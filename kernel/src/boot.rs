@@ -5,6 +5,7 @@ use x86_64::instructions::segmentation::Segment;
 use x86_64::VirtAddr;
 use lazy_static::lazy_static;
 use crate::{println, serial_println};
+use crate::memory;
 
 const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
@@ -58,6 +59,9 @@ pub fn init_kernel(boot_info: BootInformation) {
     
     // Parse and display memory information
     parse_memory_map(&boot_info);
+    
+    // Initialize physical memory manager
+    init_physical_memory(&boot_info);
     
     // Initialize early console output (already done in main, but ensure it's working)
     test_console_output();
@@ -191,4 +195,49 @@ pub fn init_cpu_state() {
     }
     
     serial_println!("CPU state initialized");
+}
+
+/// Initialize physical memory manager
+fn init_physical_memory(boot_info: &BootInformation) {
+    serial_println!("Initializing physical memory manager...");
+    
+    match memory::physical::init_physical_memory(boot_info) {
+        Ok(()) => {
+            serial_println!("Physical memory manager initialized successfully");
+            
+            // Test the allocator by allocating and deallocating a few frames
+            test_physical_allocator();
+        }
+        Err(e) => {
+            serial_println!("Failed to initialize physical memory manager: {}", e);
+            panic!("Physical memory initialization failed");
+        }
+    }
+}
+
+/// Test the physical memory allocator
+fn test_physical_allocator() {
+    serial_println!("Testing physical memory allocator...");
+    
+    // Test single frame allocation
+    if let Some(frame1) = memory::physical::allocate_frame() {
+        serial_println!("Allocated frame: 0x{:x}", frame1.address());
+        
+        // Test multiple frame allocation
+        if let Some(frame2) = memory::physical::allocate_frames(3) {
+            serial_println!("Allocated 3 contiguous frames starting at: 0x{:x}", frame2.address());
+            
+            // Deallocate the frames
+            memory::physical::deallocate_frames(frame2, 3);
+            serial_println!("Deallocated 3 frames");
+        }
+        
+        memory::physical::deallocate_frame(frame1);
+        serial_println!("Deallocated single frame");
+    }
+    
+    // Print memory statistics after test
+    memory::physical::print_memory_stats();
+    
+    serial_println!("Physical memory allocator test complete");
 }

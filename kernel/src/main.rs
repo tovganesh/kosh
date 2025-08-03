@@ -11,6 +11,7 @@ use linked_list_allocator::LockedHeap;
 mod serial;
 mod vga_buffer;
 mod boot;
+mod memory;
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
@@ -28,6 +29,26 @@ pub extern "C" fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
         }
     }
     0
+}
+
+#[no_mangle]
+pub extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
+    unsafe {
+        for i in 0..n {
+            *s.add(i) = c as u8;
+        }
+    }
+    s
+}
+
+#[no_mangle]
+pub extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    unsafe {
+        for i in 0..n {
+            *dest.add(i) = *src.add(i);
+        }
+    }
+    dest
 }
 
 // Multiboot2 header

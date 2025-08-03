@@ -17,8 +17,9 @@
 
   - _Requirements: 8.1, 8.4, 5.1, 5.4_
 
-- [ ] 3. Initialize core memory management
-- [ ] 3.1 Implement physical memory manager
+- [-] 3. Initialize core memory management
+
+- [x] 3.1 Implement physical memory manager
 
   - Create bitmap-based physical page allocator
   - Parse memory map from bootloader
