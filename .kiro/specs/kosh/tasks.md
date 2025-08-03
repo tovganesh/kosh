@@ -17,7 +17,11 @@
 
   - _Requirements: 8.1, 8.4, 5.1, 5.4_
 
-- [-] 3. Initialize core memory management
+- [x] 3. Initialize core memory management
+
+
+
+
 
 - [x] 3.1 Implement physical memory manager
 
@@ -44,8 +48,14 @@
   - Create allocation tracking for debugging
   - _Requirements: 5.2, 5.4_
 
-- [ ] 4. Implement basic process management
-- [ ] 4.1 Create process control structures
+- [x] 4. Implement basic process management
+
+
+
+
+- [x] 4.1 Create process control structures
+
+
 
   - Define Process struct with PID, state, and memory space
   - Implement process creation and destruction
@@ -53,7 +63,9 @@
   - Add process state transitions
   - _Requirements: 1.2, 1.3, 8.2_
 
-- [ ] 4.2 Implement basic scheduler
+- [x] 4.2 Implement basic scheduler
+
+
 
   - Create round-robin scheduler for initial implementation
   - Implement context switching for x86-64
