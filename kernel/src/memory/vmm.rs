@@ -153,6 +153,7 @@ impl VirtualMemoryRegion {
 }
 
 /// Frame allocator wrapper for x86_64 crate
+#[derive(Debug)]
 pub struct KoshFrameAllocator;
 
 unsafe impl FrameAllocator<Size4KiB> for KoshFrameAllocator {
@@ -182,6 +183,16 @@ pub struct VirtualAddressSpace {
     regions: Vec<VirtualMemoryRegion>,
     /// Physical memory offset for higher half kernel
     physical_memory_offset: VirtAddr,
+}
+
+impl core::fmt::Debug for VirtualAddressSpace {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VirtualAddressSpace")
+            .field("frame_allocator", &self.frame_allocator)
+            .field("regions", &self.regions)
+            .field("physical_memory_offset", &self.physical_memory_offset)
+            .finish()
+    }
 }
 
 impl VirtualAddressSpace {
