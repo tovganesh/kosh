@@ -63,6 +63,9 @@ pub fn init_kernel(boot_info: BootInformation) {
     // Initialize physical memory manager
     init_physical_memory(&boot_info);
     
+    // Initialize virtual memory management
+    init_virtual_memory();
+    
     // Initialize early console output (already done in main, but ensure it's working)
     test_console_output();
     
@@ -240,4 +243,41 @@ fn test_physical_allocator() {
     memory::physical::print_memory_stats();
     
     serial_println!("Physical memory allocator test complete");
+}
+
+/// Initialize virtual memory management
+fn init_virtual_memory() {
+    serial_println!("Initializing virtual memory management...");
+    
+    match unsafe { memory::vmm::init_virtual_memory() } {
+        Ok(()) => {
+            serial_println!("Virtual memory management initialized successfully");
+            
+            // Test virtual memory functionality
+            test_virtual_memory();
+        }
+        Err(e) => {
+            serial_println!("Failed to initialize virtual memory management: {}", e);
+            panic!("Virtual memory initialization failed");
+        }
+    }
+}
+
+/// Test virtual memory functionality
+fn test_virtual_memory() {
+    serial_println!("Testing virtual memory management...");
+    
+    // Print virtual memory layout
+    memory::vmm::print_virtual_memory_stats();
+    
+    // Test virtual address translation
+    let test_virt_addr = memory::vmm::VirtualAddress::new(0xFFFFFFFF80000000);
+    if let Some(phys_addr) = memory::vmm::translate_virtual_address(test_virt_addr) {
+        serial_println!("Virtual address 0x{:x} maps to physical address 0x{:x}", 
+                       test_virt_addr.as_usize(), phys_addr);
+    } else {
+        serial_println!("Virtual address 0x{:x} is not mapped", test_virt_addr.as_usize());
+    }
+    
+    serial_println!("Virtual memory management test complete");
 }

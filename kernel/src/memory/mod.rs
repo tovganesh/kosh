@@ -1,4 +1,5 @@
 pub mod physical;
+pub mod vmm;
 
 /// Page size constant (4KB on x86-64)
 pub const PAGE_SIZE: usize = 4096;

@@ -27,7 +27,8 @@
   - Add memory statistics tracking
   - _Requirements: 3.5, 8.2_
 
-- [ ] 3.2 Set up virtual memory management
+- [x] 3.2 Set up virtual memory management
+
 
   - Implement page table structures for x86-64
   - Create virtual address space abstraction
