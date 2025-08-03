@@ -29,14 +29,14 @@
 
 - [x] 3.2 Set up virtual memory management
 
-
   - Implement page table structures for x86-64
   - Create virtual address space abstraction
   - Set up kernel virtual memory mapping
   - Implement memory protection mechanisms
   - _Requirements: 1.1, 3.5, 8.2_
 
-- [ ] 3.3 Create heap allocator for kernel
+- [x] 3.3 Create heap allocator for kernel
+
 
   - Implement linked-list based kernel heap
   - Integrate with Rust's global allocator interface

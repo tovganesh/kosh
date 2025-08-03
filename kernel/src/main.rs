@@ -8,7 +8,6 @@ extern crate alloc;
 
 use core::panic::PanicInfo;
 use multiboot2::BootInformation;
-use linked_list_allocator::LockedHeap;
 
 mod serial;
 mod vga_buffer;
@@ -16,7 +15,7 @@ mod boot;
 mod memory;
 
 #[global_allocator]
-static ALLOCATOR: LockedHeap = LockedHeap::empty();
+static ALLOCATOR: memory::heap::GlobalKernelAllocator = memory::heap::GlobalKernelAllocator;
 
 // Required by the linker for some core operations
 #[no_mangle]
