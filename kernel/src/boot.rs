@@ -69,6 +69,9 @@ pub fn init_kernel(boot_info: BootInformation) {
     // Initialize kernel heap allocator
     init_heap_allocator();
     
+    // Initialize process management
+    init_process_management();
+    
     // Initialize early console output (already done in main, but ensure it's working)
     test_console_output();
     
@@ -348,4 +351,118 @@ fn test_heap_allocator() {
     }
     
     serial_println!("Kernel heap allocator test complete");
+}
+
+/// Initialize process management
+fn init_process_management() {
+    serial_println!("Initializing process management...");
+    
+    match crate::process::init_process_management() {
+        Ok(()) => {
+            serial_println!("Process management initialized successfully");
+            
+            // Test process management functionality
+            test_process_management();
+        }
+        Err(e) => {
+            serial_println!("Failed to initialize process management: {}", e);
+            panic!("Process management initialization failed");
+        }
+    }
+}
+
+/// Test process management functionality
+fn test_process_management() {
+    serial_println!("Testing process management...");
+    
+    // Test process creation
+    {
+        extern crate alloc;
+        use alloc::string::String;
+        use crate::process::{create_process, ProcessPriority, ProcessId, print_process_table};
+        
+        // Create a few test processes
+        let init_pid = create_process(
+            None,
+            String::from("init"),
+            ProcessPriority::System,
+        );
+        
+        if let Ok(init_pid) = init_pid {
+            serial_println!("Created init process with PID {}", init_pid.0);
+            
+            // Create child processes
+            let shell_pid = create_process(
+                Some(init_pid),
+                String::from("shell"),
+                ProcessPriority::Interactive,
+            );
+            
+            let background_pid = create_process(
+                Some(init_pid),
+                String::from("background_task"),
+                ProcessPriority::Background,
+            );
+            
+            if let (Ok(shell_pid), Ok(bg_pid)) = (shell_pid, background_pid) {
+                serial_println!("Created shell process with PID {}", shell_pid.0);
+                serial_println!("Created background process with PID {}", bg_pid.0);
+                
+                // Print process table
+                print_process_table();
+                
+                // Test scheduler
+                test_scheduler();
+                
+                // Test context switching
+                test_context_switching_functionality();
+            }
+        }
+    }
+    
+    serial_println!("Process management test complete");
+}
+
+/// Test scheduler functionality
+fn test_scheduler() {
+    serial_println!("Testing scheduler...");
+    
+    use crate::process::{schedule_next_process, print_scheduler_info, set_scheduling_algorithm, SchedulingAlgorithm};
+    
+    // Test round-robin scheduling
+    serial_println!("Testing round-robin scheduling...");
+    if let Ok(scheduled_pid) = schedule_next_process() {
+        if let Some(pid) = scheduled_pid {
+            serial_println!("Scheduled process: {}", pid.0);
+        } else {
+            serial_println!("No process scheduled");
+        }
+    }
+    
+    // Test priority scheduling
+    serial_println!("Testing priority scheduling...");
+    if set_scheduling_algorithm(SchedulingAlgorithm::Priority).is_ok() {
+        if let Ok(scheduled_pid) = schedule_next_process() {
+            if let Some(pid) = scheduled_pid {
+                serial_println!("Priority scheduled process: {}", pid.0);
+            }
+        }
+    }
+    
+    // Print scheduler information
+    print_scheduler_info();
+    
+    serial_println!("Scheduler test complete");
+}
+
+/// Test context switching functionality
+fn test_context_switching_functionality() {
+    serial_println!("Testing context switching functionality...");
+    
+    use crate::process::test_context_switching;
+    
+    // Test context switching
+    test_context_switching();
+    
+    serial_println!("Context switching test complete");
 }
