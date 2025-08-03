@@ -2,23 +2,19 @@
 
 - [x] 1. Set up project structure and build system
 
-
-
-
-
-
   - Create Cargo workspace with kernel, drivers, and userspace crates
   - Configure cross-compilation targets for x86-64 and ARM64
   - Set up no_std environment for kernel development
   - Create build scripts for generating bootable images
   - _Requirements: 2.3, 2.4, 2.5, 5.5, 9.1, 9.2_
 
-- [ ] 2. Implement basic bootloader and kernel entry
+- [x] 2. Implement basic bootloader and kernel entry
 
   - Create multiboot2-compatible kernel entry point
   - Set up initial stack and basic CPU state
   - Implement early console output for debugging
   - Create basic panic handler for kernel errors
+
   - _Requirements: 8.1, 8.4, 5.1, 5.4_
 
 - [ ] 3. Initialize core memory management
