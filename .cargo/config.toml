@@ -1,0 +1,8 @@
+[target.x86_64-kosh]
+runner = "bootimage runner"
+
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "code-model=kernel"]
+
+[target.'cfg(target_arch = "aarch64")']
+rustflags = ["-C", "target-feature=+strict-align"]

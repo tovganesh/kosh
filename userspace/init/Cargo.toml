@@ -1,0 +1,8 @@
+[package]
+name = "kosh-init"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kosh-types = { path = "../../shared/kosh-types" }
+kosh-ipc = { path = "../../shared/kosh-ipc" }
