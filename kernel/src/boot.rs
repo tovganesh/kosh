@@ -66,6 +66,9 @@ pub fn init_kernel(boot_info: BootInformation) {
     // Initialize virtual memory management
     init_virtual_memory();
     
+    // Initialize kernel heap allocator
+    init_heap_allocator();
+    
     // Initialize early console output (already done in main, but ensure it's working)
     test_console_output();
     
@@ -280,4 +283,69 @@ fn test_virtual_memory() {
     }
     
     serial_println!("Virtual memory management test complete");
+}
+
+/// Initialize kernel heap allocator
+fn init_heap_allocator() {
+    serial_println!("Initializing kernel heap allocator...");
+    
+    // Allocate 1MB (256 pages) for the kernel heap
+    const HEAP_SIZE_PAGES: usize = 256;
+    
+    match memory::heap::init_kernel_heap(HEAP_SIZE_PAGES) {
+        Ok(()) => {
+            serial_println!("Kernel heap allocator initialized successfully");
+            
+            // Test the heap allocator
+            test_heap_allocator();
+        }
+        Err(e) => {
+            serial_println!("Failed to initialize kernel heap allocator: {}", e);
+            panic!("Heap allocator initialization failed");
+        }
+    }
+}
+
+/// Test kernel heap allocator
+fn test_heap_allocator() {
+    serial_println!("Testing kernel heap allocator...");
+    
+    // Test the heap allocator functionality
+    memory::heap::test_heap_allocator();
+    
+    // Test Rust's built-in allocation using Vec
+    {
+        extern crate alloc;
+        use alloc::vec::Vec;
+        use alloc::string::String;
+        
+        // Test Vec allocation
+        let mut test_vec: Vec<u32> = Vec::new();
+        for i in 0..100 {
+            test_vec.push(i);
+        }
+        serial_println!("Successfully allocated and used Vec with {} elements", test_vec.len());
+        
+        // Test String allocation
+        let test_string = String::from("Hello, Kosh kernel heap!");
+        serial_println!("Successfully allocated String: '{}'", test_string);
+        
+        // Test larger allocation
+        let mut large_vec: Vec<u8> = Vec::new();
+        for _ in 0..4096 {
+            large_vec.push(0x42);
+        }
+        serial_println!("Successfully allocated large Vec with {} bytes", large_vec.len());
+    } // All allocations should be automatically freed here
+    
+    // Print final heap statistics
+    memory::heap::print_heap_stats();
+    
+    // Validate heap integrity
+    match memory::heap::validate_heap() {
+        Ok(()) => serial_println!("Heap integrity validation passed"),
+        Err(e) => serial_println!("Heap integrity validation failed: {}", e),
+    }
+    
+    serial_println!("Kernel heap allocator test complete");
 }
