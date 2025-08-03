@@ -1,0 +1,10 @@
+[package]
+name = "kosh-storage-driver"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kosh-types = { path = "../../shared/kosh-types" }
+kosh-ipc = { path = "../../shared/kosh-ipc" }
+spin = { workspace = true }
+log = { workspace = true }

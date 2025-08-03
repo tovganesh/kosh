@@ -1,0 +1,28 @@
+[workspace]
+members = [
+    "kernel",
+    "drivers/storage",
+    "drivers/network", 
+    "drivers/graphics",
+    "userspace/init",
+    "userspace/fs-service",
+    "userspace/driver-manager",
+    "shared/kosh-types",
+    "shared/kosh-ipc",
+]
+
+resolver = "2"
+
+[workspace.dependencies]
+# Shared dependencies across workspace
+spin = "0.9"
+bitflags = "2.4"
+log = "0.4"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
