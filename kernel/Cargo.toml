@@ -27,3 +27,6 @@ bootloader = "0.9"
 [[bin]]
 name = "kosh-kernel"
 path = "src/main.rs"
+
+[build-dependencies]
+cc = "1.0"
