@@ -72,6 +72,9 @@ pub fn init_kernel(boot_info: BootInformation) {
     // Initialize process management
     init_process_management();
     
+    // Initialize IPC system
+    init_ipc_system();
+    
     // Initialize early console output (already done in main, but ensure it's working)
     test_console_output();
     
@@ -421,6 +424,174 @@ fn test_process_management() {
     }
     
     serial_println!("Process management test complete");
+}
+
+/// Initialize IPC system
+fn init_ipc_system() {
+    serial_println!("Initializing IPC system...");
+    
+    match crate::ipc::init_ipc_system() {
+        Ok(()) => {
+            serial_println!("IPC system initialized successfully");
+            
+            // Test IPC functionality
+            test_ipc_system();
+        }
+        Err(e) => {
+            serial_println!("Failed to initialize IPC system: {}", e);
+            panic!("IPC system initialization failed");
+        }
+    }
+}
+
+/// Test IPC system functionality
+fn test_ipc_system() {
+    serial_println!("Testing IPC system...");
+    
+    // Test message passing
+    {
+        extern crate alloc;
+        use alloc::string::String;
+        use crate::process::ProcessId;
+        use crate::ipc::{
+            create_message, send_message, receive_message,
+            MessageType, MessageData, create_capability, check_capability,
+            CapabilityType, grant_system_process_capabilities, grant_user_process_capabilities,
+            create_secure_ipc_channel, is_restricted_operation, validate_capability_request
+        };
+        use crate::ipc::capability::ResourceId;
+        
+        let sender_pid = ProcessId::new(1);
+        let receiver_pid = ProcessId::new(2);
+        
+        // Test basic message creation and sending
+        let message = create_message(
+            sender_pid,
+            receiver_pid,
+            MessageType::ServiceRequest,
+            MessageData::Text(String::from("Hello, IPC!")),
+        );
+        
+        serial_println!("Created test message: {}", message);
+        
+        // Test message sending
+        match send_message(message) {
+            Ok(()) => {
+                serial_println!("Message sent successfully");
+                
+                // Test message receiving
+                match receive_message(receiver_pid) {
+                    Ok(received_msg) => {
+                        serial_println!("Message received: {}", received_msg);
+                        
+                        if let MessageData::Text(text) = &received_msg.data {
+                            serial_println!("Message content: '{}'", text);
+                        }
+                    }
+                    Err(e) => {
+                        serial_println!("Failed to receive message: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                serial_println!("Failed to send message: {}", e);
+            }
+        }
+        
+        // Test capability system
+        serial_println!("Testing capability system...");
+        
+        // Grant a capability to a process
+        let file_resource = ResourceId::File(String::from("/test/file.txt"));
+        match create_capability(
+            sender_pid,
+            CapabilityType::Read,
+            file_resource.clone(),
+            None, // System-granted
+        ) {
+            Ok(cap_id) => {
+                serial_println!("Created capability {} for process {}", cap_id.0, sender_pid.0);
+                
+                // Test capability checking
+                if check_capability(sender_pid, CapabilityType::Read, &file_resource) {
+                    serial_println!("Capability check passed for read access");
+                } else {
+                    serial_println!("Capability check failed for read access");
+                }
+                
+                // Test capability check for different permission
+                if check_capability(sender_pid, CapabilityType::Write, &file_resource) {
+                    serial_println!("Capability check passed for write access");
+                } else {
+                    serial_println!("Capability check failed for write access (expected)");
+                }
+            }
+            Err(e) => {
+                serial_println!("Failed to create capability: {}", e);
+            }
+        }
+        
+        // Test security policy system
+        serial_println!("Testing security policy system...");
+        
+        // Test granting system capabilities
+        match grant_system_process_capabilities(sender_pid) {
+            Ok(capabilities) => {
+                serial_println!("Granted {} system capabilities to process {}", 
+                               capabilities.len(), sender_pid.0);
+            }
+            Err(e) => {
+                serial_println!("Failed to grant system capabilities: {}", e);
+            }
+        }
+        
+        // Test granting user capabilities
+        match grant_user_process_capabilities(receiver_pid) {
+            Ok(capabilities) => {
+                serial_println!("Granted {} user capabilities to process {}", 
+                               capabilities.len(), receiver_pid.0);
+            }
+            Err(e) => {
+                serial_println!("Failed to grant user capabilities: {}", e);
+            }
+        }
+        
+        // Test secure IPC channel creation
+        match create_secure_ipc_channel(sender_pid, receiver_pid) {
+            Ok(()) => {
+                serial_println!("Created secure IPC channel between processes {} and {}", 
+                               sender_pid.0, receiver_pid.0);
+            }
+            Err(e) => {
+                serial_println!("Failed to create secure IPC channel: {}", e);
+            }
+        }
+        
+        // Test restricted operation validation
+        if is_restricted_operation(CapabilityType::Admin) {
+            serial_println!("Admin operation correctly identified as restricted");
+        }
+        
+        if !is_restricted_operation(CapabilityType::Read) {
+            serial_println!("Read operation correctly identified as non-restricted");
+        }
+        
+        // Test capability request validation
+        if validate_capability_request(
+            sender_pid,
+            CapabilityType::SendMessage,
+            &ResourceId::Process(receiver_pid),
+        ) {
+            serial_println!("SendMessage capability request validated successfully");
+        } else {
+            serial_println!("SendMessage capability request validation failed");
+        }
+    }
+    
+    // Print IPC statistics
+    crate::ipc::print_ipc_info();
+    
+    serial_println!("IPC system test complete");
 }
 
 /// Test scheduler functionality

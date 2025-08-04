@@ -14,6 +14,7 @@ mod vga_buffer;
 mod boot;
 mod memory;
 mod process;
+mod ipc;
 
 #[global_allocator]
 static ALLOCATOR: memory::heap::GlobalKernelAllocator = memory::heap::GlobalKernelAllocator;
@@ -48,6 +49,24 @@ pub extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
     unsafe {
         for i in 0..n {
             *dest.add(i) = *src.add(i);
+        }
+    }
+    dest
+}
+
+#[no_mangle]
+pub extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    unsafe {
+        if src < dest as *const u8 {
+            // Copy backwards to avoid overlap issues
+            for i in (0..n).rev() {
+                *dest.add(i) = *src.add(i);
+            }
+        } else {
+            // Copy forwards
+            for i in 0..n {
+                *dest.add(i) = *src.add(i);
+            }
         }
     }
     dest
