@@ -19,10 +19,6 @@
 
 - [x] 3. Initialize core memory management
 
-
-
-
-
 - [x] 3.1 Implement physical memory manager
 
   - Create bitmap-based physical page allocator
@@ -41,7 +37,6 @@
 
 - [x] 3.3 Create heap allocator for kernel
 
-
   - Implement linked-list based kernel heap
   - Integrate with Rust's global allocator interface
   - Add heap corruption detection
@@ -50,12 +45,7 @@
 
 - [x] 4. Implement basic process management
 
-
-
-
 - [x] 4.1 Create process control structures
-
-
 
   - Define Process struct with PID, state, and memory space
   - Implement process creation and destruction
@@ -65,16 +55,15 @@
 
 - [x] 4.2 Implement basic scheduler
 
-
-
   - Create round-robin scheduler for initial implementation
   - Implement context switching for x86-64
   - Add process priority management
   - Create scheduler statistics and monitoring
   - _Requirements: 6.2, 8.2_
 
-- [ ] 5. Set up inter-process communication (IPC)
-- [ ] 5.1 Implement message passing system
+- [x] 5. Set up inter-process communication (IPC)
+
+- [x] 5.1 Implement message passing system
 
   - Create message queue structures
   - Implement synchronous message passing
@@ -82,7 +71,7 @@
   - Create IPC error handling
   - _Requirements: 1.5, 8.2_
 
-- [ ] 5.2 Add capability-based security
+- [x] 5.2 Add capability-based security
 
   - Define capability structures and types
   - Implement capability checking for IPC
