@@ -1,0 +1,11 @@
+[package]
+name = "kosh-driver"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kosh-types = { path = "../kosh-types" }
+kosh-ipc = { path = "../kosh-ipc" }
+
+[features]
+default = []

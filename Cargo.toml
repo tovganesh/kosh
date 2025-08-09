@@ -9,6 +9,7 @@ members = [
     "userspace/driver-manager",
     "shared/kosh-types",
     "shared/kosh-ipc",
+    "shared/kosh-driver",
 ]
 
 resolver = "2"
