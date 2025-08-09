@@ -45,7 +45,7 @@ pub enum MessageType {
     Signal,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum DriverError {
     InitializationFailed,
     HardwareNotFound,

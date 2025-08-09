@@ -6,3 +6,8 @@ edition = "2021"
 [dependencies]
 kosh-types = { path = "../../shared/kosh-types" }
 kosh-ipc = { path = "../../shared/kosh-ipc" }
+kosh-driver = { path = "../../shared/kosh-driver" }
+linked_list_allocator = "0.10"
+
+[features]
+default = []
