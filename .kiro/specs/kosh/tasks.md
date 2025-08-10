@@ -109,17 +109,18 @@
 
 - [x] 7.2 Implement keyboard input driver
 
-
   - Create PS/2 keyboard driver
   - Add scancode to keycode translation
   - Implement input event queuing
   - Test driver communication with user space
   - _Requirements: 7.1, 7.2, 7.4_
 
-- [ ] 8. Create file system support
-- [ ] 8.1 Implement Virtual File System (VFS)
+- [-] 8. Create file system support
+
+- [x] 8.1 Implement Virtual File System (VFS)
 
   - Create VFS abstraction layer
+
   - Define file system interface traits
   - Implement file descriptor management
   - Add mount point management
