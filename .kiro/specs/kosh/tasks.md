@@ -101,14 +101,14 @@
 
 - [x] 7.1 Create VGA text mode driver
 
-
   - Implement basic text output driver
   - Add color and formatting support
   - Create driver registration with kernel
   - Test driver isolation and error handling
   - _Requirements: 7.1, 7.2, 7.3_
 
-- [ ] 7.2 Implement keyboard input driver
+- [x] 7.2 Implement keyboard input driver
+
 
   - Create PS/2 keyboard driver
   - Add scancode to keycode translation

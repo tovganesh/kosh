@@ -4,6 +4,7 @@ members = [
     "drivers/storage",
     "drivers/network", 
     "drivers/graphics",
+    "drivers/keyboard",
     "userspace/init",
     "userspace/fs-service",
     "userspace/driver-manager",
