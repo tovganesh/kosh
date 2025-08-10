@@ -3,6 +3,16 @@ name = "kosh-fs-service"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "kosh-fs-service"
+path = "src/main.rs"
+
+[lib]
+name = "kosh_fs_service"
+path = "src/lib.rs"
+
 [dependencies]
 kosh-types = { path = "../../shared/kosh-types" }
 kosh-ipc = { path = "../../shared/kosh-ipc" }
+spin = { workspace = true }
+linked_list_allocator = "0.10"
