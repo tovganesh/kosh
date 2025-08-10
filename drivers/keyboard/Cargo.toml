@@ -1,0 +1,19 @@
+[package]
+name = "kosh-keyboard-driver"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kosh-driver = { path = "../../shared/kosh-driver" }
+kosh-types = { path = "../../shared/kosh-types" }
+kosh-ipc = { path = "../../shared/kosh-ipc" }
+spin = "0.9"
+volatile = "0.4"
+bitflags = "2.4"
+
+[lib]
+crate-type = ["staticlib", "cdylib"]
+
+[[bin]]
+name = "keyboard-driver"
+path = "src/main.rs"
