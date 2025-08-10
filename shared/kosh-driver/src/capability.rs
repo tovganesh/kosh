@@ -14,6 +14,14 @@ pub enum DriverCapabilityType {
     FileSystem(FileSystemCapability),
     /// Network capabilities
     Network(NetworkCapability),
+    /// Direct memory access capability
+    MemoryAccess,
+    /// Hardware access capability
+    HardwareAccess,
+    /// Text output capability
+    TextOutput,
+    /// Graphics output capability
+    GraphicsOutput,
     /// Custom capability
     Custom(String),
 }
@@ -158,6 +166,10 @@ impl DriverCapabilityManager {
             DriverCapabilityType::Ipc(_) => CapabilityFlags::IPC_SEND | CapabilityFlags::IPC_RECEIVE,
             DriverCapabilityType::FileSystem(_) => CapabilityFlags::FILE_READ | CapabilityFlags::FILE_WRITE,
             DriverCapabilityType::Network(_) => CapabilityFlags::NETWORK_ACCESS,
+            DriverCapabilityType::MemoryAccess => CapabilityFlags::READ_MEMORY | CapabilityFlags::WRITE_MEMORY,
+            DriverCapabilityType::HardwareAccess => CapabilityFlags::HARDWARE_ACCESS,
+            DriverCapabilityType::TextOutput => CapabilityFlags::HARDWARE_ACCESS, // VGA buffer access
+            DriverCapabilityType::GraphicsOutput => CapabilityFlags::HARDWARE_ACCESS,
             DriverCapabilityType::Custom(_) => CapabilityFlags::empty(),
         };
 
