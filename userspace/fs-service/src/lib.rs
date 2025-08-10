@@ -6,6 +6,7 @@ use alloc::{vec::Vec, string::String};
 use kosh_types::{OpenFlags, FileType, FilePermissions, VfsError};
 
 pub mod vfs;
+pub mod ext4;
 pub use vfs::{Vfs, FileSystemType};
 
 /// File system service request types
