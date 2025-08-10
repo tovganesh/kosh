@@ -126,7 +126,8 @@
   - Add mount point management
   - _Requirements: 4.1, 4.3, 4.5_
 
-- [ ] 8.2 Add basic ext4 file system support
+- [x] 8.2 Add basic ext4 file system support
+
 
   - Implement ext4 superblock parsing
   - Create inode and directory handling

@@ -2,12 +2,14 @@ use kosh_types::{
     FileDescriptor, InodeNumber, FileOffset, FileType, FilePermissions,
     OpenFlags, FileMetadata, VfsError, DirectoryEntry
 };
-use alloc::{vec::Vec, string::{String, ToString}, collections::BTreeMap};
+use crate::ext4::Ext4FileSystem;
+use alloc::{vec, vec::Vec, string::{String, ToString}, collections::BTreeMap, boxed::Box};
 use core::result::Result;
 
 /// Virtual File System abstraction layer
 pub struct Vfs {
     mount_points: BTreeMap<String, MountPoint>,
+    file_systems: BTreeMap<String, Box<dyn FileSystem>>,
     open_files: BTreeMap<FileDescriptor, OpenFile>,
     next_fd: FileDescriptor,
 }
@@ -90,6 +92,7 @@ impl Vfs {
     pub fn new() -> Self {
         Self {
             mount_points: BTreeMap::new(),
+            file_systems: BTreeMap::new(),
             open_files: BTreeMap::new(),
             next_fd: 1, // Start from 1, 0 is reserved
         }
@@ -107,6 +110,16 @@ impl Vfs {
             return Err(VfsError::MountPointBusy);
         }
         
+        // Create the appropriate file system instance
+        let mut filesystem: Box<dyn FileSystem> = match fs_type {
+            FileSystemType::Ext4 => Box::new(Ext4FileSystem::new()),
+            _ => return Err(VfsError::IoError), // Other file systems not implemented yet
+        };
+        
+        // Initialize and mount the file system
+        filesystem.init()?;
+        filesystem.mount(device_id)?;
+        
         let mount_point = MountPoint {
             path: path.to_string(),
             filesystem: fs_type,
@@ -114,7 +127,10 @@ impl Vfs {
             device_id,
         };
         
+        // Store both the mount point and the file system instance
         self.mount_points.insert(path.to_string(), mount_point);
+        self.file_systems.insert(path.to_string(), filesystem);
+        
         Ok(())
     }
     
@@ -125,6 +141,11 @@ impl Vfs {
             if open_file.mount_point == path {
                 return Err(VfsError::MountPointBusy);
             }
+        }
+        
+        // Unmount the file system
+        if let Some(mut filesystem) = self.file_systems.remove(path) {
+            filesystem.unmount()?;
         }
         
         self.mount_points.remove(path)
@@ -153,27 +174,27 @@ impl Vfs {
         let mount_point = self.find_mount_point(path)?;
         
         // Check read-only mount for write operations
-        if mount_point.read_only && (flags.contains(OpenFlags::WRITE_ONLY) || flags.contains(OpenFlags::READ_WRITE)) {
+        if mount_point.read_only && (flags == OpenFlags::WRITE_ONLY || flags == OpenFlags::READ_WRITE) {
             return Err(VfsError::ReadOnlyFileSystem);
         }
         
         // Clone the mount point path to avoid borrowing issues
         let mount_path = mount_point.path.clone();
         
-        // For now, create a placeholder implementation
-        // In a real implementation, this would delegate to the specific file system
-        let inode = 1; // Placeholder inode
-        let metadata = FileMetadata {
-            inode,
-            file_type: FileType::Regular,
-            permissions: FilePermissions::OWNER_READ | FilePermissions::OWNER_WRITE,
-            size: 0,
-            uid: 0,
-            gid: 0,
-            created_time: 0,
-            modified_time: 0,
-            accessed_time: 0,
+        // Get the file system and delegate the open operation
+        let filesystem = self.file_systems.get_mut(&mount_path)
+            .ok_or(VfsError::NotMounted)?;
+        
+        // Convert absolute path to relative path within the file system
+        let relative_path = if path == &mount_path {
+            "/"
+        } else if path.starts_with(&mount_path) {
+            &path[mount_path.len()..]
+        } else {
+            path
         };
+        
+        let (inode, metadata) = filesystem.open(relative_path, flags)?;
         
         let fd = self.next_fd;
         self.next_fd += 1;
@@ -192,23 +213,37 @@ impl Vfs {
     
     /// Close a file descriptor
     pub fn close(&mut self, fd: FileDescriptor) -> Result<(), VfsError> {
-        self.open_files.remove(&fd)
+        let open_file = self.open_files.remove(&fd)
             .ok_or(VfsError::InvalidFileDescriptor)?;
+        
+        // Delegate to the file system
+        let filesystem = self.file_systems.get_mut(&open_file.mount_point)
+            .ok_or(VfsError::NotMounted)?;
+        
+        filesystem.close(open_file.inode)?;
         Ok(())
     }
     
     /// Read from a file descriptor
-    pub fn read(&mut self, fd: FileDescriptor, _buffer: &mut [u8]) -> Result<usize, VfsError> {
+    pub fn read(&mut self, fd: FileDescriptor, buffer: &mut [u8]) -> Result<usize, VfsError> {
         let open_file = self.open_files.get_mut(&fd)
             .ok_or(VfsError::InvalidFileDescriptor)?;
         
         // Check if file is open for reading
-        if open_file.flags.contains(OpenFlags::WRITE_ONLY) {
+        if open_file.flags == OpenFlags::WRITE_ONLY {
             return Err(VfsError::PermissionDenied);
         }
         
-        // Placeholder implementation - in reality would delegate to file system
-        Ok(0)
+        // Get the file system and delegate the read operation
+        let filesystem = self.file_systems.get_mut(&open_file.mount_point)
+            .ok_or(VfsError::NotMounted)?;
+        
+        let bytes_read = filesystem.read(open_file.inode, open_file.offset, buffer)?;
+        
+        // Update the file offset
+        open_file.offset += bytes_read as u64;
+        
+        Ok(bytes_read)
     }
     
     /// Write to a file descriptor
@@ -217,41 +252,67 @@ impl Vfs {
             .ok_or(VfsError::InvalidFileDescriptor)?;
         
         // Check if file is open for writing
-        if open_file.flags.contains(OpenFlags::READ_ONLY) {
+        if open_file.flags == OpenFlags::READ_ONLY {
             return Err(VfsError::PermissionDenied);
         }
         
-        // Placeholder implementation - in reality would delegate to file system
-        Ok(buffer.len())
+        // Get the file system and delegate the write operation
+        let filesystem = self.file_systems.get_mut(&open_file.mount_point)
+            .ok_or(VfsError::NotMounted)?;
+        
+        let bytes_written = filesystem.write(open_file.inode, open_file.offset, buffer)?;
+        
+        // Update the file offset
+        open_file.offset += bytes_written as u64;
+        
+        Ok(bytes_written)
     }
     
     /// Get file metadata
-    pub fn stat(&self, path: &str) -> Result<FileMetadata, VfsError> {
-        let _mount_point = self.find_mount_point(path)?;
+    pub fn stat(&mut self, path: &str) -> Result<FileMetadata, VfsError> {
+        let mount_point = self.find_mount_point(path)?;
+        let mount_path = mount_point.path.clone();
         
-        // Placeholder implementation
-        Ok(FileMetadata {
-            inode: 1,
-            file_type: FileType::Regular,
-            permissions: FilePermissions::OWNER_READ | FilePermissions::OWNER_WRITE,
-            size: 0,
-            uid: 0,
-            gid: 0,
-            created_time: 0,
-            modified_time: 0,
-            accessed_time: 0,
-        })
+        // Get the file system and delegate the stat operation
+        let filesystem = self.file_systems.get_mut(&mount_path)
+            .ok_or(VfsError::NotMounted)?;
+        
+        // Convert absolute path to relative path within the file system
+        let relative_path = if path == &mount_path {
+            "/"
+        } else if path.starts_with(&mount_path) {
+            &path[mount_path.len()..]
+        } else {
+            path
+        };
+        
+        filesystem.stat(relative_path)
     }
     
     /// Create a new file
-    pub fn create(&mut self, path: &str, _file_type: FileType, _permissions: FilePermissions) -> Result<(), VfsError> {
+    pub fn create(&mut self, path: &str, file_type: FileType, permissions: FilePermissions) -> Result<(), VfsError> {
         let mount_point = self.find_mount_point(path)?;
         
         if mount_point.read_only {
             return Err(VfsError::ReadOnlyFileSystem);
         }
         
-        // Placeholder implementation
+        let mount_path = mount_point.path.clone();
+        
+        // Get the file system and delegate the create operation
+        let filesystem = self.file_systems.get_mut(&mount_path)
+            .ok_or(VfsError::NotMounted)?;
+        
+        // Convert absolute path to relative path within the file system
+        let relative_path = if path == &mount_path {
+            "/"
+        } else if path.starts_with(&mount_path) {
+            &path[mount_path.len()..]
+        } else {
+            path
+        };
+        
+        filesystem.create(relative_path, file_type, permissions)?;
         Ok(())
     }
     
@@ -263,28 +324,69 @@ impl Vfs {
             return Err(VfsError::ReadOnlyFileSystem);
         }
         
-        // Placeholder implementation
-        Ok(())
+        let mount_path = mount_point.path.clone();
+        
+        // Get the file system and delegate the unlink operation
+        let filesystem = self.file_systems.get_mut(&mount_path)
+            .ok_or(VfsError::NotMounted)?;
+        
+        // Convert absolute path to relative path within the file system
+        let relative_path = if path == &mount_path {
+            "/"
+        } else if path.starts_with(&mount_path) {
+            &path[mount_path.len()..]
+        } else {
+            path
+        };
+        
+        filesystem.unlink(relative_path)
     }
     
     /// Read directory entries
-    pub fn readdir(&self, path: &str) -> Result<Vec<DirectoryEntry>, VfsError> {
-        let _mount_point = self.find_mount_point(path)?;
+    pub fn readdir(&mut self, path: &str) -> Result<Vec<DirectoryEntry>, VfsError> {
+        let mount_point = self.find_mount_point(path)?;
+        let mount_path = mount_point.path.clone();
         
-        // Placeholder implementation - return empty directory
-        Ok(Vec::new())
+        // Get the file system and delegate the readdir operation
+        let filesystem = self.file_systems.get_mut(&mount_path)
+            .ok_or(VfsError::NotMounted)?;
+        
+        // Convert absolute path to relative path within the file system
+        let relative_path = if path == &mount_path {
+            "/"
+        } else if path.starts_with(&mount_path) {
+            &path[mount_path.len()..]
+        } else {
+            path
+        };
+        
+        filesystem.readdir(relative_path)
     }
     
     /// Create a directory
-    pub fn mkdir(&mut self, path: &str, _permissions: FilePermissions) -> Result<(), VfsError> {
+    pub fn mkdir(&mut self, path: &str, permissions: FilePermissions) -> Result<(), VfsError> {
         let mount_point = self.find_mount_point(path)?;
         
         if mount_point.read_only {
             return Err(VfsError::ReadOnlyFileSystem);
         }
         
-        // Placeholder implementation
-        Ok(())
+        let mount_path = mount_point.path.clone();
+        
+        // Get the file system and delegate the mkdir operation
+        let filesystem = self.file_systems.get_mut(&mount_path)
+            .ok_or(VfsError::NotMounted)?;
+        
+        // Convert absolute path to relative path within the file system
+        let relative_path = if path == &mount_path {
+            "/"
+        } else if path.starts_with(&mount_path) {
+            &path[mount_path.len()..]
+        } else {
+            path
+        };
+        
+        filesystem.mkdir(relative_path, permissions)
     }
     
     /// Remove a directory
@@ -295,8 +397,22 @@ impl Vfs {
             return Err(VfsError::ReadOnlyFileSystem);
         }
         
-        // Placeholder implementation
-        Ok(())
+        let mount_path = mount_point.path.clone();
+        
+        // Get the file system and delegate the rmdir operation
+        let filesystem = self.file_systems.get_mut(&mount_path)
+            .ok_or(VfsError::NotMounted)?;
+        
+        // Convert absolute path to relative path within the file system
+        let relative_path = if path == &mount_path {
+            "/"
+        } else if path.starts_with(&mount_path) {
+            &path[mount_path.len()..]
+        } else {
+            path
+        };
+        
+        filesystem.rmdir(relative_path)
     }
     
     /// Get list of mount points
@@ -351,5 +467,57 @@ mod tests {
         
         // Relative path
         assert_eq!(vfs.mount("relative", FileSystemType::Ext4, None, false), Err(VfsError::InvalidPath));
+    }
+
+    #[test]
+    fn test_ext4_integration() {
+        let mut vfs = Vfs::new();
+        
+        // Mount ext4 file system
+        assert!(vfs.mount("/", FileSystemType::Ext4, Some(1), false).is_ok());
+        
+        // Test file operations through VFS
+        assert!(vfs.create("/test.txt", FileType::Regular, FilePermissions::OWNER_READ | FilePermissions::OWNER_WRITE).is_ok());
+        
+        // Test opening a file
+        let fd = vfs.open("/test.txt", OpenFlags::READ_WRITE);
+        assert!(fd.is_ok());
+        let fd = fd.unwrap();
+        
+        // Test writing to the file
+        let data = b"Hello, ext4 through VFS!";
+        let written = vfs.write(fd, data);
+        assert!(written.is_ok());
+        assert_eq!(written.unwrap(), data.len());
+        
+        // Test reading from the file (need to reset offset for this test)
+        let mut buffer = vec![0u8; data.len()];
+        // Reset the file offset to 0 for reading
+        if let Some(open_file) = vfs.open_files.get_mut(&fd) {
+            open_file.offset = 0;
+        }
+        let read = vfs.read(fd, &mut buffer);
+        assert!(read.is_ok());
+        assert_eq!(read.unwrap(), data.len());
+        
+        // Test closing the file
+        assert!(vfs.close(fd).is_ok());
+        
+        // Test stat
+        let metadata = vfs.stat("/test.txt");
+        assert!(metadata.is_ok());
+        let metadata = metadata.unwrap();
+        assert_eq!(metadata.file_type, FileType::Regular);
+        
+        // Test directory operations
+        assert!(vfs.mkdir("/testdir", FilePermissions::OWNER_READ | FilePermissions::OWNER_WRITE | FilePermissions::OWNER_EXECUTE).is_ok());
+        
+        let entries = vfs.readdir("/testdir");
+        assert!(entries.is_ok());
+        let entries = entries.unwrap();
+        assert_eq!(entries.len(), 2); // Should contain "." and ".."
+        
+        // Test unmounting
+        assert!(vfs.unmount("/").is_ok());
     }
 }
