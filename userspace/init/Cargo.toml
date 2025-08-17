@@ -6,3 +6,10 @@ edition = "2021"
 [dependencies]
 kosh-types = { path = "../../shared/kosh-types" }
 kosh-ipc = { path = "../../shared/kosh-ipc" }
+linked_list_allocator = "0.10"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
