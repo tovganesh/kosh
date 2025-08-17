@@ -128,15 +128,15 @@
 
 - [x] 8.2 Add basic ext4 file system support
 
-
   - Implement ext4 superblock parsing
   - Create inode and directory handling
   - Add basic file operations (read, write, create, delete)
   - Implement file metadata and permissions
   - _Requirements: 4.1, 4.2, 4.3_
 
-- [ ] 9. Implement swap space management
-- [ ] 9.1 Create swap space abstraction
+- [-] 9. Implement swap space management
+
+- [x] 9.1 Create swap space abstraction
 
   - Define swap device interface
   - Implement swap space allocation tracking
@@ -144,7 +144,7 @@
   - Add swap space configuration support
   - _Requirements: 3.1, 3.3_
 
-- [ ] 9.2 Implement page swapping algorithms
+- [x] 9.2 Implement page swapping algorithms
 
   - Create LRU page replacement algorithm
   - Implement page-out operations to swap

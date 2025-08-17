@@ -69,6 +69,9 @@ pub fn init_kernel(boot_info: BootInformation) {
     // Initialize kernel heap allocator
     init_heap_allocator();
     
+    // Initialize swap space management
+    init_swap_management();
+    
     // Initialize process management
     init_process_management();
     
@@ -354,6 +357,253 @@ fn test_heap_allocator() {
     }
     
     serial_println!("Kernel heap allocator test complete");
+}
+
+/// Initialize swap space management
+fn init_swap_management() {
+    serial_println!("Initializing swap space management...");
+    
+    // Initialize the swap manager
+    match memory::swap::init_swap_manager() {
+        Ok(()) => {
+            serial_println!("Swap manager initialized successfully");
+            
+            // Initialize page swapper with LRU algorithm and 1024 page limit
+            match memory::swap::swap_algorithm::init_page_swapper(
+                memory::swap::swap_algorithm::PageReplacementAlgorithm::LRU, 
+                1024
+            ) {
+                Ok(()) => {
+                    serial_println!("Page swapper initialized successfully");
+                    
+                    // Test swap space functionality
+                    test_swap_management();
+                }
+                Err(e) => {
+                    serial_println!("Failed to initialize page swapper: {:?}", e);
+                    println!("Warning: Page swapping not available");
+                }
+            }
+        }
+        Err(e) => {
+            serial_println!("Failed to initialize swap manager: {:?}", e);
+            // Don't panic - swap is optional for basic functionality
+            println!("Warning: Swap space not available");
+        }
+    }
+}
+
+/// Test swap space management functionality
+fn test_swap_management() {
+    serial_println!("Testing swap space management...");
+    
+    // Create and configure swap devices
+    {
+        extern crate alloc;
+        use alloc::boxed::Box;
+        use alloc::string::String;
+        use crate::memory::swap::swap_config::{create_default_config, SwapConfigManager};
+        use crate::memory::swap::swap_file::FileSwapDevice;
+        use crate::memory::swap::{add_swap_device, swap_out_page, swap_in_page, print_swap_stats};
+        use crate::memory::physical::PageFrame;
+        use crate::memory::PAGE_SIZE;
+        
+        // Create a test swap configuration
+        let mut config_manager = create_default_config();
+        config_manager.print_config();
+        
+        // Create a test file-based swap device (8MB for testing)
+        match FileSwapDevice::new("test_swap".to_string(), 8) {
+            Ok(test_device) => {
+                serial_println!("Created test swap device: 8MB file-based swap");
+                
+                // Add the device to the swap manager
+                match add_swap_device(Box::new(test_device)) {
+                    Ok(device_index) => {
+                        serial_println!("Added swap device with index {}", device_index);
+                        
+                        // Test swap operations
+                        test_swap_operations();
+                        
+                        // Test page swapping algorithms
+                        test_page_swapping_algorithms();
+                        
+                        // Print swap statistics
+                        print_swap_stats();
+                    }
+                    Err(e) => {
+                        serial_println!("Failed to add swap device: {:?}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                serial_println!("Failed to create test swap device: {:?}", e);
+            }
+        }
+        
+        // Initialize swap devices from configuration (would be empty in this test)
+        match config_manager.initialize_all() {
+            Ok(count) => {
+                serial_println!("Initialized {} swap devices from configuration", count);
+            }
+            Err(e) => {
+                serial_println!("Failed to initialize swap devices from config: {:?}", e);
+            }
+        }
+    }
+    
+    serial_println!("Swap space management test complete");
+}
+
+/// Test basic swap operations
+fn test_swap_operations() {
+    serial_println!("Testing basic swap operations...");
+    
+    use crate::memory::swap::{swap_out_page, swap_in_page, is_page_swapped};
+    use crate::memory::physical::PageFrame;
+    use crate::memory::PAGE_SIZE;
+    
+    // Create test data
+    let test_page_frame = PageFrame(1000);
+    let mut test_data = [0u8; PAGE_SIZE];
+    
+    // Fill with test pattern
+    for (i, byte) in test_data.iter_mut().enumerate() {
+        *byte = (i % 256) as u8;
+    }
+    
+    // Test swap out
+    match swap_out_page(test_page_frame, &test_data) {
+        Ok(swap_slot) => {
+            serial_println!("Successfully swapped out page {} to slot {}", 
+                           test_page_frame.0, swap_slot.slot());
+            
+            // Verify page is marked as swapped
+            if is_page_swapped(test_page_frame) {
+                serial_println!("Page correctly marked as swapped");
+                
+                // Test swap in
+                let mut read_data = [0u8; PAGE_SIZE];
+                match swap_in_page(test_page_frame, &mut read_data) {
+                    Ok(()) => {
+                        serial_println!("Successfully swapped in page {}", test_page_frame.0);
+                        
+                        // Verify data integrity
+                        if read_data == test_data {
+                            serial_println!("Swap data integrity verified - data matches");
+                        } else {
+                            serial_println!("Warning: Swap data integrity check failed");
+                        }
+                        
+                        // Verify page is no longer marked as swapped
+                        if !is_page_swapped(test_page_frame) {
+                            serial_println!("Page correctly unmarked as swapped");
+                        } else {
+                            serial_println!("Warning: Page still marked as swapped after swap-in");
+                        }
+                    }
+                    Err(e) => {
+                        serial_println!("Failed to swap in page: {:?}", e);
+                    }
+                }
+            } else {
+                serial_println!("Warning: Page not marked as swapped after swap-out");
+            }
+        }
+        Err(e) => {
+            serial_println!("Failed to swap out page: {:?}", e);
+        }
+    }
+    
+    serial_println!("Basic swap operations test complete");
+}
+
+/// Test page swapping algorithms
+fn test_page_swapping_algorithms() {
+    serial_println!("Testing page swapping algorithms...");
+    
+    use crate::memory::swap::swap_algorithm::{
+        record_page_access, handle_page_fault, check_memory_pressure, 
+        set_page_replacement_algorithm, set_memory_pressure_threshold,
+        swap_out_pages, print_swapper_stats, PageReplacementAlgorithm
+    };
+    use crate::memory::vmm::VirtualAddress;
+    use crate::memory::physical::PageFrame;
+    
+    // Test different page replacement algorithms
+    let test_algorithms = [
+        PageReplacementAlgorithm::LRU,
+        PageReplacementAlgorithm::FIFO,
+        PageReplacementAlgorithm::Clock,
+        PageReplacementAlgorithm::LFU,
+    ];
+    
+    for algorithm in &test_algorithms {
+        serial_println!("Testing {:?} algorithm...", algorithm);
+        
+        // Set the algorithm
+        if let Err(e) = set_page_replacement_algorithm(*algorithm) {
+            serial_println!("Failed to set algorithm {:?}: {:?}", algorithm, e);
+            continue;
+        }
+        
+        // Simulate page accesses
+        for i in 0..10 {
+            let virt_addr = VirtualAddress::new(0x10000000 + i * 0x1000);
+            let page_frame = PageFrame(2000 + i);
+            let is_write = i % 3 == 0; // Every third access is a write
+            
+            record_page_access(virt_addr, page_frame, is_write);
+        }
+        
+        // Test memory pressure handling
+        if let Err(e) = set_memory_pressure_threshold(5) {
+            serial_println!("Failed to set memory pressure threshold: {:?}", e);
+        } else {
+            match check_memory_pressure() {
+                Ok(swapped_count) => {
+                    if swapped_count > 0 {
+                        serial_println!("Memory pressure handling: swapped out {} pages", swapped_count);
+                    } else {
+                        serial_println!("No memory pressure detected");
+                    }
+                }
+                Err(e) => {
+                    serial_println!("Memory pressure check failed: {:?}", e);
+                }
+            }
+        }
+        
+        // Test manual page swapping
+        match swap_out_pages(2) {
+            Ok(swapped_count) => {
+                serial_println!("Manual swap: swapped out {} pages", swapped_count);
+            }
+            Err(e) => {
+                serial_println!("Manual swap failed: {:?}", e);
+            }
+        }
+        
+        // Test page fault handling
+        let fault_virt_addr = VirtualAddress::new(0x20000000);
+        let fault_page_frame = PageFrame(3000);
+        
+        match handle_page_fault(fault_virt_addr, fault_page_frame) {
+            Ok(()) => {
+                serial_println!("Page fault handled successfully");
+            }
+            Err(e) => {
+                serial_println!("Page fault handling failed: {:?}", e);
+            }
+        }
+        
+        serial_println!("{:?} algorithm test complete", algorithm);
+    }
+    
+    // Print final statistics
+    print_swapper_stats();
+    
+    serial_println!("Page swapping algorithms test complete");
 }
 
 /// Initialize process management
