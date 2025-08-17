@@ -7,6 +7,7 @@
 extern crate alloc;
 
 use core::panic::PanicInfo;
+#[cfg(target_arch = "x86_64")]
 use multiboot2::BootInformation;
 
 mod serial;
@@ -17,6 +18,7 @@ mod process;
 mod ipc;
 mod syscall;
 mod power;
+mod platform;
 
 #[cfg(test)]
 mod test_harness;
@@ -272,6 +274,7 @@ fn parse_boot_parameters(boot_info: &BootInformation) {
     serial_println!("Boot parameter parsing complete");
 }
 
+#[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub extern "C" fn _start(multiboot_info_addr: usize) -> ! {
     // Initialize early console output for debugging
@@ -304,7 +307,35 @@ pub extern "C" fn _start(multiboot_info_addr: usize) -> ! {
 
     // Halt the CPU in an infinite loop
     loop {
+        #[cfg(target_arch = "x86_64")]
         x86_64::instructions::hlt();
+        
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::arch::asm!("wfi") }; // Wait for interrupt on ARM64
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[no_mangle]
+pub extern "C" fn _start() -> ! {
+    // Initialize early console output for debugging
+    serial_println!("Kosh Kernel Starting on ARM64...");
+    println!("Kosh Kernel Starting on ARM64...");
+
+    // Initialize platform abstraction layer first
+    init_platform_abstraction();
+    
+    // Initialize kernel without multiboot2 info (ARM64 uses different boot protocol)
+    boot::init_kernel_arm64();
+
+    #[cfg(test)]
+    test_main();
+
+    println!("Kosh kernel initialized successfully on ARM64!");
+
+    // Halt the CPU in an infinite loop
+    loop {
+        unsafe { core::arch::asm!("wfi") }; // Wait for interrupt
     }
 }
 
