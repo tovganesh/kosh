@@ -1,6 +1,6 @@
 use crate::memory::{PAGE_SIZE, swap::{SwapDevice, SwapDeviceType, SwapSlot, SwapError}};
-use alloc::vec::Vec;
-use alloc::string::String;
+use alloc::{vec, vec::Vec};
+use alloc::string::{String, ToString};
 
 /// File-based swap device implementation
 pub struct FileSwapDevice {

@@ -1,12 +1,13 @@
 use crate::memory::{PAGE_SIZE, physical::PageFrame};
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec, boxed::Box};
 use alloc::collections::BTreeMap;
 use spin::Mutex;
 use crate::{serial_println, println};
 
-pub mod swap_file;
-pub mod swap_config;
-pub mod swap_algorithm;
+// Re-export swap modules that are in the same directory
+pub use crate::memory::swap_file;
+pub use crate::memory::swap_config;
+pub use crate::memory::swap_algorithm;
 
 /// Swap slot identifier - represents a location in swap space
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

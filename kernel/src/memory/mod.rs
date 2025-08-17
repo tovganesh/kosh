@@ -2,6 +2,9 @@ pub mod physical;
 pub mod vmm;
 pub mod heap;
 pub mod swap;
+pub mod swap_file;
+pub mod swap_config;
+pub mod swap_algorithm;
 
 /// Page size constant (4KB on x86-64)
 pub const PAGE_SIZE: usize = 4096;
