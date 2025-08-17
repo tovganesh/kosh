@@ -164,15 +164,16 @@
 
 - [x] 10.2 Add core system calls
 
-
   - Implement process management system calls (fork, exec, exit)
   - Add memory management system calls (mmap, munmap)
   - Create file system system calls (open, read, write, close)
   - Implement IPC system calls (send, receive)
   - _Requirements: 4.3, 3.5, 4.3, 1.5_
 
-- [ ] 11. Create user space initialization
-- [ ] 11.1 Implement init process
+- [x] 11. Create user space initialization
+
+
+- [x] 11.1 Implement init process
 
   - Create minimal init process in user space
   - Add process spawning capabilities
@@ -180,7 +181,7 @@
   - Create system shutdown handling
   - _Requirements: 8.5, 1.3_
 
-- [ ] 11.2 Add essential system services
+- [x] 11.2 Add essential system services
 
   - Create file system service process
   - Implement device manager service
