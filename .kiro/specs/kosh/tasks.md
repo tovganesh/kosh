@@ -152,8 +152,9 @@
   - Create swap space compaction
   - _Requirements: 3.1, 3.2, 3.4_
 
-- [ ] 10. Add system call interface
-- [ ] 10.1 Implement system call dispatcher
+- [-] 10. Add system call interface
+
+- [x] 10.1 Implement system call dispatcher
 
   - Create system call number definitions
   - Implement system call entry and exit handling
@@ -161,7 +162,8 @@
   - Create system call error handling
   - _Requirements: 5.3, 7.4_
 
-- [ ] 10.2 Add core system calls
+- [x] 10.2 Add core system calls
+
 
   - Implement process management system calls (fork, exec, exit)
   - Add memory management system calls (mmap, munmap)

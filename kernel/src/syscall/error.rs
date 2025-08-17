@@ -1,4 +1,5 @@
 use core::fmt;
+use alloc::format;
 
 /// System call error types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,6 +12,8 @@ pub enum SyscallError {
     PermissionDenied,
     /// Resource not found
     NotFound,
+    /// Process not found
+    ProcessNotFound,
     /// Resource already exists
     AlreadyExists,
     /// Operation not supported
@@ -45,6 +48,7 @@ impl SyscallError {
             SyscallError::InvalidArgument => -22,    // EINVAL
             SyscallError::PermissionDenied => -13,   // EACCES
             SyscallError::NotFound => -2,            // ENOENT
+            SyscallError::ProcessNotFound => -3,     // ESRCH
             SyscallError::AlreadyExists => -17,      // EEXIST
             SyscallError::NotSupported => -95,       // EOPNOTSUPP
             SyscallError::OutOfMemory => -12,        // ENOMEM
@@ -67,6 +71,7 @@ impl SyscallError {
             SyscallError::InvalidArgument => "Invalid argument",
             SyscallError::PermissionDenied => "Permission denied",
             SyscallError::NotFound => "Resource not found",
+            SyscallError::ProcessNotFound => "Process not found",
             SyscallError::AlreadyExists => "Resource already exists",
             SyscallError::NotSupported => "Operation not supported",
             SyscallError::OutOfMemory => "Out of memory",
