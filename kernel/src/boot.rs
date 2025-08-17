@@ -78,6 +78,9 @@ pub fn init_kernel(boot_info: BootInformation) {
     // Initialize IPC system
     init_ipc_system();
     
+    // Initialize system call interface
+    init_syscall_interface();
+    
     // Initialize early console output (already done in main, but ensure it's working)
     test_console_output();
     
@@ -401,7 +404,7 @@ fn test_swap_management() {
     {
         extern crate alloc;
         use alloc::boxed::Box;
-        use alloc::string::String;
+        use alloc::string::{String, ToString};
         use crate::memory::swap::swap_config::{create_default_config, SwapConfigManager};
         use crate::memory::swap::swap_file::FileSwapDevice;
         use crate::memory::swap::{add_swap_device, swap_out_page, swap_in_page, print_swap_stats};
@@ -842,6 +845,85 @@ fn test_ipc_system() {
     crate::ipc::print_ipc_info();
     
     serial_println!("IPC system test complete");
+}
+
+/// Initialize system call interface
+fn init_syscall_interface() {
+    serial_println!("Initializing system call interface...");
+    
+    match crate::syscall::init_syscall_interface() {
+        Ok(()) => {
+            serial_println!("System call interface initialized successfully");
+            
+            // Test system call functionality
+            test_syscall_interface();
+            
+            // Run comprehensive system call tests
+            crate::syscall::test::run_all_syscall_tests();
+        }
+        Err(e) => {
+            serial_println!("Failed to initialize system call interface: {}", e);
+            panic!("System call interface initialization failed");
+        }
+    }
+}
+
+/// Test system call interface functionality
+fn test_syscall_interface() {
+    serial_println!("Testing system call interface...");
+    
+    use crate::process::ProcessId;
+    use crate::syscall::{dispatch_syscall, SYS_GETPID, SYS_TIME};
+    
+    let test_pid = ProcessId::new(1);
+    let args = [0; 6];
+    
+    // Test getpid system call
+    match dispatch_syscall(test_pid, SYS_GETPID, args) {
+        Ok(result) => {
+            serial_println!("getpid syscall test passed: returned {}", result);
+        }
+        Err(e) => {
+            serial_println!("getpid syscall test failed: {:?}", e);
+        }
+    }
+    
+    // Test time system call
+    match dispatch_syscall(test_pid, SYS_TIME, args) {
+        Ok(result) => {
+            serial_println!("time syscall test passed: returned {}", result);
+        }
+        Err(e) => {
+            serial_println!("time syscall test failed: {:?}", e);
+        }
+    }
+    
+    // Test invalid system call
+    match dispatch_syscall(test_pid, 999, args) {
+        Ok(_) => {
+            serial_println!("Invalid syscall test failed: should have returned error");
+        }
+        Err(e) => {
+            serial_println!("Invalid syscall test passed: returned error {:?}", e);
+        }
+    }
+    
+    #[cfg(debug_assertions)]
+    {
+        // Test debug system calls in debug builds
+        use crate::syscall::SYS_DEBUG_PRINT;
+        
+        match dispatch_syscall(test_pid, SYS_DEBUG_PRINT, [0x1000, 10, 0, 0, 0, 0]) {
+            Ok(_) => {
+                serial_println!("debug_print syscall test passed");
+            }
+            Err(e) => {
+                serial_println!("debug_print syscall test failed: {:?}", e);
+            }
+        }
+    }
+    
+    serial_println!("System call interface test complete");
 }
 
 /// Test scheduler functionality

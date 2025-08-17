@@ -1,7 +1,7 @@
 use crate::memory::swap::{SwapDevice, SwapError, add_swap_device};
 use crate::memory::swap::swap_file::{FileSwapDevice, PartitionSwapDevice};
 use alloc::vec::Vec;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::boxed::Box;
 use crate::{serial_println, println};
 
