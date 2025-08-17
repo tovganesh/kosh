@@ -226,7 +226,6 @@
 
 - [x] 14. Add comprehensive testing framework
 
-
 - [x] 14.1 Create kernel unit tests
 
   - Implement test harness for kernel code
@@ -243,8 +242,10 @@
   - Create file system integrity tests
   - _Requirements: 9.3, 9.4_
 
-- [ ] 15. Platform abstraction and ARM preparation
-- [ ] 15.1 Create hardware abstraction layer
+- [x] 15. Platform abstraction and ARM preparation
+
+
+- [x] 15.1 Create hardware abstraction layer
 
   - Define platform-independent interfaces
   - Implement x86-64 platform layer
@@ -252,7 +253,8 @@
   - Add cross-compilation support
   - _Requirements: 2.1, 2.2, 2.3, 2.5_
 
-- [ ] 15.2 Prepare ARM64 support foundation
+- [x] 15.2 Prepare ARM64 support foundation
+
   - Create ARM64 memory management stubs
   - Implement ARM64 context switching interfaces
   - Add ARM64 interrupt handling framework

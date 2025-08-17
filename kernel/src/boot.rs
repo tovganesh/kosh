@@ -1,14 +1,21 @@
+#[cfg(target_arch = "x86_64")]
 use multiboot2::BootInformation;
+#[cfg(target_arch = "x86_64")]
 use x86_64::structures::gdt::{GlobalDescriptorTable, Descriptor, SegmentSelector};
+#[cfg(target_arch = "x86_64")]
 use x86_64::structures::tss::TaskStateSegment;
+#[cfg(target_arch = "x86_64")]
 use x86_64::instructions::segmentation::Segment;
+#[cfg(target_arch = "x86_64")]
 use x86_64::VirtAddr;
 use lazy_static::lazy_static;
 use crate::{println, serial_println};
 use crate::memory;
 
+#[cfg(target_arch = "x86_64")]
 const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
+#[cfg(target_arch = "x86_64")]
 lazy_static! {
     static ref TSS: TaskStateSegment = {
         let mut tss = TaskStateSegment::new();
@@ -24,6 +31,7 @@ lazy_static! {
     };
 }
 
+#[cfg(target_arch = "x86_64")]
 lazy_static! {
     static ref GDT: (GlobalDescriptorTable, Selectors) = {
         let mut gdt = GlobalDescriptorTable::new();
@@ -41,15 +49,20 @@ lazy_static! {
     };
 }
 
+#[cfg(target_arch = "x86_64")]
 struct Selectors {
     code_selector: SegmentSelector,
     data_selector: SegmentSelector,
     tss_selector: SegmentSelector,
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Initialize the kernel with multiboot2 information
 pub fn init_kernel(boot_info: BootInformation) {
     serial_println!("Initializing kernel...");
+    
+    // Initialize platform abstraction layer first
+    init_platform_abstraction();
     
     // Set up basic CPU state first
     init_cpu_state();
@@ -88,6 +101,38 @@ pub fn init_kernel(boot_info: BootInformation) {
     test_console_output();
     
     serial_println!("Kernel initialization complete");
+}
+
+#[cfg(target_arch = "aarch64")]
+/// Initialize the kernel for ARM64 (without multiboot2)
+pub fn init_kernel_arm64() {
+    serial_println!("Initializing ARM64 kernel...");
+    
+    // Set up basic CPU state first
+    init_cpu_state_arm64();
+    
+    // Initialize physical memory manager (with default memory layout)
+    init_physical_memory_arm64();
+    
+    // Initialize virtual memory management
+    init_virtual_memory();
+    
+    // Initialize kernel heap allocator
+    init_heap_allocator();
+    
+    // Initialize process management
+    init_process_management();
+    
+    // Initialize IPC system
+    init_ipc_system();
+    
+    // Initialize power management framework
+    init_power_management();
+    
+    // Test console output
+    test_console_output();
+    
+    serial_println!("ARM64 kernel initialization complete");
 }
 
 /// Initialize power management framework
@@ -492,6 +537,55 @@ fn test_console_output() {
     serial_println!("Console output test complete");
 }
 
+/// Initialize platform abstraction layer
+fn init_platform_abstraction() {
+    serial_println!("Initializing platform abstraction layer...");
+    
+    match crate::platform::init() {
+        Ok(()) => {
+            serial_println!("Platform abstraction layer initialized successfully");
+            
+            // Get platform information
+            let platform = crate::platform::current_platform();
+            let cpu_info = platform.get_cpu_info();
+            let memory_map = platform.get_memory_map();
+            let constants = platform.get_constants();
+            
+            serial_println!("Platform Information:");
+            serial_println!("  Architecture: {:?}", cpu_info.architecture);
+            serial_println!("  Vendor: {}", cpu_info.vendor);
+            serial_println!("  Model: {}", cpu_info.model_name);
+            serial_println!("  Cores: {}", cpu_info.core_count);
+            serial_println!("  Cache line size: {} bytes", cpu_info.cache_line_size);
+            serial_println!("  Features: MMU={}, Cache={}, FPU={}, SIMD={}", 
+                           cpu_info.features.has_mmu,
+                           cpu_info.features.has_cache,
+                           cpu_info.features.has_fpu,
+                           cpu_info.features.has_simd);
+            
+            serial_println!("Memory Map:");
+            serial_println!("  Total memory: {} MB", memory_map.total_memory / (1024 * 1024));
+            serial_println!("  Available memory: {} MB", memory_map.available_memory / (1024 * 1024));
+            serial_println!("  Memory regions: {}", memory_map.regions.len());
+            
+            serial_println!("Platform Constants:");
+            serial_println!("  Page size: {} bytes", constants.page_size);
+            serial_println!("  Virtual address bits: {}", constants.virtual_address_bits);
+            serial_println!("  Physical address bits: {}", constants.physical_address_bits);
+            
+            // Display on VGA console as well
+            println!("Platform: {} {} ({} cores)", 
+                    cpu_info.vendor, cpu_info.model_name, cpu_info.core_count);
+            println!("Memory: {} MB available", memory_map.available_memory / (1024 * 1024));
+        }
+        Err(e) => {
+            serial_println!("Failed to initialize platform abstraction layer: {}", e);
+            panic!("Platform initialization failed");
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 /// Initialize basic CPU features and state
 pub fn init_cpu_state() {
     serial_println!("Initializing CPU state...");
@@ -523,6 +617,18 @@ pub fn init_cpu_state() {
     serial_println!("CPU state initialized");
 }
 
+#[cfg(target_arch = "aarch64")]
+/// Initialize basic CPU features and state for ARM64
+pub fn init_cpu_state_arm64() {
+    serial_println!("Initializing ARM64 CPU state...");
+    
+    // ARM64 CPU initialization would go here
+    // For now, this is a stub
+    
+    serial_println!("ARM64 CPU state initialized");
+}
+
+#[cfg(target_arch = "x86_64")]
 /// Initialize physical memory manager
 fn init_physical_memory(boot_info: &BootInformation) {
     serial_println!("Initializing physical memory manager...");
@@ -566,6 +672,17 @@ fn test_physical_allocator() {
     memory::physical::print_memory_stats();
     
     serial_println!("Physical memory allocator test complete");
+}
+
+#[cfg(target_arch = "aarch64")]
+/// Initialize physical memory manager for ARM64
+fn init_physical_memory_arm64() {
+    serial_println!("Initializing ARM64 physical memory manager...");
+    
+    // ARM64 physical memory initialization would go here
+    // For now, this is a stub that assumes a default memory layout
+    
+    serial_println!("ARM64 physical memory manager initialized (stub)");
 }
 
 /// Initialize virtual memory management

@@ -9,16 +9,16 @@ kosh-ipc = { path = "../shared/kosh-ipc" }
 spin = { workspace = true }
 bitflags = { workspace = true }
 log = { workspace = true }
+volatile = "0.2"
+lazy_static = { version = "1.4", features = ["spin_no_std"] }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
 multiboot2 = "0.24"
 x86_64 = "0.14"
 uart_16550 = "0.3"
 pic8259 = "0.11"
 pc-keyboard = "0.7"
-
-volatile = "0.2"
-lazy_static = { version = "1.4", features = ["spin_no_std"] }
-
-[target.'cfg(target_arch = "x86_64")'.dependencies]
+raw-cpuid = "11.0"
 bootloader = "0.9"
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
