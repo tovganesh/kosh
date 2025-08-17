@@ -2,6 +2,9 @@ pub mod process;
 pub mod scheduler;
 pub mod context;
 
+#[cfg(test)]
+pub mod tests;
+
 pub use process::{
     Process, ProcessId, ProcessState, ProcessTable, ProcessError, ProcessPriority, ProcessInfo,
     create_process, get_process, remove_process, set_current_process, get_current_process,

@@ -18,6 +18,11 @@ mod ipc;
 mod syscall;
 mod power;
 
+#[cfg(test)]
+mod test_harness;
+#[cfg(test)]
+mod driver_tests;
+
 #[global_allocator]
 static ALLOCATOR: memory::heap::GlobalKernelAllocator = memory::heap::GlobalKernelAllocator;
 
@@ -256,10 +261,12 @@ fn parse_boot_parameters(boot_info: &BootInformation) {
     
     // Display framebuffer info if available
     if let Some(framebuffer_tag) = boot_info.framebuffer_tag() {
-        serial_println!("Framebuffer: {}x{} @ {} bpp", 
-                       framebuffer_tag.width(), 
-                       framebuffer_tag.height(),
-                       framebuffer_tag.bpp());
+        if let Ok(framebuffer) = framebuffer_tag {
+            serial_println!("Framebuffer: {}x{} @ {} bpp", 
+                           framebuffer.width(), 
+                           framebuffer.height(),
+                           framebuffer.bpp());
+        }
     }
     
     serial_println!("Boot parameter parsing complete");
@@ -331,11 +338,31 @@ fn panic(info: &PanicInfo) -> ! {
 
 #[cfg(test)]
 fn test_runner(tests: &[&dyn Fn()]) {
-    serial_println!("Running {} tests", tests.len());
+    serial_println!("Running {} legacy tests", tests.len());
     for test in tests {
         test();
     }
+    
+    // Run comprehensive kernel test suite
+    run_comprehensive_tests();
+    
     exit_qemu(QemuExitCode::Success);
+}
+
+#[cfg(test)]
+fn run_comprehensive_tests() {
+    use test_harness::KernelTestRunner;
+    
+    let mut runner = KernelTestRunner::new();
+    
+    // Register all test modules
+    memory::tests::register_memory_tests(&mut runner);
+    process::tests::register_process_tests(&mut runner);
+    ipc::tests::register_ipc_tests(&mut runner);
+    driver_tests::register_driver_tests(&mut runner);
+    
+    // Run all tests
+    runner.run_all_tests();
 }
 
 #[cfg(test)]

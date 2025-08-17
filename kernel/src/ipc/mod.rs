@@ -6,6 +6,9 @@ pub mod security;
 #[cfg(test)]
 pub mod capability_test;
 
+#[cfg(test)]
+pub mod tests;
+
 pub use message::{
     Message, MessageId, MessageType, MessageData, MessageHeader, MessageError,
     create_message, send_message, receive_message, reply_message

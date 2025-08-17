@@ -208,7 +208,6 @@
 
 - [x] 13. Create build system for ISO generation
 
-
 - [x] 13.1 Implement bootloader integration
 
   - Configure GRUB2 as bootloader
@@ -225,8 +224,10 @@
   - Create bootable ISO testing scripts
   - _Requirements: 9.1, 9.2, 9.5_
 
-- [ ] 14. Add comprehensive testing framework
-- [ ] 14.1 Create kernel unit tests
+- [x] 14. Add comprehensive testing framework
+
+
+- [x] 14.1 Create kernel unit tests
 
   - Implement test harness for kernel code
   - Add memory management tests
@@ -234,7 +235,7 @@
   - Implement driver framework tests
   - _Requirements: 5.1, 5.2, 5.3, 5.4_
 
-- [ ] 14.2 Add integration testing
+- [x] 14.2 Add integration testing
 
   - Create VirtualBox testing automation
   - Implement full system boot tests
