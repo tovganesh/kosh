@@ -76,6 +76,32 @@ impl Default for ProcessPriority {
     }
 }
 
+impl ProcessPriority {
+    /// Boost priority by the specified number of levels
+    pub fn boost(self, levels: u8) -> Self {
+        let current_level = self as u8;
+        let new_level = current_level.saturating_sub(levels);
+        match new_level {
+            0 => ProcessPriority::System,
+            1 => ProcessPriority::Interactive,
+            2 => ProcessPriority::Normal,
+            _ => ProcessPriority::Background,
+        }
+    }
+
+    /// Reduce priority by the specified number of levels
+    pub fn reduce(self, levels: u8) -> Self {
+        let current_level = self as u8;
+        let new_level = (current_level + levels).min(3);
+        match new_level {
+            0 => ProcessPriority::System,
+            1 => ProcessPriority::Interactive,
+            2 => ProcessPriority::Normal,
+            _ => ProcessPriority::Background,
+        }
+    }
+}
+
 /// Process control block containing all process information
 #[derive(Debug)]
 pub struct Process {

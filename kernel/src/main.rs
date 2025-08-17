@@ -16,6 +16,7 @@ mod memory;
 mod process;
 mod ipc;
 mod syscall;
+mod power;
 
 #[global_allocator]
 static ALLOCATOR: memory::heap::GlobalKernelAllocator = memory::heap::GlobalKernelAllocator;

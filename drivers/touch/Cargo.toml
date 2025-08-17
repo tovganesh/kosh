@@ -1,0 +1,14 @@
+[package]
+name = "kosh-touch-driver"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "kosh_touch_driver"
+crate-type = ["staticlib"]
+
+[dependencies]
+shared-kosh-driver = { path = "../../shared/kosh-driver" }
+
+[features]
+default = []

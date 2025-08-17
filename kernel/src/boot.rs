@@ -81,10 +81,318 @@ pub fn init_kernel(boot_info: BootInformation) {
     // Initialize system call interface
     init_syscall_interface();
     
+    // Initialize power management framework
+    init_power_management();
+    
     // Initialize early console output (already done in main, but ensure it's working)
     test_console_output();
     
     serial_println!("Kernel initialization complete");
+}
+
+/// Initialize power management framework
+fn init_power_management() {
+    serial_println!("Initializing power management framework...");
+    
+    // Initialize CPU frequency scaling
+    match crate::power::cpu_scaling::init() {
+        Ok(()) => {
+            serial_println!("CPU frequency scaling initialized successfully");
+        }
+        Err(e) => {
+            serial_println!("Failed to initialize CPU frequency scaling: {}", e);
+            // Don't panic - power management is optional for basic functionality
+            println!("Warning: CPU frequency scaling not available");
+        }
+    }
+    
+    // Initialize idle state management
+    match crate::power::idle_management::init() {
+        Ok(()) => {
+            serial_println!("Idle state management initialized successfully");
+        }
+        Err(e) => {
+            serial_println!("Failed to initialize idle state management: {}", e);
+            println!("Warning: Idle state management not available");
+        }
+    }
+    
+    // Initialize battery monitoring
+    match crate::power::battery_monitor::init() {
+        Ok(()) => {
+            serial_println!("Battery monitoring initialized successfully");
+        }
+        Err(e) => {
+            serial_println!("Failed to initialize battery monitoring: {}", e);
+            println!("Warning: Battery monitoring not available");
+        }
+    }
+    
+    // Initialize power policy management
+    match crate::power::power_policy::init() {
+        Ok(()) => {
+            serial_println!("Power policy management initialized successfully");
+        }
+        Err(e) => {
+            serial_println!("Failed to initialize power policy management: {}", e);
+            println!("Warning: Power policy management not available");
+        }
+    }
+    
+    // Initialize responsiveness optimizations
+    match crate::power::responsiveness::init() {
+        Ok(()) => {
+            serial_println!("Responsiveness optimizations initialized successfully");
+            
+            // Test power management functionality
+            test_power_management();
+        }
+        Err(e) => {
+            serial_println!("Failed to initialize responsiveness optimizations: {}", e);
+            println!("Warning: Responsiveness optimizations not available");
+        }
+    }
+    
+    serial_println!("Power management framework initialization complete");
+}
+
+/// Test power management functionality
+fn test_power_management() {
+    serial_println!("Testing power management framework...");
+    
+    use crate::power::{
+        PowerState, CpuGovernor, ProcessActivity,
+        cpu_scaling, idle_management, battery_monitor, power_policy,
+    };
+    use crate::process::ProcessId;
+    
+    // Test CPU frequency scaling
+    serial_println!("Testing CPU frequency scaling...");
+    
+    // Test different governors
+    let governors = [
+        CpuGovernor::Performance,
+        CpuGovernor::OnDemand,
+        CpuGovernor::PowerSave,
+        CpuGovernor::Interactive,
+    ];
+    
+    for governor in &governors {
+        match cpu_scaling::set_governor(*governor) {
+            Ok(()) => {
+                serial_println!("Successfully set CPU governor to {:?}", governor);
+                
+                if let Ok(freq_info) = cpu_scaling::get_frequency_info() {
+                    serial_println!("  Current frequency: {} MHz", freq_info.current_mhz);
+                    serial_println!("  Frequency range: {} - {} MHz", 
+                                   freq_info.min_mhz, freq_info.max_mhz);
+                }
+            }
+            Err(e) => {
+                serial_println!("Failed to set CPU governor {:?}: {}", governor, e);
+            }
+        }
+    }
+    
+    // Test CPU load updates
+    let test_loads = [10, 30, 50, 70, 90];
+    for load in &test_loads {
+        match cpu_scaling::update_load(*load) {
+            Ok(()) => {
+                serial_println!("Updated CPU load to {}%", load);
+            }
+            Err(e) => {
+                serial_println!("Failed to update CPU load: {}", e);
+            }
+        }
+    }
+    
+    // Test process activity notifications
+    let test_pid = ProcessId::new(100);
+    cpu_scaling::notify_process_activity(test_pid, ProcessActivity::Interactive);
+    serial_println!("Notified CPU scaling of interactive process activity");
+    
+    // Test idle state management
+    serial_println!("Testing idle state management...");
+    
+    let current_time = 1000; // Simulated timestamp
+    
+    // Test entering idle
+    match idle_management::enter_idle(current_time) {
+        Ok(idle_state) => {
+            serial_println!("Entered idle state: {:?}", idle_state);
+        }
+        Err(e) => {
+            serial_println!("Failed to enter idle state: {}", e);
+        }
+    }
+    
+    // Test process activity notification for idle management
+    idle_management::notify_process_activity(test_pid, ProcessActivity::Interactive, current_time + 100);
+    serial_println!("Notified idle management of process activity");
+    
+    // Test exiting idle
+    match idle_management::exit_idle(current_time + 200) {
+        Ok(()) => {
+            serial_println!("Exited idle state successfully");
+        }
+        Err(e) => {
+            serial_println!("Failed to exit idle state: {}", e);
+        }
+    }
+    
+    // Test idle statistics
+    match idle_management::get_stats() {
+        Ok(stats) => {
+            serial_println!("Idle statistics:");
+            serial_println!("  Total idle time: {} ms", stats.total_idle_time);
+            serial_println!("  Total idle entries: {}", stats.total_idle_entries);
+        }
+        Err(e) => {
+            serial_println!("Failed to get idle statistics: {}", e);
+        }
+    }
+    
+    // Test battery monitoring
+    serial_println!("Testing battery monitoring...");
+    
+    // Test battery info retrieval
+    match battery_monitor::get_battery_info() {
+        Ok(battery_info) => {
+            serial_println!("Battery information:");
+            serial_println!("  Level: {}%", battery_info.level_percent);
+            serial_println!("  Charging: {}", battery_info.is_charging);
+            if let Some(time_remaining) = battery_info.estimated_time_remaining {
+                serial_println!("  Time remaining: {} minutes", time_remaining);
+            }
+        }
+        Err(e) => {
+            serial_println!("Failed to get battery info: {}", e);
+        }
+    }
+    
+    // Test power state recommendations
+    let recommended_state = battery_monitor::get_recommended_power_state();
+    serial_println!("Recommended power state: {:?}", recommended_state);
+    
+    // Test battery status checks
+    if battery_monitor::is_critical() {
+        serial_println!("Battery is in critical state");
+    } else if battery_monitor::is_low() {
+        serial_println!("Battery is in low state");
+    } else {
+        serial_println!("Battery level is normal");
+    }
+    
+    // Test power policy management
+    serial_println!("Testing power policy management...");
+    
+    // Test power state changes
+    let test_states = [
+        PowerState::Performance,
+        PowerState::Balanced,
+        PowerState::PowerSaver,
+    ];
+    
+    for state in &test_states {
+        match power_policy::set_power_state(*state) {
+            Ok(()) => {
+                serial_println!("Successfully set power state to {:?}", state);
+                let current_state = power_policy::get_power_state();
+                serial_println!("  Current power state: {:?}", current_state);
+            }
+            Err(e) => {
+                serial_println!("Failed to set power state {:?}: {}", state, e);
+            }
+        }
+    }
+    
+    // Test process classification
+    use crate::power::power_policy::ProcessPowerClass;
+    power_policy::classify_process(test_pid, ProcessPowerClass::Interactive);
+    serial_println!("Classified process {} as Interactive", test_pid.0);
+    
+    // Test process activity notification
+    power_policy::notify_process_activity(test_pid, ProcessActivity::Interactive, current_time + 300);
+    serial_println!("Notified power policy of process activity");
+    
+    // Test power-aware priority calculation
+    use crate::process::ProcessPriority;
+    let base_priority = ProcessPriority::Normal;
+    let power_aware_priority = power_policy::get_power_aware_priority(test_pid, base_priority);
+    serial_println!("Power-aware priority: {:?} -> {:?}", base_priority, power_aware_priority);
+    
+    // Test time slice multiplier
+    let time_slice_multiplier = power_policy::get_time_slice_multiplier(test_pid);
+    serial_println!("Time slice multiplier for process {}: {:.2}", test_pid.0, time_slice_multiplier);
+    
+    // Test background throttling check
+    if power_policy::should_throttle_background(test_pid) {
+        serial_println!("Process {} should be throttled", test_pid.0);
+    } else {
+        serial_println!("Process {} should not be throttled", test_pid.0);
+    }
+    
+    // Test responsiveness optimizations
+    serial_println!("Testing responsiveness optimizations...");
+    
+    use crate::power::responsiveness::{
+        TouchEvent, GestureType, SwipeDirection, 
+        handle_touch_event, get_adaptive_time_slice, should_throttle_process,
+        update_system_metrics, get_statistics
+    };
+    
+    // Test touch input handling
+    let touch_events = [
+        TouchEvent::TouchDown { x: 100, y: 200 },
+        TouchEvent::TouchMove { x: 105, y: 205 },
+        TouchEvent::TouchMove { x: 110, y: 210 },
+        TouchEvent::TouchUp { x: 115, y: 215 },
+        TouchEvent::Gesture { gesture_type: GestureType::Swipe { direction: SwipeDirection::Right } },
+    ];
+    
+    for (i, event) in touch_events.iter().enumerate() {
+        let timestamp = current_time + 400 + (i as u64 * 10);
+        match handle_touch_event(*event, timestamp) {
+            Ok(()) => {
+                serial_println!("Handled touch event: {:?}", event);
+            }
+            Err(e) => {
+                serial_println!("Failed to handle touch event: {}", e);
+            }
+        }
+    }
+    
+    // Test adaptive time slice calculation
+    let base_time_slice = 10; // 10ms
+    let adaptive_time_slice = get_adaptive_time_slice(test_pid, base_time_slice, current_time + 500);
+    serial_println!("Adaptive time slice for process {}: {} ms (base: {} ms)", 
+                   test_pid.0, adaptive_time_slice, base_time_slice);
+    
+    // Test responsiveness throttling
+    if should_throttle_process(test_pid) {
+        serial_println!("Process {} should be throttled for responsiveness", test_pid.0);
+    } else {
+        serial_println!("Process {} should not be throttled for responsiveness", test_pid.0);
+    }
+    
+    // Test system metrics update
+    update_system_metrics(75, 60, current_time + 600); // 75% CPU, 60% memory
+    serial_println!("Updated system metrics: 75% CPU, 60% memory");
+    
+    // Test responsiveness statistics
+    if let Some(stats) = get_statistics() {
+        serial_println!("Responsiveness statistics:");
+        serial_println!("  Interactive processes: {}", stats.interactive_processes_count);
+        serial_println!("  Tracked processes: {}", stats.tracked_processes_count);
+        serial_println!("  Average response time: {} μs", stats.average_response_time_us);
+        serial_println!("  System load: {}%", stats.system_load_percent);
+        serial_println!("  Memory usage: {}%", stats.memory_usage_percent);
+        serial_println!("  Touch events queued: {}", stats.touch_events_queued);
+        serial_println!("  Throttled processes: {}", stats.throttled_processes_count);
+    }
+    
+    serial_println!("Power management framework test complete");
 }
 
 /// Initialize Global Descriptor Table and Task State Segment
