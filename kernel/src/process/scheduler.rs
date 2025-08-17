@@ -2,6 +2,7 @@ use alloc::vec::Vec;
 use spin::Mutex;
 use crate::process::{ProcessId, ProcessPriority, get_runnable_processes, get_process, set_current_process, get_current_process};
 use crate::process::context::{CpuContext, ContextSwitcher};
+use crate::power::{power_policy, responsiveness, ProcessActivity};
 use crate::{serial_println, println};
 
 /// Scheduler errors
@@ -91,6 +92,18 @@ impl Scheduler {
                 set_current_process(Some(pid))
                     .map_err(|_| SchedulerError::InvalidProcess)?;
                 self.stats.context_switches += 1;
+                
+                // Notify power management of process activity
+                // Determine activity type based on process priority
+                if let Some(process) = get_process(pid) {
+                    let activity = match process.priority {
+                        ProcessPriority::System => ProcessActivity::Interactive,
+                        ProcessPriority::Interactive => ProcessActivity::Interactive,
+                        ProcessPriority::Normal => ProcessActivity::Background,
+                        ProcessPriority::Background => ProcessActivity::Background,
+                    };
+                    self.notify_power_management(pid, activity);
+                }
                 
                 serial_println!("Scheduled process {} (algorithm: {:?})", pid.0, self.algorithm);
             }
@@ -208,14 +221,26 @@ impl Scheduler {
         
         for pid in runnable_processes {
             if let Some(process) = get_process(pid) {
-                let priority_index = match process.priority {
+                // Get power-aware priority instead of base priority
+                let effective_priority = power_policy::get_power_aware_priority(pid, process.priority);
+                
+                let priority_index = match effective_priority {
                     ProcessPriority::System => 0,
                     ProcessPriority::Interactive => 1,
                     ProcessPriority::Normal => 2,
                     ProcessPriority::Background => 3,
                 };
                 
-                self.priority_queues[priority_index].push(pid);
+                // Check if background task should be throttled
+                let should_throttle_power = power_policy::should_throttle_background(pid);
+                let should_throttle_responsiveness = responsiveness::should_throttle_process(pid);
+                
+                if !should_throttle_power && !should_throttle_responsiveness {
+                    self.priority_queues[priority_index].push(pid);
+                } else {
+                    // Throttled processes go to the lowest priority queue
+                    self.priority_queues[3].push(pid);
+                }
             }
         }
     }
@@ -245,6 +270,24 @@ impl Scheduler {
                        self.time_slice_ms, time_slice_ms);
         self.time_slice_ms = time_slice_ms;
         self.stats.time_slice_ms = time_slice_ms;
+    }
+    
+    /// Get power-aware time slice for a process
+    fn get_power_aware_time_slice(&self, pid: ProcessId) -> u64 {
+        let base_multiplier = power_policy::get_time_slice_multiplier(pid);
+        let base_time_slice = ((self.time_slice_ms as f32) * base_multiplier) as u64;
+        
+        // Apply responsiveness optimizations
+        let current_time = self.stats.context_switches; // Use context switches as time proxy
+        responsiveness::get_adaptive_time_slice(pid, base_time_slice, current_time)
+    }
+    
+    /// Notify power management of process scheduling activity
+    fn notify_power_management(&self, pid: ProcessId, activity: ProcessActivity) {
+        // Get current time (simplified - in real implementation would use proper timer)
+        let current_time = self.stats.context_switches; // Use context switches as time proxy
+        power_policy::notify_process_activity(pid, activity, current_time);
+        responsiveness::notify_process_activity(pid, activity, current_time);
     }
     
     /// Get current time slice
