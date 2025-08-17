@@ -1,0 +1,108 @@
+# Kosh Testing Configuration
+# This file defines test parameters and settings
+
+[general]
+# Test timeout in seconds
+timeout = 300
+# Maximum memory for test VMs (MB)
+max_memory = 512
+# Test results directory
+results_dir = "test-results"
+
+[unit_tests]
+# Enable comprehensive unit testing
+enabled = true
+# Test categories to run
+categories = ["memory", "process", "ipc", "driver", "syscall"]
+# Parallel test execution
+parallel = false
+
+[integration_tests]
+# Enable integration testing
+enabled = true
+# Test environments
+environments = ["qemu", "virtualbox"]
+# Boot timeout (seconds)
+boot_timeout = 30
+# Stability test duration (seconds)
+stability_duration = 15
+
+[qemu]
+# QEMU executable path (auto-detected if empty)
+executable = ""
+# Default memory allocation (MB)
+memory = 256
+# Additional QEMU arguments
+extra_args = ["-no-reboot", "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]
+# Serial output capture
+capture_serial = true
+
+[virtualbox]
+# VirtualBox executable path (auto-detected if empty)
+vboxmanage = ""
+# Test VM configuration
+vm_memory = 256
+vm_cpus = 1
+vm_vram = 16
+# Clean up test VMs after testing
+cleanup = true
+
+[build_tests]
+# Test build system
+enabled = true
+# Test targets
+targets = ["x86_64-kosh", "aarch64-kosh"]
+# Test build modes
+modes = ["debug", "release"]
+# Validate generated artifacts
+validate_artifacts = true
+
+[driver_tests]
+# Test driver framework
+enabled = true
+# Driver directories to test
+driver_dirs = ["drivers/graphics", "drivers/keyboard", "drivers/storage", "drivers/network", "drivers/touch"]
+# Test driver manager
+test_manager = true
+# Test driver isolation
+test_isolation = true
+
+[filesystem_tests]
+# Test file system integrity
+enabled = true
+# Test ISO structure
+test_iso_structure = true
+# Test multiboot2 compliance
+test_multiboot2 = true
+# Test file system operations
+test_operations = false  # Requires running system
+
+[performance_tests]
+# Performance testing (disabled by default)
+enabled = false
+# Boot time measurement
+measure_boot_time = true
+# Memory usage profiling
+profile_memory = true
+# IPC latency testing
+test_ipc_latency = true
+
+[reporting]
+# Generate HTML reports
+html_reports = true
+# Generate JUnit XML
+junit_xml = true
+# Generate coverage reports
+coverage_reports = false
+# Email notifications (requires configuration)
+email_notifications = false
+
+[logging]
+# Log level (debug, info, warn, error)
+level = "info"
+# Log to file
+log_file = "test-results/test.log"
+# Console output
+console_output = true
+# Detailed error reporting
+detailed_errors = true

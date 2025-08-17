@@ -28,5 +28,18 @@ bootloader = "0.9"
 name = "kosh-kernel"
 path = "src/main.rs"
 
+[lib]
+name = "kosh_kernel"
+path = "src/lib.rs"
+
 [build-dependencies]
 cc = "1.0"
+
+# Test configuration
+[profile.test]
+panic = "abort"
+
+# Custom test harness configuration
+[[test]]
+name = "kernel_tests"
+harness = false

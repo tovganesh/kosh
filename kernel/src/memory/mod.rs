@@ -6,6 +6,9 @@ pub mod swap_file;
 pub mod swap_config;
 pub mod swap_algorithm;
 
+#[cfg(test)]
+pub mod tests;
+
 /// Page size constant (4KB on x86-64)
 pub const PAGE_SIZE: usize = 4096;
 
