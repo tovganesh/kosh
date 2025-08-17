@@ -190,7 +190,6 @@
 
 - [x] 12. Implement mobile optimizations
 
-
 - [x] 12.1 Add power management framework
 
   - Create CPU frequency scaling support
@@ -207,8 +206,10 @@
   - Implement background task throttling
   - _Requirements: 6.2, 6.5, 6.3_
 
-- [ ] 13. Create build system for ISO generation
-- [ ] 13.1 Implement bootloader integration
+- [x] 13. Create build system for ISO generation
+
+
+- [x] 13.1 Implement bootloader integration
 
   - Configure GRUB2 as bootloader
   - Create GRUB configuration files
@@ -216,7 +217,7 @@
   - Implement multiboot2 compliance
   - _Requirements: 9.1, 9.2, 8.1_
 
-- [ ] 13.2 Build ISO creation pipeline
+- [x] 13.2 Build ISO creation pipeline
 
   - Create ISO filesystem structure
   - Implement automated ISO building
