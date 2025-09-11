@@ -3,7 +3,7 @@
 
 extern crate alloc;
 
-use kosh_keyboard_driver::{register_keyboard_driver, keyboard_interrupt_handler};
+use kosh_keyboard_driver::{keyboard_interrupt_handler, register_keyboard_driver};
 
 /// Entry point for the keyboard driver process
 #[no_mangle]
@@ -21,13 +21,13 @@ pub extern "C" fn _start() -> ! {
         // 2. Handle driver requests
         // 3. Process hardware interrupts
         // 4. Send responses back to requesters
-        
+
         // For now, just halt
         #[cfg(target_arch = "x86_64")]
         unsafe {
             core::arch::asm!("hlt");
         }
-        
+
         #[cfg(not(target_arch = "x86_64"))]
         {
             // For other architectures, just loop

@@ -1,7 +1,9 @@
 use alloc::vec::Vec;
 use alloc::string::String;
 use kosh_types::ProcessId;
-use crate::syscalls::{sys_kill, sys_debug_print};
+use crate::syscalls::sys_kill;
+#[cfg(debug_assertions)]
+use crate::syscalls::sys_debug_print;
 
 #[derive(Debug, Clone)]
 pub struct Service {

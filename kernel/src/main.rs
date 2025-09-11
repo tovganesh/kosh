@@ -81,96 +81,36 @@ pub extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
     dest
 }
 
-// Multiboot2 header with comprehensive boot information
+// Multiboot2 header - simple and reliable approach
 #[repr(C, align(8))]
 struct Multiboot2Header {
     magic: u32,
     architecture: u32,
     header_length: u32,
     checksum: u32,
-    
-    // Information request tag
-    info_req_type: u16,
-    info_req_flags: u16,
-    info_req_size: u32,
-    info_req_requests: [u32; 8], // Request specific boot information
-    
-    // Console flags tag (optional)
-    console_type: u16,
-    console_flags: u16,
-    console_size: u32,
-    console_flags_value: u32,
-    
-    // Framebuffer tag (for future graphics support)
-    framebuffer_type: u16,
-    framebuffer_flags: u16,
-    framebuffer_size: u32,
-    framebuffer_width: u32,
-    framebuffer_height: u32,
-    framebuffer_depth: u32,
-    
-    // Module alignment tag
-    module_align_type: u16,
-    module_align_flags: u16,
-    module_align_size: u32,
-    
     // End tag
-    end_tag_type: u16,
-    end_tag_flags: u16,
-    end_tag_size: u32,
+    end_type: u16,
+    end_flags: u16,
+    end_size: u32,
 }
 
 #[link_section = ".multiboot2"]
 #[no_mangle]
+#[used]
 static MULTIBOOT2_HEADER: Multiboot2Header = {
-    const HEADER_SIZE: u32 = core::mem::size_of::<Multiboot2Header>() as u32;
     const MAGIC: u32 = 0xE85250D6;
-    const ARCH: u32 = 0; // i386 protected mode
+    const ARCH: u32 = 0;
+    const HEADER_LEN: u32 = 16; // 4 u32 fields = 16 bytes for main header
     
     Multiboot2Header {
         magic: MAGIC,
         architecture: ARCH,
-        header_length: HEADER_SIZE,
-        checksum: 0x100000000u64.wrapping_sub(MAGIC as u64 + ARCH as u64 + HEADER_SIZE as u64) as u32,
-        
-        // Information request tag - request specific boot info
-        info_req_type: 1,
-        info_req_flags: 0,
-        info_req_size: 40, // 8 + 8*4 bytes
-        info_req_requests: [
-            4,  // Basic memory information
-            6,  // Memory map
-            8,  // Framebuffer info
-            9,  // ELF symbols
-            10, // APM table
-            14, // ACPI old RSDP
-            15, // ACPI new RSDP
-            21, // Image load base address
-        ],
-        
-        // Console flags tag - prefer text console
-        console_type: 4,
-        console_flags: 1, // Console required
-        console_size: 12,
-        console_flags_value: 2, // EGA text supported
-        
-        // Framebuffer tag - request specific framebuffer (optional)
-        framebuffer_type: 5,
-        framebuffer_flags: 1, // Framebuffer preferred
-        framebuffer_size: 20,
-        framebuffer_width: 1024,
-        framebuffer_height: 768,
-        framebuffer_depth: 32,
-        
-        // Module alignment tag
-        module_align_type: 6,
-        module_align_flags: 0,
-        module_align_size: 8,
-        
+        header_length: HEADER_LEN,
+        checksum: 0u32.wrapping_sub(MAGIC).wrapping_sub(ARCH).wrapping_sub(HEADER_LEN),
         // End tag
-        end_tag_type: 0,
-        end_tag_flags: 0,
-        end_tag_size: 8,
+        end_type: 0,
+        end_flags: 0,
+        end_size: 8,
     }
 };
 
@@ -337,6 +277,30 @@ pub extern "C" fn _start() -> ! {
     loop {
         unsafe { core::arch::asm!("wfi") }; // Wait for interrupt
     }
+}
+
+/// Initialize platform abstraction layer
+fn init_platform_abstraction() {
+    serial_println!("Initializing platform abstraction layer...");
+    
+    // Initialize the appropriate platform
+    #[cfg(target_arch = "x86_64")]
+    {
+        if let Err(e) = platform::x86_64::init() {
+            serial_println!("Failed to initialize x86_64 platform: {:?}", e);
+            panic!("Platform initialization failed");
+        }
+    }
+    
+    #[cfg(target_arch = "aarch64")]
+    {
+        if let Err(e) = platform::aarch64::init() {
+            serial_println!("Failed to initialize ARM64 platform: {:?}", e);
+            panic!("Platform initialization failed");
+        }
+    }
+    
+    serial_println!("Platform abstraction layer initialized successfully");
 }
 
 #[panic_handler]
