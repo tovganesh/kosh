@@ -112,8 +112,7 @@ pub fn sys_kill(pid: ProcessId, signal: i32) -> Result<(), i32> {
     }
 }
 
-/// Debug print function (only available in debug builds)
-#[cfg(debug_assertions)]
+/// Debug print function
 pub fn sys_debug_print(message: &[u8]) {
     unsafe {
         core::arch::asm!(
