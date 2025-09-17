@@ -1,5 +1,7 @@
 NOTE: I am building this using kiro, using a spec based approach.
+
 Intial thoughs and ideas: https://blog.tovganesh.in/2012/01/kosh-building-mobile-user-experience.html
+
 At this point this is my personal toy project. I currently have no idea if this will actually work. If you are interested in writing a rust based OS with or without AI tools you can poke me.
 
 
