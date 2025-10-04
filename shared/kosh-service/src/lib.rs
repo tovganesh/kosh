@@ -155,7 +155,7 @@ impl ServiceClient {
         };
         
         // Convert to IPC message
-        let ipc_message = self.service_message_to_ipc(service_pid, service_message)?;
+        let _ipc_message = self.service_message_to_ipc(service_pid, service_message)?;
         
         // Send via IPC (this would use actual IPC system calls)
         // For now, just return the request ID
@@ -168,7 +168,7 @@ impl ServiceClient {
         Err(ServiceError::NotImplemented)
     }
     
-    fn service_message_to_ipc(&self, receiver: ProcessId, message: ServiceMessage) -> Result<Message, ServiceError> {
+    fn service_message_to_ipc(&self, receiver: ProcessId, _message: ServiceMessage) -> Result<Message, ServiceError> {
         // Convert ServiceMessage to IPC Message
         // This is a simplified conversion
         let message_data = MessageData::Bytes(&[]); // Would serialize the actual data

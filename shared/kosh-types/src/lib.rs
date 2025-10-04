@@ -3,7 +3,6 @@
 use bitflags::bitflags;
 
 extern crate alloc;
-use alloc::string::String;
 
 pub type ProcessId = u32;
 pub type DriverId = u32;

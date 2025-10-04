@@ -1,5 +1,4 @@
-use alloc::string::String;
-use alloc::format;
+use crate::types::TextColor;
 
 pub struct OutputHandler {
     // Could store output buffer or display state here
@@ -21,24 +20,28 @@ impl OutputHandler {
         self.print("\n");
     }
     
+    #[allow(dead_code)]
     pub fn print_char(&self, ch: char) {
         let mut buffer = [0u8; 4];
         let char_str = ch.encode_utf8(&mut buffer);
         self.write_to_display(char_str.as_bytes());
     }
     
+    #[allow(dead_code)]
     pub fn clear_screen(&self) {
         // In a real implementation, this would clear the display
         // For now, just print some newlines
         self.print("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n");
     }
     
-    pub fn set_cursor_position(&self, x: usize, y: usize) {
+    #[allow(dead_code)]
+    pub fn set_cursor_position(&self, _x: usize, _y: usize) {
         // In a real implementation, this would set cursor position
         // via display driver
     }
     
-    pub fn set_text_color(&self, color: TextColor) {
+    #[allow(dead_code)]
+    pub fn set_text_color(&self, _color: TextColor) {
         // In a real implementation, this would set text color
         // via display driver
     }
@@ -65,22 +68,3 @@ impl OutputHandler {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum TextColor {
-    Black,
-    Red,
-    Green,
-    Yellow,
-    Blue,
-    Magenta,
-    Cyan,
-    White,
-    BrightBlack,
-    BrightRed,
-    BrightGreen,
-    BrightYellow,
-    BrightBlue,
-    BrightMagenta,
-    BrightCyan,
-    BrightWhite,
-}
