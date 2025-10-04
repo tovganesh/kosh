@@ -1,5 +1,6 @@
 use alloc::string::String;
 use alloc::vec::Vec;
+use crate::types::SpecialKey;
 
 pub struct InputHandler {
     input_buffer: Vec<u8>,
@@ -39,12 +40,14 @@ impl InputHandler {
         }
     }
     
+    #[allow(dead_code)]
     fn read_char(&self) -> Option<char> {
         // In a real implementation, this would read a single character
         // from the keyboard driver via system calls
         None
     }
     
+    #[allow(dead_code)]
     fn handle_special_key(&mut self, key: SpecialKey) {
         match key {
             SpecialKey::Backspace => {
@@ -67,18 +70,4 @@ impl InputHandler {
             }
         }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum SpecialKey {
-    Backspace,
-    Enter,
-    Tab,
-    ArrowUp,
-    ArrowDown,
-    ArrowLeft,
-    ArrowRight,
-    Delete,
-    Home,
-    End,
 }

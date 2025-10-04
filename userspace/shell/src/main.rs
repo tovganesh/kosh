@@ -3,12 +3,9 @@
 
 extern crate alloc;
 
-use core::panic::PanicInfo;
-use alloc::vec::Vec;
 use alloc::string::String;
 use alloc::format;
 use linked_list_allocator::LockedHeap;
-use kosh_service::ServiceClient;
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
@@ -16,10 +13,13 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 mod commands;
 mod input;
 mod output;
+mod error;
+mod types;
 
 use commands::CommandProcessor;
 use input::InputHandler;
 use output::OutputHandler;
+use error::ShellResult;
 
 /// Basic shell for testing the Kosh operating system
 #[no_mangle]
@@ -34,20 +34,16 @@ pub extern "C" fn _start() -> ! {
 }
 
 struct KoshShell {
-    command_processor: CommandProcessor,
     input_handler: InputHandler,
     output_handler: OutputHandler,
-    service_client: ServiceClient,
     running: bool,
 }
 
 impl KoshShell {
     fn new() -> Self {
         Self {
-            command_processor: CommandProcessor::new(),
             input_handler: InputHandler::new(),
             output_handler: OutputHandler::new(),
-            service_client: ServiceClient::new(),
             running: true,
         }
     }
@@ -74,7 +70,10 @@ impl KoshShell {
                     }
                 }
                 Err(error) => {
-                    self.output_handler.print_line(&format!("Error: {}", error));
+                    self.output_handler.print_line(&error.user_message());
+                    if let Some(suggestion) = error.suggest_fix() {
+                        self.output_handler.print_line(&format!("Suggestion: {}", suggestion));
+                    }
                 }
             }
             
@@ -90,76 +89,12 @@ impl KoshShell {
         sys_exit(0);
     }
     
-    fn process_shell_command(&mut self, command_line: &str) -> Result<String, String> {
-        let parts: Vec<&str> = command_line.trim().split_whitespace().collect();
-        if parts.is_empty() {
-            return Ok(String::new());
-        }
-        
-        let command = parts[0];
-        let args = &parts[1..];
-        
-        match command {
-            "help" => {
-                Ok(String::from("Available commands:\n  help - Show this help\n  ls [path] - List directory contents\n  cat <file> - Display file contents\n  echo <text> - Print text\n  ps - List processes\n  drivers - List loaded drivers\n  exit - Exit shell"))
-            }
-            "ls" => {
-                let path = args.get(0).unwrap_or(&"/");
-                self.list_directory(path)
-            }
-            "cat" => {
-                if args.is_empty() {
-                    Err(String::from("Usage: cat <filename>"))
-                } else {
-                    self.read_file(args[0])
-                }
-            }
-            "echo" => {
-                Ok(args.join(" "))
-            }
-            "ps" => {
-                Ok(String::from("Process list not implemented yet"))
-            }
-            "drivers" => {
-                self.list_drivers()
-            }
-            "exit" => {
-                Ok(String::new())
-            }
-            _ => {
-                Err(format!("Unknown command: {}", command))
-            }
-        }
+    fn process_shell_command(&mut self, command_line: &str) -> ShellResult<String> {
+        let mut command_processor = CommandProcessor::new();
+        command_processor.process_command(command_line)
     }
     
-    fn list_directory(&mut self, path: &str) -> Result<String, String> {
-        // This would send a request to the file system service
-        // For now, return a mock response
-        debug_print(b"Shell: Listing directory\n");
-        
-        // In a real implementation, this would:
-        // 1. Find the file system service PID
-        // 2. Send a FileSystemRequest::List message
-        // 3. Wait for and parse the response
-        
-        Ok(format!("Contents of {}:\n  file1.txt\n  file2.txt\n  subdir/", path))
-    }
-    
-    fn read_file(&mut self, filename: &str) -> Result<String, String> {
-        debug_print(b"Shell: Reading file\n");
-        
-        // Mock file reading - in a real implementation this would
-        // communicate with the file system service
-        Ok(format!("Contents of file: {}\n(This is mock content)", filename))
-    }
-    
-    fn list_drivers(&mut self) -> Result<String, String> {
-        debug_print(b"Shell: Listing drivers\n");
-        
-        // This would send a request to the driver manager service
-        // For now, return a mock response
-        Ok(String::from("Loaded drivers:\n  graphics.ko (ID: 1)\n  keyboard.ko (ID: 2)\n  storage.ko (ID: 3)"))
-    }
+
 }
 
 fn init_heap() {
@@ -197,8 +132,10 @@ fn sys_exit(status: i32) -> ! {
     }
 }
 
+// Conditional panic handler - only when not testing
+#[cfg(not(test))]
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(_info: &core::panic::PanicInfo) -> ! {
     debug_print(b"Shell: PANIC occurred!\n");
     sys_exit(1);
 }
