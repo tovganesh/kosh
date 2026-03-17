@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
-use alloc::string::String;
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::boxed::Box;
 use kosh_types::ProcessId;
@@ -162,38 +163,121 @@ pub struct FileSystemInfo {
     pub used_space: u64,
 }
 
-/// Environment variable management
+/// Environment variable management using BTreeMap for ordered, efficient storage.
 #[derive(Debug, Clone)]
 pub struct Environment {
-    pub variables: Vec<(String, String)>,
+    variables: BTreeMap<String, String>,
     pub working_directory: String,
-    pub path: Vec<String>,
 }
 
 impl Environment {
+    /// Create a new empty environment.
     pub fn new() -> Self {
         Self {
-            variables: Vec::new(),
+            variables: BTreeMap::new(),
             working_directory: String::from("/"),
-            path: Vec::new(),
         }
     }
-    
+
+    /// Create a new environment pre-populated with built-in variables.
+    pub fn with_defaults() -> Self {
+        let mut env = Self::new();
+        env.set_var("PWD".to_string(), "/".to_string());
+        env.set_var("HOME".to_string(), "/home/user".to_string());
+        env.set_var("PATH".to_string(), "/bin:/usr/bin".to_string());
+        env.set_var("SHELL".to_string(), "/bin/kosh-shell".to_string());
+        env.set_var("USER".to_string(), "user".to_string());
+        env.set_var("HOSTNAME".to_string(), "kosh".to_string());
+        env
+    }
+
+    /// Get the value of an environment variable.
     pub fn get_var(&self, name: &str) -> Option<&str> {
-        self.variables.iter()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value.as_str())
+        self.variables.get(name).map(|v| v.as_str())
     }
-    
+
+    /// Set an environment variable. Updates PWD/working_directory in sync.
     pub fn set_var(&mut self, name: String, value: String) {
-        if let Some(pos) = self.variables.iter().position(|(key, _)| key == &name) {
-            self.variables[pos].1 = value;
-        } else {
-            self.variables.push((name, value));
+        if name == "PWD" {
+            self.working_directory = value.clone();
+        }
+        self.variables.insert(name, value);
+    }
+
+    /// Remove an environment variable. Built-in variables like PWD cannot be unset.
+    pub fn unset_var(&mut self, name: &str) -> bool {
+        self.variables.remove(name).is_some()
+    }
+
+    /// Return an iterator over all environment variables in sorted order.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.variables.iter()
+    }
+
+    /// Return the number of environment variables.
+    pub fn len(&self) -> usize {
+        self.variables.len()
+    }
+
+    /// Check if the environment has no variables.
+    pub fn is_empty(&self) -> bool {
+        self.variables.is_empty()
+    }
+
+    /// Expand environment variables in the given input string.
+    /// Supports $VAR and ${VAR} syntax. Single-quoted strings are not expanded.
+    pub fn expand_variables(&self, input: &str) -> String {
+        crate::parser::expand_variables(input, &|name: &str| {
+            self.get_var(name).map(|v| String::from(v))
+        })
+    }
+
+    /// Get the PATH entries as a vector of strings.
+    pub fn path_entries(&self) -> Vec<String> {
+        match self.get_var("PATH") {
+            Some(path) => path.split(':').map(|s| String::from(s)).collect(),
+            None => Vec::new(),
         }
     }
-    
-    pub fn unset_var(&mut self, name: &str) {
-        self.variables.retain(|(key, _)| key != name);
+
+    /// Format all variables for display (used by `env` command).
+    pub fn format_all(&self) -> String {
+        let mut output = String::new();
+        for (key, value) in self.variables.iter() {
+            output.push_str(key);
+            output.push('=');
+            output.push_str(value);
+            output.push('\n');
+        }
+        // Remove trailing newline
+        if output.ends_with('\n') {
+            output.pop();
+        }
+        output
+    }
+
+    /// Parse an "export" argument of the form NAME=VALUE.
+    /// Returns (name, value) if valid, or None if the format is invalid.
+    pub fn parse_assignment(arg: &str) -> Option<(String, String)> {
+        let eq_pos = arg.find('=')?;
+        let name = &arg[..eq_pos];
+        if name.is_empty() || !Self::is_valid_var_name(name) {
+            return None;
+        }
+        let value = &arg[eq_pos + 1..];
+        Some((String::from(name), String::from(value)))
+    }
+
+    /// Check if a variable name is valid (starts with letter or _, contains only alphanumeric or _).
+    pub fn is_valid_var_name(name: &str) -> bool {
+        if name.is_empty() {
+            return false;
+        }
+        let mut chars = name.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+            _ => return false,
+        }
+        chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
     }
 }
