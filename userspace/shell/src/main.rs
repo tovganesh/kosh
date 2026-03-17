@@ -15,6 +15,9 @@ mod input;
 mod output;
 mod error;
 mod types;
+mod infrastructure;
+mod parser;
+mod history;
 
 use commands::CommandProcessor;
 use input::InputHandler;

@@ -2,6 +2,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::format;
 use crate::error::{ShellError, ShellResult};
+use crate::types::Environment;
 
 pub struct CommandProcessor {
     // Basic command processor - will be enhanced in later tasks
@@ -42,6 +43,84 @@ impl CommandProcessor {
         }
     }
     
+    /// Process environment-related commands that need access to the Environment.
+    /// Returns Some(output) if the command was handled, None if it's not an env command.
+    pub fn process_env_command(command: &str, args: &[&str], env: &mut Environment) -> Option<ShellResult<String>> {
+        match command {
+            "export" => Some(Self::cmd_export(args, env)),
+            "unset" => Some(Self::cmd_unset(args, env)),
+            "env" => Some(Self::cmd_env(env)),
+            _ => None,
+        }
+    }
+
+    /// export command: set or display environment variables.
+    /// Usage: export NAME=VALUE  — set a variable
+    ///        export             — list all variables
+    fn cmd_export(args: &[&str], env: &mut Environment) -> ShellResult<String> {
+        if args.is_empty() {
+            // Display all variables in export format
+            let mut output = String::new();
+            for (key, value) in env.iter() {
+                output.push_str("export ");
+                output.push_str(key);
+                output.push_str("=\"");
+                output.push_str(value);
+                output.push_str("\"\n");
+            }
+            if output.ends_with('\n') {
+                output.pop();
+            }
+            return Ok(output);
+        }
+
+        for arg in args {
+            match Environment::parse_assignment(arg) {
+                Some((name, value)) => {
+                    env.set_var(name, value);
+                }
+                None => {
+                    // If no '=', just check if the variable name is valid
+                    if !Environment::is_valid_var_name(arg) {
+                        return Err(ShellError::InvalidArguments(
+                            format!("export: '{}': not a valid identifier", arg),
+                        ));
+                    }
+                    // export without value — variable already exists, nothing to do
+                }
+            }
+        }
+
+        Ok(String::new())
+    }
+
+    /// unset command: remove environment variables.
+    /// Usage: unset NAME [NAME ...]
+    fn cmd_unset(args: &[&str], env: &mut Environment) -> ShellResult<String> {
+        if args.is_empty() {
+            return Err(ShellError::InvalidArguments(
+                "Usage: unset NAME [NAME ...]".to_string(),
+            ));
+        }
+
+        for arg in args {
+            if !Environment::is_valid_var_name(arg) {
+                return Err(ShellError::InvalidArguments(
+                    format!("unset: '{}': not a valid identifier", arg),
+                ));
+            }
+            env.unset_var(arg);
+        }
+
+        Ok(String::new())
+    }
+
+    /// env command: list all environment variables.
+    /// Usage: env
+    fn cmd_env(env: &Environment) -> ShellResult<String> {
+        Ok(env.format_all())
+    }
+    
     fn cmd_help(&self) -> ShellResult<String> {
         let help_text = "Available commands:\n\
             help     - Show this help message\n\
@@ -55,6 +134,9 @@ impl CommandProcessor {
             rm       - Remove file\n\
             pwd      - Print working directory\n\
             cd       - Change directory\n\
+            export   - Set/display environment variables\n\
+            unset    - Remove environment variables\n\
+            env      - List all environment variables\n\
             clear    - Clear screen\n\
             exit     - Exit shell\n\
             shutdown - Shutdown system";
