@@ -1,4 +1,6 @@
-NOTE: I am building this using kiro, using a spec based approach.
+NOTE: 
+Initially, I build this using kiro, using a spec based approach.
+Now using Claude to build further.
 
 Intial thoughs and ideas: https://blog.tovganesh.in/2012/01/kosh-building-mobile-user-experience.html
 
