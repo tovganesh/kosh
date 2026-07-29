@@ -150,7 +150,9 @@ pub extern "C" fn kosh_syscall_handler(frame: &mut SyscallFrame) -> u64 {
     match crate::syscall::dispatcher::dispatch_syscall(pid, number, args) {
         Ok(value) => value,
         Err(err) => {
-            serial_println!("syscall {} failed: {:?}", number, err);
+            if crate::syscall::dispatcher::syscall_trace_enabled() {
+                serial_println!("syscall {} returning error {:?}", number, err);
+            }
 
             // Linux convention: errors come back as a negative value in RAX,
             // successes as a non-negative one, and userspace tests the sign.

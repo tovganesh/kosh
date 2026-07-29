@@ -21,6 +21,8 @@ mod task;
 #[cfg(target_arch = "x86_64")]
 mod gdt;
 #[cfg(target_arch = "x86_64")]
+mod elf;
+#[cfg(target_arch = "x86_64")]
 mod usermode;
 #[cfg(target_arch = "x86_64")]
 mod user_program;

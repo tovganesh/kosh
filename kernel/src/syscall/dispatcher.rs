@@ -4,6 +4,23 @@ use crate::syscall::numbers::*;
 use crate::syscall::validation::validate_syscall_args;
 use crate::{serial_println, println};
 use alloc::format;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// Per-syscall tracing.
+///
+/// Off by default. It is genuinely useful while bringing a syscall up, but a
+/// program that writes one character at a time — a console, say — produces two
+/// log lines per keystroke, interleaved with its own output on the same line.
+/// That makes the thing you are trying to read unreadable.
+static SYSCALL_TRACE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_syscall_trace(enabled: bool) {
+    SYSCALL_TRACE.store(enabled, Ordering::Relaxed);
+}
+
+pub fn syscall_trace_enabled() -> bool {
+    SYSCALL_TRACE.load(Ordering::Relaxed)
+}
 
 /// Initialize the system call dispatcher
 pub fn init_syscall_dispatcher() -> Result<(), &'static str> {
@@ -22,14 +39,15 @@ pub fn dispatch_syscall(
     syscall_number: u64,
     args: [u64; 6],
 ) -> SyscallResult {
-    // Log the system call for debugging
-    serial_println!(
-        "Process {} calling syscall {} ({}) with args [{}, {}, {}, {}, {}, {}]",
-        process_id.0,
-        syscall_number,
-        syscall_name(syscall_number),
-        args[0], args[1], args[2], args[3], args[4], args[5]
-    );
+    if syscall_trace_enabled() {
+        serial_println!(
+            "Process {} calling syscall {} ({}) with args [{}, {}, {}, {}, {}, {}]",
+            process_id.0,
+            syscall_number,
+            syscall_name(syscall_number),
+            args[0], args[1], args[2], args[3], args[4], args[5]
+        );
+    }
     
     // Validate system call arguments
     validate_syscall_args(process_id, syscall_number, &args)?;
@@ -101,13 +119,16 @@ pub fn dispatch_syscall(
         }
     };
     
-    // Log the result
+    // Failures are always reported; successes only when tracing. A syscall
+    // that fails is news, one that works is not.
     match &result {
         Ok(value) => {
-            serial_println!(
-                "Process {} syscall {} completed successfully, returned {}",
-                process_id.0, syscall_name(syscall_number), value
-            );
+            if syscall_trace_enabled() {
+                serial_println!(
+                    "Process {} syscall {} completed successfully, returned {}",
+                    process_id.0, syscall_name(syscall_number), value
+                );
+            }
         }
         Err(error) => {
             serial_println!(

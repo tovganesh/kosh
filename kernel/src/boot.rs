@@ -29,6 +29,11 @@ pub fn init_kernel(boot_info: BootInformation) {
     // Parse and display memory information
     parse_memory_map(&boot_info);
     
+    // Record where GRUB put the boot modules. `boot_info` borrows the
+    // multiboot2 structure and does not outlive this function, so the addresses
+    // are copied out now and read through the physmap later.
+    crate::usermode::record_boot_modules(&boot_info);
+    
     // Initialize physical memory manager
     init_physical_memory(&boot_info);
     
@@ -716,6 +721,35 @@ fn init_usermode() {
         serial_println!("Ring 3: PASS — {} syscalls serviced from user mode", serviced);
     } else {
         serial_println!("Ring 3: FAIL — only {} syscalls serviced", serviced);
+    }
+
+    // Demo 3: an ELF the kernel was not compiled with, loaded from a GRUB
+    // module. Reported separately, because it exercises the loader rather than
+    // the ring-3 mechanics above.
+    serial_println!();
+    let before_elf = crate::syscall::entry::syscall_count();
+
+    if let Err(e) = crate::task::spawn("elf-loader", crate::usermode::run_boot_module, 0) {
+        serial_println!("Failed to spawn ELF loader thread: {}", e);
+        return;
+    }
+    while crate::task::live_threads() > 0 {
+        x86_64::instructions::hlt();
+    }
+    serial_println!("--- back in ring 0 ---");
+    crate::task::reap_finished();
+
+    let elf_syscalls = crate::syscall::entry::syscall_count() - before_elf;
+    if elf_syscalls >= 5 {
+        serial_println!(
+            "ELF loader: PASS — loaded program ran and made {} syscalls",
+            elf_syscalls
+        );
+    } else {
+        serial_println!(
+            "ELF loader: FAIL — loaded program made only {} syscalls",
+            elf_syscalls
+        );
     }
 }
 

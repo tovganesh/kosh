@@ -58,6 +58,18 @@ fi
 KERNEL="$ROOT/target/$TARGET_NAME/$PROFILE/kosh-kernel"
 [ -f "$KERNEL" ] || { echo "error: kernel binary not found at $KERNEL" >&2; exit 1; }
 
+# Userspace programs shipped as GRUB modules. These are ordinary static ELF
+# binaries; the kernel parses and maps them at run time.
+echo "==> building userspace programs"
+USER_FLAGS=(--package kosh-hello --target "$TARGET_JSON" -Z build-std=core)
+[ "$PROFILE" = "release" ] && USER_FLAGS+=(--release)
+cargo build "${USER_FLAGS[@]}" -Z json-target-spec 2>/dev/null \
+    || cargo build "${USER_FLAGS[@]}"
+
+HELLO="$ROOT/target/$TARGET_NAME/$PROFILE/kosh-hello"
+[ -f "$HELLO" ] || { echo "error: userspace binary not found at $HELLO" >&2; exit 1; }
+echo "==> $(basename "$HELLO"): $(readelf -h "$HELLO" | awk '/Entry point/ {print $4}')"
+
 # --- validate the multiboot2 header before we waste a boot ------------------
 
 if grub-file --is-x86-multiboot2 "$KERNEL"; then
@@ -76,6 +88,7 @@ echo "==> building ISO"
 rm -rf "$ISO_DIR"
 mkdir -p "$ISO_DIR/boot/grub"
 cp "$KERNEL" "$ISO_DIR/boot/kosh-kernel"
+cp "$HELLO" "$ISO_DIR/boot/init"
 
 cat > "$ISO_DIR/boot/grub/grub.cfg" <<'EOF'
 set timeout=0
@@ -83,6 +96,7 @@ set default=0
 
 menuentry "Kosh" {
     multiboot2 /boot/kosh-kernel
+    module2 /boot/init init
     boot
 }
 EOF
@@ -144,6 +158,10 @@ check)
         "ring 3 fault — terminating the process" \
         "Ring 3: PASS" \
         "kernel survived a ring 3 fault" \
+        "hello from a loaded ELF binary" \
+        ".bss was zeroed correctly" \
+        "stack is writable and readable" \
+        "ELF loader: PASS" \
         "Kernel initialization complete" \
         "uptime 1s"
     do

@@ -6,6 +6,7 @@ members = [
     "drivers/graphics",
     "drivers/keyboard",
     "userspace/init",
+    "userspace/hello",
     "userspace/fs-service",
     "userspace/driver-manager",
     "userspace/shell",
