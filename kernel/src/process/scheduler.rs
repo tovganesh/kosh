@@ -1,6 +1,21 @@
 use alloc::vec::Vec;
 use spin::Mutex;
 use crate::process::{ProcessId, ProcessPriority, get_runnable_processes, get_process, set_current_process, get_current_process};
+// NOTE (Phase 4): this module is scheduling *policy* over the process table —
+// round-robin, priorities, a simplified CFS. It does not perform context
+// switches, and `handle_timer_tick` below still has no caller.
+//
+// The thing that actually runs threads is `crate::task`: it owns the stacks,
+// the switch primitive (`task::switch::kosh_switch_context`) and the timer
+// wiring. `task` deliberately covers *kernel* threads; this module is meant to
+// govern userspace processes, which do not exist until ring 3 arrives in
+// Phase 5. When they do, the intended shape is for `task` to ask this module
+// which process to run next, rather than for this module to grow its own
+// switch.
+//
+// Until then, treat everything here as unwired. It is kept because the policy
+// code is real and worth reusing — not because it is running.
+#[allow(unused_imports)]
 use crate::process::context::{CpuContext, ContextSwitcher};
 use crate::power::{power_policy, responsiveness, ProcessActivity};
 use crate::{serial_println, println};

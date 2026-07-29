@@ -17,6 +17,8 @@ mod boot;
 #[cfg(target_arch = "x86_64")]
 mod interrupts;
 #[cfg(target_arch = "x86_64")]
+mod task;
+#[cfg(target_arch = "x86_64")]
 mod boot32;
 mod memory;
 mod process;

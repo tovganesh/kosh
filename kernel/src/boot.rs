@@ -126,6 +126,10 @@ pub fn init_kernel(boot_info: BootInformation) {
     // Deliberately last, so a timer tick cannot arrive mid-initialisation.
     crate::interrupts::enable_hardware_interrupts();
     
+    // Kernel threads. Needs a live timer, so it has to come after the line
+    // above.
+    init_scheduler();
+    
     serial_println!("Kernel initialization complete");
 }
 
@@ -746,6 +750,68 @@ fn test_virtual_memory() {
     }
     
     serial_println!("Virtual memory management test complete");
+}
+
+/// Bring up preemptive kernel threading and prove it works.
+#[cfg(target_arch = "x86_64")]
+fn init_scheduler() {
+    serial_println!("Initializing kernel threads...");
+    crate::task::init();
+
+    for (i, name) in ["worker-A", "worker-B", "worker-C"].iter().enumerate() {
+        if let Err(e) = crate::task::spawn(name, scheduler_demo_thread, i) {
+            serial_println!("Failed to spawn {}: {}", name, e);
+            return;
+        }
+    }
+
+    serial_println!("Starting preemptive scheduling...");
+    serial_println!("Expect A/B/C to interleave — none of them ever yields:");
+    crate::serial_print!("  ");
+
+    crate::task::start();
+
+    // Wait for the workers. `hlt` parks the CPU until the next interrupt, which
+    // is what lets the timer preempt us into the workers in the first place.
+    while crate::task::live_threads() > 0 {
+        x86_64::instructions::hlt();
+    }
+
+    serial_println!();
+    crate::task::print_threads();
+    crate::task::reap_finished();
+
+    let switches = crate::task::switch_count();
+    if switches > 10 {
+        serial_println!("Scheduler: PASS — {} real context switches", switches);
+    } else {
+        serial_println!("Scheduler: FAIL — only {} context switches", switches);
+    }
+}
+
+/// Body of each demo thread.
+///
+/// The busy-wait is the point. These threads never call `yield_now`, never
+/// sleep, and never block on anything — so the *only* way their output can
+/// interleave is if the timer interrupt takes the CPU away from them. If the
+/// letters come out as `A A A ... B B B ... C C C`, scheduling is cooperative
+/// and something is wrong.
+#[cfg(target_arch = "x86_64")]
+fn scheduler_demo_thread(index: usize) {
+    const NAMES: [&str; 3] = ["A", "B", "C"];
+    const ROUNDS: usize = 8;
+    const BUSY_TICKS: u64 = 5; // 50 ms of work per round, slice is 20 ms
+
+    let name = NAMES[index % NAMES.len()];
+
+    for _ in 0..ROUNDS {
+        crate::serial_print!("{} ", name);
+
+        let target = crate::interrupts::timer::ticks() + BUSY_TICKS;
+        while crate::interrupts::timer::ticks() < target {
+            core::hint::spin_loop();
+        }
+    }
 }
 
 /// Build and install the kernel page tables.

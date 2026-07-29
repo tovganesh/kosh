@@ -13,6 +13,21 @@ lazy_static! {
 #[doc(hidden)]
 pub fn _print(args: ::core::fmt::Arguments) {
     use core::fmt::Write;
+
+    // Interrupts off while the port lock is held. Once the kernel is
+    // preemptive, a thread can be interrupted mid-print; if the timer handler
+    // (or the thread scheduled next) then tries to print, it spins forever on a
+    // lock parked in a thread that is no longer running. Same reasoning as the
+    // `try_lock` rule in the interrupt handlers.
+    #[cfg(target_arch = "x86_64")]
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        SERIAL1
+            .lock()
+            .write_fmt(args)
+            .expect("Printing to serial failed");
+    });
+
+    #[cfg(not(target_arch = "x86_64"))]
     SERIAL1.lock().write_fmt(args).expect("Printing to serial failed");
 }
 

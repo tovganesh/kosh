@@ -78,10 +78,16 @@ pub extern "x86-interrupt" fn timer_interrupt_handler(_frame: InterruptStackFram
         serial_println!("[tick] uptime {}s ({} ticks)", tick / TIMER_HZ as u64, tick);
     }
 
-    // TODO (Phase 4): drive the scheduler from here.
-    //   crate::process::scheduler::handle_timer_tick();
-
+    // Acknowledge before scheduling: `on_tick` may not return to this handler
+    // for a long time (it returns on whichever thread we switch to), and until
+    // the PIC gets its EOI it will not deliver another timer interrupt to
+    // anybody.
     unsafe {
         pic::notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
     }
+
+    // The wiring that never existed: a periodic interrupt that actually reaches
+    // a scheduler. This call may switch stacks and return on a different
+    // thread.
+    crate::task::on_tick();
 }

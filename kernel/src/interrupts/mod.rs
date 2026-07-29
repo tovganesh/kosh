@@ -147,6 +147,11 @@ where
     x86_64::instructions::interrupts::without_interrupts(f)
 }
 
+/// Whether the interrupt flag is currently set.
+pub fn interrupts_enabled() -> bool {
+    x86_64::instructions::interrupts::are_enabled()
+}
+
 /// Deliberately trigger a breakpoint (`int3`) to prove the IDT is live.
 ///
 /// The handler prints and returns, so execution continues normally. If the

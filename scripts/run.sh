@@ -138,6 +138,7 @@ check)
         "physmap aliases identity map: OK" \
         "page 0 unmapped: OK" \
         "PASS: heap fully reclaimed" \
+        "Scheduler: PASS" \
         "Kernel initialization complete" \
         "uptime 1s"
     do

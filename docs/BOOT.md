@@ -214,10 +214,85 @@ mixed-size, mixed-alignment allocations, freed out of order:
 The stress test asserts the heap collapses back to exactly one free block of its
 original size — which is the only way to prove coalescing works.
 
+## Scheduling (Phase 4)
+
+`kernel/src/task/` is the first thing in Kosh that actually schedules.
+
+| File | Role |
+|---|---|
+| `switch.rs` | `kosh_switch_context(prev_rsp, next_rsp)` — the whole switch, in `global_asm!` |
+| `mod.rs` | Thread table, round-robin picker, `spawn` / `schedule` / `on_tick` / `exit_current` |
+
+**The switch is a plain `extern "C"` call, not interrupt machinery.** It follows
+the System V AMD64 ABI, so the caller has already spilled its caller-saved
+registers; the function only preserves RBX, RBP, R12-R15 and RFLAGS. It pushes
+those, stores RSP in the outgoing TCB, loads RSP from the incoming TCB, pops
+them back, and returns.
+
+The consequence is the part worth internalising: **the incoming thread resumes
+by returning out of its own earlier call to this function.** Thread B returns
+into B's `schedule()`, which returns into B's timer handler, whose `iretq`
+resumes whatever B was doing. Nothing reconstructs an interrupt frame, because
+B's frame never left B's stack.
+
+A brand-new thread has no such history, so `Thread::prepare_stack` fabricates
+one. From low address to high: RFLAGS, R15, R14, R13, R12, RBX, RBP, return
+address, and one dummy word. The dummy is for ABI alignment — after `ret` pops
+the return address, RSP must be 8 mod 16, which is the state a function sees
+right after a real `call`. The synthesised RFLAGS has IF *clear*, because a new
+thread is first entered from inside the timer handler; `thread_bootstrap`
+enables interrupts itself once it is on its own stack and holds no locks.
+
+Three rules the code follows, each of which is a hang if broken:
+
+1. **Every scheduler access runs with interrupts disabled.** The timer handler
+   takes the same lock.
+2. **The lock is released before the switch.** Holding a spinlock across a
+   context switch parks it in the outgoing thread; the incoming thread spins on
+   it forever.
+3. **EOI before scheduling.** `on_tick` may not return to the handler for a long
+   time, and until the PIC is acknowledged it delivers no further timer
+   interrupts to anybody.
+
+`serial::_print` and `vga_buffer::_print` now disable interrupts while holding
+their port locks, for the same reason as rule 2 — a thread preempted mid-print
+would otherwise deadlock the next thread that prints.
+
+### Proving it
+
+`init_scheduler` spawns three threads that each print a letter and then busy-wait
+on the tick counter. They never yield, never sleep, never block. The only thing
+that can interleave them is the timer taking the CPU away:
+
+```
+Expect A/B/C to interleave — none of them ever yields:
+  A B C A B C A B C A B C A B C A B C A B C A B C
+Thread table:
+  [0] kmain      Running  18 ticks
+  [1] worker-A   Finished  16 ticks
+  [2] worker-B   Finished  16 ticks
+  [3] worker-C   Finished  17 ticks
+  context switches: 36
+Scheduler: PASS — 36 real context switches
+```
+
+If those letters ever come out as `A A A ... B B B ...`, scheduling has become
+cooperative and something is broken.
+
+### What about `process/scheduler.rs`?
+
+It stays. It is scheduling *policy* — round-robin, priorities, a simplified CFS —
+over a process table, and it is real code. What it is not is wired to anything:
+`handle_timer_tick` still has no caller.
+
+`task` covers **kernel** threads, which share the kernel address space and run
+in ring 0. `process` is meant to govern **userspace** processes, which do not
+exist until ring 3 arrives in Phase 5. When they do, the intended shape is for
+`task` to ask `process::scheduler` which process to run next — not for
+`process::scheduler` to grow its own switch.
+
 ## What is deliberately still missing
 
-- **No preemption.** The timer increments a counter and prints a heartbeat;
-  `scheduler::handle_timer_tick()` is still not called. Phase 4.
 - **No ring 3, no syscall entry.** Phase 5.
 - **`PHYSICAL_MEMORY_OFFSET` is 0**, because the map is flat identity. It
   becomes `0xFFFF_8000_0000_0000` when the kernel builds its own page tables in

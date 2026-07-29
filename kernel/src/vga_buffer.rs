@@ -138,5 +138,14 @@ macro_rules! println {
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
+
+    // See serial::_print — holding this lock across a preemption deadlocks the
+    // next thread that prints.
+    #[cfg(target_arch = "x86_64")]
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        WRITER.lock().write_fmt(args).unwrap();
+    });
+
+    #[cfg(not(target_arch = "x86_64"))]
     WRITER.lock().write_fmt(args).unwrap();
 }
