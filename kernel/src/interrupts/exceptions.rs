@@ -174,6 +174,17 @@ pub extern "x86-interrupt" fn page_fault_handler(
         serial_println!("                     like a null pointer dereference.");
     }
 
+    // A fault in ring 3 is the process's problem, not the kernel's. Killing the
+    // offending thread and carrying on is the entire point of running services
+    // outside the kernel — halting here would mean any userspace bug takes the
+    // whole system down, which is what a microkernel exists to avoid.
+    if error_code.contains(PageFaultErrorCode::USER_MODE) {
+        serial_println!("  action           : ring 3 fault — terminating the process");
+        serial_println!("  rip              : 0x{:016x}", frame.instruction_pointer.as_u64());
+        serial_println!("====================================================");
+        crate::task::exit_current();
+    }
+
     fault(14, "#PF Page Fault", Some(error_code.bits()), &frame)
 }
 

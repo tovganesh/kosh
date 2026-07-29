@@ -305,6 +305,85 @@ pub fn map_kernel_pages(virt: u64, pages: usize) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Map `pages` of existing physical memory starting at `phys` to `virt`, with
+/// `flags`, for ring-3 access.
+///
+/// Every table on the walk also needs `USER_ACCESSIBLE`, or the CPU stops at
+/// the first supervisor-only level and the leaf flags never get consulted. That
+/// is why this uses `map_to_with_table_flags` rather than plain `map_to`:
+/// permissive parent entries, restrictive leaves. Kernel pages sharing those
+/// tables stay private because *their* leaf entries lack the bit.
+pub fn map_user_range(
+    virt: u64,
+    phys: u64,
+    pages: usize,
+    flags: PageTableFlags,
+) -> Result<(), &'static str> {
+    let mut mapper = unsafe { active_mapper() };
+    let mut frames = KoshFrameAllocator;
+
+    let table_flags =
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+
+    for i in 0..pages {
+        let offset = (i * PAGE_SIZE) as u64;
+        let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(virt + offset));
+        let frame: PhysFrame<Size4KiB> =
+            PhysFrame::containing_address(PhysAddr::new(phys + offset));
+
+        unsafe {
+            mapper
+                .map_to_with_table_flags(page, frame, flags, table_flags, &mut frames)
+                .map_err(|_| "failed to map user range")?
+                .flush();
+        }
+    }
+
+    Ok(())
+}
+
+/// Allocate `pages` fresh frames and map them at `virt` for ring-3 access.
+pub fn map_user_pages(
+    virt: u64,
+    pages: usize,
+    flags: PageTableFlags,
+) -> Result<(), &'static str> {
+    let mut mapper = unsafe { active_mapper() };
+    let mut frames = KoshFrameAllocator;
+
+    let table_flags =
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+
+    for i in 0..pages {
+        let frame = allocate_frame().ok_or("out of physical memory mapping user pages")?;
+
+        // Zero it through the physmap before it is reachable from ring 3 —
+        // handing a user process a page of somebody else's data is a textbook
+        // information leak.
+        unsafe {
+            core::ptr::write_bytes(
+                (PHYSMAP_BASE + frame.address() as u64) as *mut u8,
+                0,
+                PAGE_SIZE,
+            );
+        }
+
+        let page: Page<Size4KiB> =
+            Page::containing_address(VirtAddr::new(virt + (i * PAGE_SIZE) as u64));
+        let phys: PhysFrame<Size4KiB> =
+            PhysFrame::containing_address(PhysAddr::new(frame.address() as u64));
+
+        unsafe {
+            mapper
+                .map_to_with_table_flags(page, phys, flags, table_flags, &mut frames)
+                .map_err(|_| "failed to map user page")?
+                .flush();
+        }
+    }
+
+    Ok(())
+}
+
 /// Borrow the live page tables through the physmap.
 ///
 /// # Safety

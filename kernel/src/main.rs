@@ -19,6 +19,12 @@ mod interrupts;
 #[cfg(target_arch = "x86_64")]
 mod task;
 #[cfg(target_arch = "x86_64")]
+mod gdt;
+#[cfg(target_arch = "x86_64")]
+mod usermode;
+#[cfg(target_arch = "x86_64")]
+mod user_program;
+#[cfg(target_arch = "x86_64")]
 mod boot32;
 mod memory;
 mod process;

@@ -77,7 +77,7 @@ lazy_static! {
         unsafe {
             idt.double_fault
                 .set_handler_fn(exceptions::double_fault_handler)
-                .set_stack_index(crate::boot::DOUBLE_FAULT_IST_INDEX);
+                .set_stack_index(crate::gdt::DOUBLE_FAULT_IST_INDEX);
         }
 
         // --- hardware IRQs (vectors 32..47) ------------------------------

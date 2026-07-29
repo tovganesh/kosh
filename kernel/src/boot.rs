@@ -1,63 +1,11 @@
 #[cfg(target_arch = "x86_64")]
 use multiboot2::BootInformation;
-#[cfg(target_arch = "x86_64")]
-use x86_64::structures::gdt::{GlobalDescriptorTable, Descriptor, SegmentSelector};
-#[cfg(target_arch = "x86_64")]
-use x86_64::structures::tss::TaskStateSegment;
-#[cfg(target_arch = "x86_64")]
-use x86_64::instructions::segmentation::Segment;
-#[cfg(target_arch = "x86_64")]
-use x86_64::VirtAddr;
-use lazy_static::lazy_static;
 use crate::{println, serial_println};
 use crate::memory;
 
-#[cfg(target_arch = "x86_64")]
-/// IST slot used for the double-fault handler's stack. A double fault caused
-/// by a bad kernel stack cannot push its exception frame onto that same stack,
-/// so it needs a known-good one.
-pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
-
-#[cfg(target_arch = "x86_64")]
-lazy_static! {
-    static ref TSS: TaskStateSegment = {
-        let mut tss = TaskStateSegment::new();
-        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
-            const STACK_SIZE: usize = 4096 * 5;
-            static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
-
-            let stack_start = VirtAddr::from_ptr(&raw const STACK);
-            let stack_end = stack_start + STACK_SIZE;
-            stack_end
-        };
-        tss
-    };
-}
-
-#[cfg(target_arch = "x86_64")]
-lazy_static! {
-    static ref GDT: (GlobalDescriptorTable, Selectors) = {
-        let mut gdt = GlobalDescriptorTable::new();
-        let code_selector = gdt.add_entry(Descriptor::kernel_code_segment());
-        let data_selector = gdt.add_entry(Descriptor::kernel_data_segment());
-        let tss_selector = gdt.add_entry(Descriptor::tss_segment(&TSS));
-        (
-            gdt,
-            Selectors {
-                code_selector,
-                data_selector,
-                tss_selector,
-            },
-        )
-    };
-}
-
-#[cfg(target_arch = "x86_64")]
-struct Selectors {
-    code_selector: SegmentSelector,
-    data_selector: SegmentSelector,
-    tss_selector: SegmentSelector,
-}
+// GDT, TSS and the double-fault IST now live in `crate::gdt`, which owns the
+// ring-3 descriptors and RSP0 as well. See that module for why the descriptor
+// order is load-bearing once SYSCALL/SYSRET exist.
 
 #[cfg(target_arch = "x86_64")]
 /// Initialize the kernel with multiboot2 information
@@ -70,8 +18,8 @@ pub fn init_kernel(boot_info: BootInformation) {
     // Set up basic CPU state first
     init_cpu_state();
     
-    // Set up GDT and TSS
-    init_gdt();
+    // Set up GDT and TSS (now including ring-3 descriptors and RSP0)
+    crate::gdt::init();
     
     // Install the IDT before anything else can fault. From here on a bad
     // pointer produces a legible dump instead of a silent triple fault.
@@ -129,6 +77,9 @@ pub fn init_kernel(boot_info: BootInformation) {
     // Kernel threads. Needs a live timer, so it has to come after the line
     // above.
     init_scheduler();
+    
+    // Ring 3.
+    init_usermode();
     
     serial_println!("Kernel initialization complete");
 }
@@ -471,29 +422,6 @@ fn test_power_management() {
 }
 
 /// Initialize Global Descriptor Table and Task State Segment
-fn init_gdt() {
-    serial_println!("Setting up GDT and TSS...");
-    
-    GDT.0.load();
-    
-    unsafe {
-        // Load code segment
-        x86_64::instructions::segmentation::CS::set_reg(GDT.1.code_selector);
-        
-        // Load data segments
-        x86_64::instructions::segmentation::DS::set_reg(GDT.1.data_selector);
-        x86_64::instructions::segmentation::ES::set_reg(GDT.1.data_selector);
-        x86_64::instructions::segmentation::FS::set_reg(GDT.1.data_selector);
-        x86_64::instructions::segmentation::GS::set_reg(GDT.1.data_selector);
-        x86_64::instructions::segmentation::SS::set_reg(GDT.1.data_selector);
-        
-        // Load TSS
-        x86_64::instructions::tables::load_tss(GDT.1.tss_selector);
-    }
-    
-    serial_println!("GDT and TSS initialized");
-}
-
 /// Parse and display memory map information from multiboot2
 fn parse_memory_map(boot_info: &BootInformation) {
     serial_println!("Parsing memory map...");
@@ -750,6 +678,45 @@ fn test_virtual_memory() {
     }
     
     serial_println!("Virtual memory management test complete");
+}
+
+/// Drop into ring 3 and run the user payload.
+#[cfg(target_arch = "x86_64")]
+fn init_usermode() {
+    crate::syscall::uaccess::self_test();
+
+    let before = crate::syscall::entry::syscall_count();
+
+    // Demo 1: syscalls from ring 3, including one the kernel must refuse.
+    if let Err(e) = crate::task::spawn("user-syscall", crate::usermode::run_user_demo, 0) {
+        serial_println!("Failed to spawn user thread: {}", e);
+        return;
+    }
+    while crate::task::live_threads() > 0 {
+        x86_64::instructions::hlt();
+    }
+    serial_println!("--- back in ring 0 ---");
+    crate::task::reap_finished();
+
+    // Demo 2: a ring-3 program that dereferences kernel memory. The kernel must
+    // kill it and survive.
+    serial_println!();
+    if let Err(e) = crate::task::spawn("user-fault", crate::usermode::run_user_demo, 1) {
+        serial_println!("Failed to spawn faulting user thread: {}", e);
+        return;
+    }
+    while crate::task::live_threads() > 0 {
+        x86_64::instructions::hlt();
+    }
+    serial_println!("--- kernel survived a ring 3 fault ---");
+    crate::task::reap_finished();
+
+    let serviced = crate::syscall::entry::syscall_count() - before;
+    if serviced >= 4 {
+        serial_println!("Ring 3: PASS — {} syscalls serviced from user mode", serviced);
+    } else {
+        serial_println!("Ring 3: FAIL — only {} syscalls serviced", serviced);
+    }
 }
 
 /// Bring up preemptive kernel threading and prove it works.

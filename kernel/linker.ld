@@ -35,6 +35,17 @@ SECTIONS
     . = ALIGN(4K);
     __rodata_end = .;
 
+    /* Ring-3 payload. Its own page-aligned section so it can be mapped into
+       user space independently of anything the kernel keeps to itself. */
+    . = ALIGN(4K);
+    __user_start = .;
+    .user ALIGN(4K) :
+    {
+        KEEP(*(.user))
+    }
+    . = ALIGN(4K);
+    __user_end = .;
+
     .data ALIGN(4K) :
     {
         *(.data .data.*)

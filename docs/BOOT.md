@@ -291,9 +291,125 @@ exist until ring 3 arrives in Phase 5. When they do, the intended shape is for
 `task` to ask `process::scheduler` which process to run next — not for
 `process::scheduler` to grow its own switch.
 
-## What is deliberately still missing
+## Ring 3 and syscalls (Phase 5)
 
-- **No ring 3, no syscall entry.** Phase 5.
+`iretq`, `sysretq`, `swapgs` and `user_code_segment` had **zero occurrences** in
+this repository before Phase 5. For a microkernel — an architecture whose whole
+premise is that services run outside the kernel — that was the biggest gap in
+the project.
+
+| File | Role |
+|---|---|
+| `gdt.rs` | GDT with ring-3 descriptors, TSS with RSP0 |
+| `syscall/entry.rs` | MSR setup and the `syscall` assembly stub |
+| `syscall/uaccess.rs` | `copy_from_user` / `copy_to_user` and range validation |
+| `usermode.rs` | Maps the payload, drops to ring 3 via `iretq` |
+| `user_program.rs` | The ring-3 payload, in position-independent assembly |
+
+### The GDT order is not arbitrary
+
+`syscall` loads CS from `STAR[47:32]` and SS from `STAR[47:32] + 8`. `sysretq`
+loads CS from `STAR[63:48] + 16` and SS from `STAR[63:48] + 8`. The CPU just
+adds those offsets, so the table has to match:
+
+```
+  0x00  null
+  0x08  kernel code   <- STAR[47:32]
+  0x10  kernel data       (= 0x08 + 8)        <- STAR[63:48]
+  0x18  user data         (= 0x10 + 8)   sysret SS, RPL 3 -> 0x1B
+  0x20  user code (64)    (= 0x10 + 16)  sysret CS, RPL 3 -> 0x23
+  0x28  TSS (two slots)
+```
+
+User *data* comes before user *code*. That reads backwards until you write out
+the `sysret` arithmetic, and getting it the intuitive way round is a classic
+route to a #GP the first time a process returns to ring 3.
+
+`TSS.RSP0` is the stack the CPU switches to when an interrupt arrives in ring 3.
+Without it, the first timer tick after entering user mode is a triple fault.
+
+### Getting to ring 3
+
+There is no "jump to user mode" instruction. You fake a return from one: push
+the five words `iretq` expects — SS, RSP, RFLAGS, CS, RIP — with ring-3
+selectors, and execute it.
+
+The user program enters with IF set, so the timer can still preempt it. A ring-3
+thread that cannot be preempted is a ring-3 thread that can hang the machine
+with `for {}`.
+
+### The syscall path
+
+`syscall` is fast because it does almost nothing: CS/SS from `STAR`, RIP from
+`LSTAR`, RFLAGS masked by `SFMASK`, caller's RIP into RCX and RFLAGS into R11 —
+and **RSP still points at the user stack**. The stack switch is the kernel's job
+and is the first thing the stub does.
+
+Argument 4 travels in R10 rather than RCX precisely because `syscall` destroys
+RCX.
+
+`SFMASK` masks IF, so a syscall cannot be interrupted. That is what makes the
+single static kernel syscall stack safe for now; multiple user threads will need
+`swapgs` and a per-CPU block.
+
+### Trusting nothing from ring 3
+
+`syscall/uaccess.rs` does two checks, both necessary:
+
+1. **Range** — the whole span must lie in the lower canonical half.
+2. **Mapping** — every page must be present *and* `USER_ACCESSIBLE`. Range
+   checking alone is not enough; a kernel-only page can sit at a low address.
+
+This is what `sys_write` was missing. It used to return the byte count without
+reading the buffer; `sys_read` returned a length without writing one; and
+`sys_send_message` discarded the user pointer and sent a `format!` string
+instead. All of them "worked" because nothing could call them.
+
+One subtlety worth knowing: `SyscallError::to_errno()` already returns
+*negative* numbers (-22 for EINVAL). Negating it in the handler — the obvious
+thing to write, since the Linux convention is "negative means error" — flips
+every failure positive, and userspace then reads all errors as success. The
+handler normalises rather than assuming.
+
+### A userspace fault must not be fatal
+
+The page-fault handler checks `USER_MODE` in the error code. If the fault came
+from ring 3 it terminates that thread and returns to the scheduler instead of
+halting. Any other behaviour would mean a userspace bug takes the whole system
+down — which is the thing a microkernel exists to prevent.
+
+### Proving it
+
+Two payloads run, back to back:
+
+```
+--- ring 3 output ---
+hello from ring 3
+Process 1 syscall write failed: InvalidArgument
+kernel rejected my out-of-bounds pointer
+Process 1 terminated with exit code 0
+--- back in ring 0 ---
+
+--- ring 3 output ---
+about to dereference a kernel address directly
+
+==================== PAGE FAULT ====================
+  accessed address : 0xffff800000000000
+  cause            : protection violation while reading in user mode
+  error code       : PageFaultErrorCode(PROTECTION_VIOLATION | USER_MODE)
+  action           : ring 3 fault — terminating the process
+  rip              : 0x00000000400000c4
+====================================================
+--- kernel survived a ring 3 fault ---
+```
+
+The first payload asks the kernel to `write` from a kernel address and reports
+back whether it was refused — the validation is tested *from the user side*, not
+by the kernel checking itself. The second bypasses syscalls entirely and touches
+kernel memory directly, so page protection rather than argument validation has
+to stop it.
+
+## What is deliberately still missing
 - **`PHYSICAL_MEMORY_OFFSET` is 0**, because the map is flat identity. It
   becomes `0xFFFF_8000_0000_0000` when the kernel builds its own page tables in
   Phase 3.

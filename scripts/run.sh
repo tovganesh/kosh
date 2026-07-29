@@ -139,6 +139,11 @@ check)
         "page 0 unmapped: OK" \
         "PASS: heap fully reclaimed" \
         "Scheduler: PASS" \
+        "hello from ring 3" \
+        "kernel rejected my out-of-bounds pointer" \
+        "ring 3 fault — terminating the process" \
+        "Ring 3: PASS" \
+        "kernel survived a ring 3 fault" \
         "Kernel initialization complete" \
         "uptime 1s"
     do
