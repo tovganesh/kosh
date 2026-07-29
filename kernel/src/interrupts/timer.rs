@@ -5,7 +5,7 @@
 //! `scheduler::handle_timer_tick()` had zero callers, so nothing in the kernel
 //! could ever be preempted or timed.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use x86_64::instructions::port::Port;
 use x86_64::structures::idt::InterruptStackFrame;
@@ -26,6 +26,21 @@ const PIT_COMMAND: u16 = 0x43;
 /// Ticks since the timer was started. Monotonic; wraps after ~5.8 billion
 /// years at 100 Hz, so not a practical concern.
 static TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether to print a once-a-second proof-of-life on the serial line.
+///
+/// On during boot, where it is the only sign the timer is alive. The console
+/// turns it off when it starts, because a line that appears in the middle of
+/// whatever you are typing makes the console unusable.
+static HEARTBEAT: AtomicBool = AtomicBool::new(true);
+
+pub fn set_heartbeat(enabled: bool) {
+    HEARTBEAT.store(enabled, Ordering::Relaxed);
+}
+
+pub fn heartbeat_enabled() -> bool {
+    HEARTBEAT.load(Ordering::Relaxed)
+}
 
 /// Program PIT channel 0 for periodic interrupts at `TIMER_HZ`.
 pub fn init() {
@@ -72,9 +87,9 @@ pub fn sleep_ms(ms: u64) {
 pub extern "x86-interrupt" fn timer_interrupt_handler(_frame: InterruptStackFrame) {
     let tick = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
 
-    // Proof of life, once a second. This is temporary scaffolding — it comes
-    // out when the scheduler takes over the tick in Phase 4.
-    if tick % TIMER_HZ as u64 == 0 {
+    // Proof of life, once a second, until something more useful owns the
+    // console.
+    if heartbeat_enabled() && tick % TIMER_HZ as u64 == 0 {
         serial_println!("[tick] uptime {}s ({} ticks)", tick / TIMER_HZ as u64, tick);
     }
 

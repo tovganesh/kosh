@@ -214,11 +214,20 @@ impl KernelHeapAllocator {
         // Remove from free list
         self.remove_from_free_list(block);
 
-        // Update statistics
+        // Account for what the block actually holds, not what was asked for.
+        //
+        // `deallocate` credits back `(*block).size`, and after the alignment
+        // carve and the split that is not the same as the requested `size`.
+        // Charging one and crediting the other made `current_bytes` drift
+        // downwards until it underflowed, and `peak_bytes` then latched onto
+        // the wrapped value — which is how the console ended up reporting a
+        // peak of 18446744073709551568 bytes.
+        let charged = unsafe { (*block.as_ptr()).size };
+
         self.stats.total_allocations += 1;
         self.stats.current_allocations += 1;
-        self.stats.bytes_allocated += size;
-        self.stats.current_bytes += size;
+        self.stats.bytes_allocated += charged;
+        self.stats.current_bytes += charged;
 
         if self.stats.current_bytes > self.stats.peak_bytes {
             self.stats.peak_bytes = self.stats.current_bytes;

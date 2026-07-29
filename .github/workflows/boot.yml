@@ -47,6 +47,12 @@ jobs:
       - name: Build, boot and assert serial markers
         run: ./scripts/run.sh --check
 
+      - name: Drive the console and assert what it answers
+        # Types at the kosh> prompt through QEMU's monitor. Without this the
+        # keyboard IRQ, the line editor and the command table are only ever
+        # exercised by a human, which means they rot quietly.
+        run: ./scripts/run.sh --check-cli
+
       - name: Upload boot logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -54,4 +60,5 @@ jobs:
           name: boot-logs
           path: |
             build/serial.txt
+            build/serial-cli.txt
             build/qemu.log

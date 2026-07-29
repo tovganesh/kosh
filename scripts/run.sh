@@ -21,10 +21,11 @@ ISO="$BUILD_DIR/kosh.iso"
 
 MODE="run"
 case "${1:-}" in
-    --debug) MODE="debug" ;;
-    --check) MODE="check" ;;
-    "")      ;;
-    *)       echo "unknown option: $1" >&2; exit 2 ;;
+    --debug)     MODE="debug" ;;
+    --check)     MODE="check" ;;
+    --check-cli) MODE="check-cli" ;;
+    "")          ;;
+    *)           echo "unknown option: $1" >&2; exit 2 ;;
 esac
 
 # --- toolchain sanity -------------------------------------------------------
@@ -148,6 +149,7 @@ check)
         "PIC remapped" \
         "PIT channel 0" \
         "Interrupts enabled" \
+        "Timer: PASS" \
         "kernel page tables active" \
         "physmap aliases identity map: OK" \
         "page 0 unmapped: OK" \
@@ -163,7 +165,7 @@ check)
         "stack is writable and readable" \
         "ELF loader: PASS" \
         "Kernel initialization complete" \
-        "uptime 1s"
+        "console started on its own thread"
     do
         if grep -qF "$marker" "$SERIAL" 2>/dev/null; then
             echo "  PASS  $marker"
@@ -177,6 +179,89 @@ check)
         echo "  FAIL  triple fault in qemu.log"
         fail=1
     fi
+
+    exit $fail
+    ;;
+
+check-cli)
+    # Boot, then type at the console through QEMU's monitor and check what it
+    # answers. Nothing else in this repo exercises the keyboard IRQ, the line
+    # editor and the command table end to end — and a console that only a human
+    # can test is a console that silently rots.
+    SERIAL="$BUILD_DIR/serial-cli.txt"
+    rm -f "$SERIAL"
+    echo "==> console check"
+
+    # QEMU's `sendkey` speaks key names, not characters.
+    keyname() {
+        case "$1" in
+            " ") echo "spc" ;;
+            ".") echo "dot" ;;
+            "-") echo "minus" ;;
+            "/") echo "slash" ;;
+            [a-z0-9]) echo "$1" ;;
+            *) echo "" ;;
+        esac
+    }
+
+    type_line() {
+        local text="$1" i c k
+        for (( i=0; i<${#text}; i++ )); do
+            c="${text:$i:1}"
+            k="$(keyname "$c")"
+            [ -n "$k" ] && echo "sendkey $k"
+            # Deliberately unhurried. QEMU drops sendkeys if you push them
+            # faster than the guest drains the PS/2 controller, and a flaky
+            # console test is worse than a slow one.
+            sleep 0.04
+        done
+        sleep 0.2
+        echo "sendkey ret"
+        sleep 0.8
+    }
+
+    {
+        # Let the boot demos finish before typing.
+        sleep 12
+        type_line "uname"
+        type_line "mem"
+        type_line "ticks"
+        type_line "echo kosh cli works"
+        type_line "modules"
+        type_line "ps"
+        type_line "history"
+        type_line "nosuchcommand"
+        type_line "fault bp"
+        sleep 1
+        echo quit
+    } | timeout 90 qemu-system-x86_64 "${QEMU_ARGS[@]}" \
+            -serial "file:$SERIAL" -display none -monitor stdio >/dev/null 2>&1 || true
+
+    echo "--- console session ---"
+    sed -n '/Kosh console/,$p' "$SERIAL" 2>/dev/null | head -60
+    echo "-----------------------"
+
+    fail=0
+    for marker in \
+        "Kosh console" \
+        "kosh>" \
+        "Kosh 0.1.0 x86_64" \
+        "running in ring 0" \
+        "physical memory:" \
+        "kernel heap:" \
+        "kosh cli works" \
+        "module 0:" \
+        "context switches since boot" \
+        "unknown command: nosuchcommand" \
+        "resumed"
+    do
+        if grep -qF "$marker" "$SERIAL" 2>/dev/null; then
+            echo "  PASS  $marker"
+        else
+            echo "  FAIL  $marker"
+            fail=1
+        fi
+    done
 
     exit $fail
     ;;

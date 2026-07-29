@@ -368,6 +368,45 @@ pub fn reap_finished() {
     });
 }
 
+/// A snapshot of one thread, for callers that want to format it themselves
+/// (the console renders to VGA as well as serial, which `print_threads` does
+/// not).
+#[derive(Debug, Clone, Copy)]
+pub struct ThreadInfo {
+    pub id: usize,
+    pub name: &'static str,
+    pub state: State,
+    pub ticks: u64,
+}
+
+/// Copy the thread table out under the lock, so callers can print without
+/// holding it. Returns how many entries were filled.
+pub fn snapshot(out: &mut [Option<ThreadInfo>; MAX_THREADS]) -> usize {
+    without_interrupts(|| {
+        let sched = SCHEDULER.lock();
+        let mut n = 0;
+        for (i, slot) in sched.threads.iter().enumerate() {
+            if let Some(t) = slot {
+                out[i] = Some(ThreadInfo {
+                    id: t.id,
+                    name: t.name,
+                    state: t.state,
+                    ticks: t.ticks,
+                });
+                n += 1;
+            } else {
+                out[i] = None;
+            }
+        }
+        n
+    })
+}
+
+/// Maximum threads, for callers sizing a snapshot buffer.
+pub const fn max_threads() -> usize {
+    MAX_THREADS
+}
+
 pub fn print_threads() {
     without_interrupts(|| {
         let sched = SCHEDULER.lock();
