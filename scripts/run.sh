@@ -117,11 +117,11 @@ check)
     SERIAL="$BUILD_DIR/serial.txt"
     rm -f "$SERIAL"
     echo "==> boot check"
-    timeout 30 qemu-system-x86_64 "${QEMU_ARGS[@]}" \
+    timeout 20 qemu-system-x86_64 "${QEMU_ARGS[@]}" \
         -serial "file:$SERIAL" -display none >/dev/null 2>&1 || true
 
-    echo "--- serial output ---"
-    cat "$SERIAL" || true
+    echo "--- serial output (last 30 lines) ---"
+    tail -30 "$SERIAL" || true
     echo "---------------------"
 
     fail=0
@@ -129,7 +129,13 @@ check)
         "32-bit protected mode entry OK" \
         "long mode OK" \
         "Kosh Kernel Starting" \
-        "Kernel initialization complete"
+        "IDT installed" \
+        "returned from int3 handler" \
+        "PIC remapped" \
+        "PIT channel 0" \
+        "Interrupts enabled" \
+        "Kernel initialization complete" \
+        "uptime 1s"
     do
         if grep -qF "$marker" "$SERIAL" 2>/dev/null; then
             echo "  PASS  $marker"

@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
 #![feature(custom_test_frameworks)]
 #![test_runner(crate::test_runner)]
 #![reexport_test_harness_main = "test_main"]
@@ -13,6 +14,8 @@ use multiboot2::BootInformation;
 mod serial;
 mod vga_buffer;
 mod boot;
+#[cfg(target_arch = "x86_64")]
+mod interrupts;
 #[cfg(target_arch = "x86_64")]
 mod boot32;
 mod memory;
@@ -253,15 +256,50 @@ pub extern "C" fn _start(multiboot_info_addr: usize) -> ! {
 
     println!("Kosh kernel initialized successfully!");
     serial_println!("Kosh kernel initialized successfully!");
-    serial_println!("Kosh: entering idle loop (no IDT and no timer yet — Phase 2)");
 
-    // Halt the CPU in an infinite loop
+    idle_loop()
+}
+
+/// Idle loop.
+///
+/// There is no scheduler yet, so the kernel's "steady state" is to wait for
+/// interrupts. The timer ticks in the background; anything typed on the PS/2
+/// keyboard is echoed here, which proves the IRQ path end to end and is the
+/// beginning of the console the shell will use in Phase 7.
+#[cfg(target_arch = "x86_64")]
+fn idle_loop() -> ! {
+    serial_println!("Kosh: idle loop — timer is ticking, type to echo keystrokes");
+    println!("Kosh ready. Type something:");
+
     loop {
-        #[cfg(target_arch = "x86_64")]
+        while let Some(c) = interrupts::keyboard::read_char() {
+            match c {
+                // Enter
+                '\n' | '\r' => {
+                    println!();
+                    serial_println!();
+                }
+                // Backspace
+                '\x08' | '\x7f' => {
+                    print!("\x08 \x08");
+                    serial_print!("\x08 \x08");
+                }
+                c => {
+                    print!("{}", c);
+                    serial_print!("{}", c);
+                }
+            }
+        }
+
+        // Sleep until the next interrupt rather than spinning.
         x86_64::instructions::hlt();
-        
-        #[cfg(target_arch = "aarch64")]
-        unsafe { core::arch::asm!("wfi") }; // Wait for interrupt on ARM64
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn idle_loop() -> ! {
+    loop {
+        unsafe { core::arch::asm!("wfi") };
     }
 }
 

@@ -13,7 +13,10 @@ use crate::{println, serial_println};
 use crate::memory;
 
 #[cfg(target_arch = "x86_64")]
-const DOUBLE_FAULT_IST_INDEX: u16 = 0;
+/// IST slot used for the double-fault handler's stack. A double fault caused
+/// by a bad kernel stack cannot push its exception frame onto that same stack,
+/// so it needs a known-good one.
+pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
 #[cfg(target_arch = "x86_64")]
 lazy_static! {
@@ -70,6 +73,11 @@ pub fn init_kernel(boot_info: BootInformation) {
     // Set up GDT and TSS
     init_gdt();
     
+    // Install the IDT before anything else can fault. From here on a bad
+    // pointer produces a legible dump instead of a silent triple fault.
+    crate::interrupts::init();
+    crate::interrupts::test_breakpoint_exception();
+    
     // Parse and display memory information
     parse_memory_map(&boot_info);
     
@@ -107,6 +115,10 @@ pub fn init_kernel(boot_info: BootInformation) {
     
     // Initialize early console output (already done in main, but ensure it's working)
     test_console_output();
+    
+    // Everything is up: remap the PIC, start the PIT and enable interrupts.
+    // Deliberately last, so a timer tick cannot arrive mid-initialisation.
+    crate::interrupts::enable_hardware_interrupts();
     
     serial_println!("Kernel initialization complete");
 }

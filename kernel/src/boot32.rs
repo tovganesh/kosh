@@ -84,14 +84,20 @@ check_long_mode:
     ret
 
 /* --- bootstrap page tables --------------------------------------------- */
-/* Identity-maps 0..1GiB with 2 MiB pages. That covers the kernel image at
-   1 MiB, the frame bitmap, the heap, VGA at 0xB8000 and QEMU's default RAM. */
+/* Identity-maps 0..1GiB. That covers the kernel image at 1 MiB, the frame
+   bitmap, the heap, VGA at 0xB8000 and QEMU's default RAM.
+ *
+ * The first 2 MiB uses 4 KiB pages rather than one huge page, purely so that
+ * page 0 can be left unmapped as a null guard. With a flat huge-page map, a
+ * null pointer dereference silently reads real memory instead of faulting —
+ * which is precisely the class of bug an OS most needs to catch. Everything
+ * from 2 MiB up uses 2 MiB pages. */
 
 setup_page_tables:
-    /* Zero PML4, PDPT and PD (3 * 4096 bytes = 3072 dwords). */
+    /* Zero PML4, PDPT, PD and the first-2MiB PT (4 * 4096 = 4096 dwords). */
     movl    $p4_table, %edi
     xorl    %eax, %eax
-    movl    $3072, %ecx
+    movl    $4096, %ecx
     rep stosl
 
     /* PML4[0] -> PDPT, present + writable */
@@ -104,8 +110,27 @@ setup_page_tables:
     orl     $0x03, %eax
     movl    %eax, p3_table
 
-    /* PD[i] = (i * 2MiB) | present | writable | huge */
-    xorl    %ecx, %ecx
+    /* PD[0] -> PT (4 KiB pages), present + writable, NOT huge */
+    movl    $p1_table, %eax
+    orl     $0x03, %eax
+    movl    %eax, p2_table
+
+    /* PT[i] = (i * 4KiB) | present | writable, for i = 1..511.
+       PT[0] is deliberately left zero: unmapped null guard page. */
+    movl    $1, %ecx
+2:
+    movl    %ecx, %eax
+    shll    $12, %eax
+    orl     $0x03, %eax
+    movl    $p1_table, %edi
+    movl    %eax, (%edi, %ecx, 8)
+    movl    $0, 4(%edi, %ecx, 8)
+    incl    %ecx
+    cmpl    $512, %ecx
+    jne     2b
+
+    /* PD[i] = (i * 2MiB) | present | writable | huge, for i = 1..511. */
+    movl    $1, %ecx
 1:
     movl    $0x200000, %eax
     mull    %ecx                    /* EDX:EAX = 2MiB * i */
@@ -284,6 +309,8 @@ p4_table:
 p3_table:
     .skip   4096
 p2_table:
+    .skip   4096
+p1_table:
     .skip   4096
 mb_magic:
     .skip   4

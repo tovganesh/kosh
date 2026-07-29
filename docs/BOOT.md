@@ -41,13 +41,21 @@ The ELF entry point (`ENTRY(_start32)` in `linker.ld`). In order:
 | Bring COM1 up by hand | So a failure *before* Rust is visible instead of a silent reboot |
 | Check magic == `0x36D76289` | Confirms a Multiboot2-compliant loader |
 | CPUID leaf `0x80000001`, EDX bit 29 | Confirms the CPU has long mode at all |
-| Build PML4 / PDPT / PD | Identity-maps the first 1 GiB with 2 MiB pages |
+| Build PML4 / PDPT / PD / PT | Identity-maps the first 1 GiB (see the null guard note below) |
 | CR3, CR4.PAE, EFER.LME, CR0.PG | The actual mode switch |
 | `lgdt` + `ljmp $0x08` | Loads a 64-bit GDT and reloads CS — this is the moment we become 64-bit |
 
 The identity map covers the kernel at 1 MiB, the frame bitmap, the heap, VGA at
 `0xB8000` and QEMU's default RAM. It is deliberately a *bootstrap* map: the
 kernel replaces it with a proper higher-half address space in Phase 3.
+
+**Null guard page.** The first 2 MiB is mapped with 4 KiB pages rather than one
+2 MiB huge page, purely so that page 0 can be left *unmapped*. With a flat
+huge-page map a null pointer dereference silently reads real memory instead of
+faulting — which is exactly the class of bug a kernel most needs to catch. This
+was found by testing: the first version of the trampoline used a huge page for
+0..2 MiB, and a deliberate `read_volatile(0)` returned successfully. Everything
+from 2 MiB up still uses 2 MiB pages.
 
 ### 3. `long_mode_start`
 
@@ -111,12 +119,47 @@ QEMU's `-d int,cpu_reset` output lands in `build/qemu.log`. A `Triple fault`
 line there means an exception fired with no IDT to catch it — which is every
 exception, until Phase 2 installs one.
 
+## Interrupts (Phase 2)
+
+`kernel/src/interrupts/` splits into four pieces:
+
+| File | Role |
+|---|---|
+| `mod.rs` | Builds and loads the IDT; `init()` vs `enable_hardware_interrupts()` |
+| `exceptions.rs` | Vectors 0..31. Print a dump and halt. `#PF` decodes CR2 and the error code; `#BP`/`#DB` return so debuggers work |
+| `pic.rs` | Remaps the 8259 pair to vectors 32..47 |
+| `timer.rs` | PIT channel 0 at 100 Hz, `TICKS` counter, `uptime_ms()`, `sleep_ms()` |
+| `keyboard.rs` | IRQ1 -> port 0x60 -> `pc-keyboard` decode -> SPSC ring buffer |
+
+Two things worth knowing:
+
+**Why the PIC remap is not optional.** On a freshly-booted PC the PICs deliver
+IRQ0..15 on vectors 8..15 and 0x70..0x77. Vector 8 is `#DF Double Fault` — so
+without remapping, the very first timer tick after `sti` arrives as a double
+fault.
+
+**Why `init()` and `enable_hardware_interrupts()` are separate.** The IDT is
+installed immediately after the GDT, so a fault during memory-manager init is
+reported rather than silently fatal. Hardware interrupts are enabled at the very
+end of `init_kernel`, so a timer tick cannot arrive mid-initialisation.
+
+Interrupt handlers use `try_lock`, never `lock`. Blocking on a spinlock held by
+the code you just interrupted is a guaranteed deadlock; dropping a keystroke is
+the correct trade.
+
+Self-test: `init_kernel` raises an `int3` right after loading the IDT and expects
+to resume. If the IDT were missing or malformed, that would triple-fault instead
+of printing `returned from int3 handler`.
+
 ## What is deliberately still missing
 
-- **No IDT.** Any fault is an instant triple fault and reboot. Phase 2.
-- **No timer, no interrupts enabled.** The kernel halts after init. Phase 2.
+- **No preemption.** The timer increments a counter and prints a heartbeat;
+  `scheduler::handle_timer_tick()` is still not called. Phase 4.
+- **No ring 3, no syscall entry.** Phase 5.
 - **`PHYSICAL_MEMORY_OFFSET` is 0**, because the map is flat identity. It
   becomes `0xFFFF_8000_0000_0000` when the kernel builds its own page tables in
   Phase 3.
 - **Swap and power management are disabled** in `init_kernel`. Both were
   simulated, and swap tried to allocate 8 MiB from a 1 MiB heap.
+- **Only IRQ0 and IRQ1 are unmasked.** Everything else on the PIC has a
+  handler that acknowledges and returns.
