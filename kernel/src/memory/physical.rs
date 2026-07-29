@@ -427,6 +427,27 @@ pub fn deallocate_frames(start_frame: PageFrame, count: usize) {
     }
 }
 
+/// Physical extent of the frame bitmap, as (start, end).
+///
+/// The bitmap is accessed by physical address, so whoever builds the kernel
+/// page tables has to keep it reachable.
+pub fn bitmap_extent() -> (usize, usize) {
+    let guard = PHYSICAL_MEMORY_MANAGER.lock();
+    match guard.as_ref() {
+        Some(m) => (m.bitmap_start, m.bitmap_start + m.bitmap.len()),
+        None => (0, 0),
+    }
+}
+
+/// End of usable physical memory as reported by the bootloader.
+pub fn physical_memory_end() -> u64 {
+    let guard = PHYSICAL_MEMORY_MANAGER.lock();
+    match guard.as_ref() {
+        Some(m) => (m.total_frames * PAGE_SIZE) as u64,
+        None => 0,
+    }
+}
+
 /// Get memory statistics
 #[allow(dead_code)]
 pub fn memory_stats() -> Option<MemoryStats> {

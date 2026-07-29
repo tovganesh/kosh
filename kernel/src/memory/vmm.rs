@@ -308,12 +308,13 @@ pub mod kernel_layout {
     /// Offset at which all of physical memory is visible in the virtual
     /// address space.
     ///
-    /// Phase 1: the boot trampoline installs a flat identity map of the first
-    /// 1 GiB, so physical == virtual and the offset is 0. This becomes
-    /// 0xFFFF_8000_0000_0000 once the kernel builds its own higher-half
-    /// address space (Phase 3) — until something actually *creates* that
-    /// mapping, using it here is an immediate page fault.
-    pub const PHYSICAL_MEMORY_OFFSET: VirtualAddress = VirtualAddress(0);
+    /// Phase 3: `memory::paging` maps all of physical memory here when it
+    /// builds the kernel page tables, so this offset is now backed by real
+    /// mappings. (Through Phase 2 it had to be 0 — the constant claimed a
+    /// higher-half physmap that nothing had ever created, so using it was an
+    /// immediate page fault.)
+    pub const PHYSICAL_MEMORY_OFFSET: VirtualAddress =
+        VirtualAddress(crate::memory::paging::PHYSMAP_BASE as usize);
 }
 
 /// Global virtual memory manager
@@ -554,6 +555,6 @@ mod tests {
         assert_eq!(kernel_layout::KERNEL_DATA_SIZE, 16 * 1024 * 1024);
         assert_eq!(kernel_layout::KERNEL_HEAP_START.as_usize(), 0xFFFFFFFF82000000);
         assert_eq!(kernel_layout::KERNEL_HEAP_SIZE, 64 * 1024 * 1024);
-        assert_eq!(kernel_layout::PHYSICAL_MEMORY_OFFSET.as_usize(), 0);
+        assert_eq!(kernel_layout::PHYSICAL_MEMORY_OFFSET.as_usize(), 0xFFFF800000000000);
     }
 }

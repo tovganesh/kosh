@@ -17,17 +17,23 @@ SECTIONS
         KEEP(*(.multiboot2))
     }
 
+    __text_start = .;
     .text ALIGN(4K) :
     {
         KEEP(*(.text.boot32))
         *(.text .text.*)
     }
+    . = ALIGN(4K);
+    __text_end = .;
 
+    __rodata_start = .;
     .rodata ALIGN(4K) :
     {
         KEEP(*(.rodata.boot32))
         *(.rodata .rodata.*)
     }
+    . = ALIGN(4K);
+    __rodata_end = .;
 
     .data ALIGN(4K) :
     {

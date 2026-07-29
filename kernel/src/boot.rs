@@ -84,14 +84,20 @@ pub fn init_kernel(boot_info: BootInformation) {
     // Initialize physical memory manager
     init_physical_memory(&boot_info);
     
+    // Build and install the kernel's own page tables, replacing the crude
+    // identity map the boot trampoline set up. Needs only the frame allocator,
+    // so it can run before the heap exists.
+    init_paging();
+    
     // Initialize kernel heap allocator.
     //
-    // ORDER MATTERS: this must come *before* init_virtual_memory(), which
-    // pushes region descriptors into a Vec and therefore allocates. Running it
-    // first meant allocating against a null heap on every boot.
+    // ORDER MATTERS: after paging (the heap is now mapped into its own virtual
+    // window, so page tables must exist) and before init_virtual_memory(),
+    // which pushes region descriptors into a Vec and therefore allocates.
+    // Running the VMM first meant allocating against a null heap every boot.
     init_heap_allocator();
     
-    // Initialize virtual memory management
+    // Initialize virtual memory management bookkeeping
     init_virtual_memory();
     
     // DISABLED (Phase 1): init_swap_management() allocates an 8 MiB Vec as a
@@ -742,12 +748,29 @@ fn test_virtual_memory() {
     serial_println!("Virtual memory management test complete");
 }
 
+/// Build and install the kernel page tables.
+#[cfg(target_arch = "x86_64")]
+fn init_paging() {
+    let phys_end = memory::physical::physical_memory_end();
+
+    match memory::paging::init(phys_end) {
+        Ok(()) => {
+            memory::paging::self_test();
+        }
+        Err(e) => {
+            serial_println!("Failed to build kernel page tables: {}", e);
+            panic!("paging initialization failed");
+        }
+    }
+}
+
 /// Initialize kernel heap allocator
 fn init_heap_allocator() {
     serial_println!("Initializing kernel heap allocator...");
     
-    // Allocate 1MB (256 pages) for the kernel heap
-    const HEAP_SIZE_PAGES: usize = 256;
+    // 4 MiB of kernel heap. Frames no longer need to be physically contiguous,
+    // so this is just 1024 mapped pages.
+    const HEAP_SIZE_PAGES: usize = 1024;
     
     match memory::heap::init_kernel_heap(HEAP_SIZE_PAGES) {
         Ok(()) => {
@@ -769,6 +792,9 @@ fn test_heap_allocator() {
     
     // Test the heap allocator functionality
     memory::heap::test_heap_allocator();
+    
+    // Prove alignment and coalescing actually work.
+    memory::heap::stress_test();
     
     // Test Rust's built-in allocation using Vec
     {

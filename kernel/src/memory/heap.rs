@@ -2,12 +2,17 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::{self, NonNull};
 use spin::Mutex;
 use alloc::vec::Vec;
-use crate::memory::{PAGE_SIZE, align_up};
-use crate::memory::physical::allocate_frames;
+use crate::memory::PAGE_SIZE;
+use crate::memory::paging::{map_kernel_pages, KERNEL_HEAP_BASE};
 use crate::{serial_println, println};
 
 /// Minimum allocation size (to reduce fragmentation)
 const MIN_ALLOC_SIZE: usize = 16;
+
+/// Round `addr` up to a multiple of `align` (which must be a power of two).
+const fn align_up_to(addr: usize, align: usize) -> usize {
+    (addr + align - 1) & !(align - 1)
+}
 
 /// Maximum allocation size that can be handled by the heap
 const MAX_ALLOC_SIZE: usize = 1024 * 1024; // 1MB
@@ -15,8 +20,15 @@ const MAX_ALLOC_SIZE: usize = 1024 * 1024; // 1MB
 /// Magic number for heap corruption detection
 const HEAP_MAGIC: u32 = 0xDEADBEEF;
 
-/// Header for each allocated block
-#[repr(C)]
+/// Header for each allocated block.
+///
+/// `align(16)` matters: it rounds `size_of::<BlockHeader>()` up to a multiple
+/// of 16, so a 16-aligned block base gives a 16-aligned payload. Combined with
+/// rounding every allocation size up to 16, that keeps *every* block base
+/// 16-aligned for the life of the heap. Without it the header was 40 bytes,
+/// payloads landed on odd offsets, and even an 8-byte alignment request failed
+/// after the first split.
+#[repr(C, align(16))]
 struct BlockHeader {
     magic: u32,
     size: usize,
@@ -125,20 +137,24 @@ impl KernelHeapAllocator {
         }
     }
 
-    /// Initialize the heap with the given size
+    /// Initialize the heap with the given size.
+    ///
+    /// The heap lives at its own virtual address range ([`KERNEL_HEAP_BASE`]),
+    /// backed by frames the page tables map in. It previously took the raw
+    /// physical address of a contiguous frame run and used it as a pointer —
+    /// which happened to work only because paging was effectively off, and
+    /// silently required physical contiguity it did not need.
     pub fn init(&mut self, heap_size_pages: usize) -> Result<(), &'static str> {
         if heap_size_pages == 0 {
             return Err("Heap size cannot be zero");
         }
 
-        // Allocate physical pages for the heap
-        let start_frame = allocate_frames(heap_size_pages)
-            .ok_or("Failed to allocate physical memory for heap")?;
+        // Allocate and map `heap_size_pages` frames at the heap window. The
+        // frames do not have to be contiguous — that is the whole point of
+        // having page tables.
+        map_kernel_pages(KERNEL_HEAP_BASE, heap_size_pages)?;
 
-        // Map the physical pages to virtual memory
-        // For now, we'll use identity mapping (virtual = physical)
-        // In a full implementation, this would use the VMM
-        let heap_start = start_frame.address() as *mut u8;
+        let heap_start = KERNEL_HEAP_BASE as *mut u8;
         let heap_size = heap_size_pages * PAGE_SIZE;
 
         // Initialize the heap memory
@@ -168,15 +184,19 @@ impl KernelHeapAllocator {
 
     /// Allocate memory with the given layout
     pub fn allocate(&mut self, layout: Layout) -> Result<NonNull<u8>, &'static str> {
-        let size = layout.size().max(MIN_ALLOC_SIZE);
+        // Round up to 16 so the *next* block's base stays 16-aligned.
+        let size = align_up_to(layout.size().max(MIN_ALLOC_SIZE), MIN_ALLOC_SIZE);
         let align = layout.align();
 
         if size > MAX_ALLOC_SIZE {
             return Err("Allocation too large");
         }
 
-        // Find a suitable free block
+        // Find a suitable free block and, if the requested alignment forces
+        // the payload away from the natural header boundary, carve a leading
+        // free block off the front so the returned pointer really is aligned.
         let block = self.find_free_block(size, align)?;
+        let block = self.align_block(block, size, align)?;
 
         // Split the block if it's significantly larger than needed
         self.split_block(block, size);
@@ -199,7 +219,6 @@ impl KernelHeapAllocator {
         self.stats.current_allocations += 1;
         self.stats.bytes_allocated += size;
         self.stats.current_bytes += size;
-        self.stats.free_bytes -= size;
 
         if self.stats.current_bytes > self.stats.peak_bytes {
             self.stats.peak_bytes = self.stats.current_bytes;
@@ -252,7 +271,6 @@ impl KernelHeapAllocator {
             self.stats.current_allocations -= 1;
             self.stats.bytes_deallocated += size;
             self.stats.current_bytes -= size;
-            self.stats.free_bytes += size;
 
             // Add back to free list
             self.add_to_free_list(block);
@@ -264,28 +282,119 @@ impl KernelHeapAllocator {
         Ok(())
     }
 
-    /// Find a free block that can satisfy the allocation
-    fn find_free_block(&mut self, size: usize, _align: usize) -> Result<NonNull<BlockHeader>, &'static str> {
+    /// Find a free block that can satisfy `size` bytes at `align`.
+    ///
+    /// The previous version ignored `layout.align()` entirely: it aligned to
+    /// PAGE_SIZE regardless of what was asked for (rejecting almost everything
+    /// by demanding up to 4095 bytes of slack) and then returned the
+    /// *unaligned* pointer anyway. So it both over-rejected and under-delivered.
+    fn find_free_block(
+        &mut self,
+        size: usize,
+        align: usize,
+    ) -> Result<NonNull<BlockHeader>, &'static str> {
         let mut current = self.free_list_head;
 
         while let Some(block) = current {
             unsafe {
                 let block_ptr = block.as_ptr();
-                if (*block_ptr).is_free && (*block_ptr).size >= size {
-                    // Check alignment
-                    let data_ptr = (*block_ptr).data_ptr();
-                    let aligned_ptr = align_up(data_ptr as usize);
-                    let alignment_offset = aligned_ptr - data_ptr as usize;
-
-                    if (*block_ptr).size >= size + alignment_offset {
-                        return Ok(block);
-                    }
+                if (*block_ptr).is_free && Self::block_fits(block, size, align) {
+                    return Ok(block);
                 }
                 current = (*block_ptr).next;
             }
         }
 
         Err("Out of memory")
+    }
+
+    /// Where the payload would have to sit inside a block starting at `base`
+    /// to satisfy `align`.
+    ///
+    /// If the natural payload position is already aligned, that is the answer.
+    /// Otherwise we must carve a leading free block off the front, and that
+    /// leading block needs a header plus at least `MIN_ALLOC_SIZE` of payload —
+    /// so the answer is the first aligned address at or beyond
+    /// `base + 2*header + MIN_ALLOC_SIZE`.
+    ///
+    /// Returning the *first* aligned address without that floor was wrong: for
+    /// any alignment above 16 the gap was a few bytes, too small to be a legal
+    /// block, and the allocation was rejected outright.
+    fn aligned_payload(base: usize, data: usize, align: usize) -> Option<usize> {
+        if data % align == 0 {
+            return Some(data);
+        }
+
+        let header = core::mem::size_of::<BlockHeader>();
+        let floor = base.checked_add(2 * header)?.checked_add(MIN_ALLOC_SIZE)?;
+        Some(align_up_to(core::cmp::max(data, floor), align))
+    }
+
+    /// Whether `block` can serve `size` bytes at `align`.
+    ///
+    /// Two ways to satisfy it: the payload is already aligned, or there is
+    /// enough room to carve a leading free block off the front (which needs a
+    /// whole header plus a minimum-sized payload, or it would not be a valid
+    /// block).
+    fn block_fits(block: NonNull<BlockHeader>, size: usize, align: usize) -> bool {
+        unsafe {
+            let b = block.as_ptr();
+            let header = core::mem::size_of::<BlockHeader>();
+            let base = b as usize;
+            let data = (*b).data_ptr() as usize;
+            let avail = (*b).size;
+
+            let Some(aligned) = Self::aligned_payload(base, data, align) else {
+                return false;
+            };
+
+            if aligned == data {
+                return avail >= size;
+            }
+
+            let lead_size = aligned - base - 2 * header;
+            let new_size = (base + header + avail).saturating_sub(aligned);
+
+            lead_size >= MIN_ALLOC_SIZE && new_size >= size
+        }
+    }
+
+    /// Carve a leading free block off `block` if needed so the payload lands on
+    /// `align`. Returns the block that should actually serve the allocation.
+    fn align_block(
+        &mut self,
+        block: NonNull<BlockHeader>,
+        _size: usize,
+        align: usize,
+    ) -> Result<NonNull<BlockHeader>, &'static str> {
+        unsafe {
+            let b = block.as_ptr();
+            let header = core::mem::size_of::<BlockHeader>();
+            let base = b as usize;
+            let data = (*b).data_ptr() as usize;
+            let avail = (*b).size;
+
+            let aligned =
+                Self::aligned_payload(base, data, align).ok_or("alignment not satisfiable")?;
+            if aligned == data {
+                return Ok(block);
+            }
+
+            let lead_size = aligned - base - 2 * header;
+            let new_header = (aligned - header) as *mut BlockHeader;
+            let new_size = base + header + avail - aligned;
+
+            // Shrink the original into the leading free block...
+            (*b).size = lead_size;
+
+            // ...and write a fresh header for the aligned remainder.
+            ptr::write(new_header, BlockHeader::new(new_size));
+            let new_block = NonNull::new(new_header).ok_or("alignment split produced null")?;
+            self.add_to_free_list(new_block);
+
+            debug_assert_eq!((*new_block.as_ptr()).data_ptr() as usize % align, 0);
+            Ok(new_block)
+        }
     }
 
     /// Split a block if it's significantly larger than needed
@@ -348,27 +457,136 @@ impl KernelHeapAllocator {
         }
     }
 
-    /// Coalesce adjacent free blocks
-    fn coalesce_free_blocks(&mut self, block: NonNull<BlockHeader>) {
-        // This is a simplified version - in a full implementation,
-        // we would check for physically adjacent blocks and merge them
-        // For now, we just ensure the block is properly linked
-        unsafe {
-            let block_ptr = block.as_ptr();
-            if !(*block_ptr).is_free {
-                return;
-            }
+    /// Merge every run of physically-adjacent free blocks.
+    ///
+    /// This used to be an empty function with a comment describing what it
+    /// would do, so the heap fragmented monotonically and never recovered: free
+    /// a 64-byte block next to another 64-byte block and you still could not
+    /// serve a 128-byte request.
+    ///
+    /// The heap is one contiguous run of blocks — `header + payload`, back to
+    /// back, from `heap_start` to `heap_start + heap_size` — so a linear walk
+    /// visits them in address order and adjacency is just pointer arithmetic.
+    ///
+    /// O(number of blocks) per call. Fine at this scale; if it ever shows up in
+    /// a profile, the fix is a boundary tag holding the previous block's size,
+    /// which makes merging O(1).
+    fn coalesce_free_blocks(&mut self, _hint: NonNull<BlockHeader>) {
+        if self.heap_start.is_null() {
+            return;
+        }
 
-            // In a more sophisticated implementation, we would:
-            // 1. Check if the next physical block is free and merge
-            // 2. Check if the previous physical block is free and merge
-            // 3. Update the free list accordingly
+        let header_size = core::mem::size_of::<BlockHeader>();
+        let heap_end = self.heap_start as usize + self.heap_size;
+        let mut cursor = self.heap_start as usize;
+
+        while cursor < heap_end {
+            let block = cursor as *mut BlockHeader;
+
+            unsafe {
+                if !(*block).is_valid() {
+                    // Corruption: stop rather than walk off into nothing.
+                    serial_println!("Heap corruption during coalesce at 0x{:x}", cursor);
+                    return;
+                }
+
+                let mut total = (*block).total_size();
+
+                if (*block).is_free {
+                    // Absorb every free block immediately following this one.
+                    loop {
+                        let next_addr = cursor + total;
+                        if next_addr >= heap_end {
+                            break;
+                        }
+
+                        let next = next_addr as *mut BlockHeader;
+                        if !(*next).is_valid() || !(*next).is_free {
+                            break;
+                        }
+
+                        let next_total = (*next).total_size();
+                        if let Some(nn) = NonNull::new(next) {
+                            self.remove_from_free_list(nn);
+                        }
+
+                        // The absorbed header becomes payload.
+                        (*block).size += next_total;
+                        (*next).magic = 0;
+                        total = (*block).total_size();
+                    }
+                }
+
+                cursor += total;
+            }
         }
     }
 
-    /// Get allocation statistics
+    /// Get allocation statistics.
+    ///
+    /// `free_bytes` is recomputed from the block chain rather than tracked
+    /// incrementally: the incremental version ignored block headers and was not
+    /// updated by `split_block`, so it drifted and eventually underflowed.
     pub fn stats(&self) -> AllocationStats {
-        self.stats
+        let mut stats = self.stats;
+        stats.free_bytes = self.free_bytes();
+        stats
+    }
+
+    /// Sum of the payload sizes of all free blocks.
+    fn free_bytes(&self) -> usize {
+        if self.heap_start.is_null() {
+            return 0;
+        }
+
+        let heap_end = self.heap_start as usize + self.heap_size;
+        let mut cursor = self.heap_start as usize;
+        let mut free = 0usize;
+
+        while cursor < heap_end {
+            unsafe {
+                let block = cursor as *mut BlockHeader;
+                if !(*block).is_valid() {
+                    break;
+                }
+                if (*block).is_free {
+                    free += (*block).size;
+                }
+                cursor += (*block).total_size();
+            }
+        }
+
+        free
+    }
+
+    /// Number of blocks in the heap, and how many of them are free.
+    ///
+    /// Used by the stress test to prove coalescing actually works: after
+    /// freeing everything the heap must collapse back to a single free block.
+    pub fn block_census(&self) -> (usize, usize) {
+        if self.heap_start.is_null() {
+            return (0, 0);
+        }
+
+        let heap_end = self.heap_start as usize + self.heap_size;
+        let mut cursor = self.heap_start as usize;
+        let (mut total, mut free) = (0usize, 0usize);
+
+        while cursor < heap_end {
+            unsafe {
+                let block = cursor as *mut BlockHeader;
+                if !(*block).is_valid() {
+                    break;
+                }
+                total += 1;
+                if (*block).is_free {
+                    free += 1;
+                }
+                cursor += (*block).total_size();
+            }
+        }
+
+        (total, free)
     }
 
     /// Print heap statistics
@@ -470,6 +688,113 @@ pub fn heap_stats() -> AllocationStats {
 /// Print heap statistics
 pub fn print_heap_stats() {
     KERNEL_HEAP.lock().print_stats();
+}
+
+/// Blocks in the heap, and how many are free.
+pub fn block_census() -> (usize, usize) {
+    KERNEL_HEAP.lock().block_census()
+}
+
+/// Stress the allocator: many mixed-size, mixed-alignment allocations, freed in
+/// a scrambled order, then assert the heap collapses back to a single free
+/// block of its original size.
+///
+/// This is the test that proves coalescing works. Before Phase 3
+/// `coalesce_free_blocks` was an empty function, so this would have finished
+/// with hundreds of stranded free blocks instead of one.
+pub fn stress_test() {
+    use alloc::vec::Vec;
+
+    const ROUNDS: usize = 2000;
+
+    serial_println!("Heap stress test: {} mixed alloc/free rounds...", ROUNDS);
+
+    let (blocks_before, _) = block_census();
+    let free_before = heap_stats().free_bytes;
+
+    let mut live: Vec<(NonNull<u8>, usize)> = Vec::new();
+    let mut misaligned = 0usize;
+    let mut failures = 0usize;
+
+    for i in 0..ROUNDS {
+        // Sizes 16..~2 KiB, alignments 8/16/32/64/128 — cycled so we exercise
+        // the alignment-split path rather than only the happy case.
+        let size = 16 + (i * 37) % 2048;
+        let align = 1usize << (3 + (i % 5));
+
+        let layout = match Layout::from_size_align(size, align) {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+
+        let result = KERNEL_HEAP.lock().allocate(layout);
+
+        match result {
+            Ok(ptr) => {
+                if ptr.as_ptr() as usize % align != 0 {
+                    misaligned += 1;
+                }
+                // Touch the whole allocation so a bad mapping or an overlapping
+                // block shows up as corruption rather than passing silently.
+                unsafe { ptr::write_bytes(ptr.as_ptr(), (i & 0xFF) as u8, size) };
+                live.push((ptr, size));
+            }
+            Err(_) => failures += 1,
+        }
+
+        // Free roughly two thirds of what we allocate, out of order, to churn
+        // the free list and force merges of non-adjacent-in-time blocks.
+        if live.len() > 8 && i % 3 != 0 {
+            let victim = live.remove((i * 7) % live.len());
+            if KERNEL_HEAP.lock().deallocate(victim.0).is_err() {
+                failures += 1;
+            }
+        }
+    }
+
+    // Drain the rest.
+    while let Some((ptr, _)) = live.pop() {
+        if KERNEL_HEAP.lock().deallocate(ptr).is_err() {
+            failures += 1;
+        }
+    }
+    drop(live);
+
+    let (blocks_after, free_blocks_after) = block_census();
+    let free_after = heap_stats().free_bytes;
+
+    serial_println!("  allocation failures : {}", failures);
+    serial_println!("  misaligned pointers : {}", misaligned);
+    serial_println!(
+        "  blocks: {} before -> {} after ({} free)",
+        blocks_before,
+        blocks_after,
+        free_blocks_after
+    );
+    serial_println!("  free bytes: {} before -> {} after", free_before, free_after);
+
+    if misaligned != 0 {
+        serial_println!("  FAIL: allocator returned {} misaligned pointers", misaligned);
+    } else if failures != 0 {
+        serial_println!("  FAIL: {} allocation/deallocation errors", failures);
+    } else if blocks_after != 1 {
+        serial_println!(
+            "  FAIL: heap did not coalesce back to one block ({} remain)",
+            blocks_after
+        );
+    } else if free_after != free_before {
+        serial_println!(
+            "  FAIL: leaked {} bytes",
+            free_before.saturating_sub(free_after)
+        );
+    } else {
+        serial_println!("  PASS: heap fully reclaimed, coalesced to a single free block");
+    }
+
+    match validate_heap() {
+        Ok(()) => serial_println!("  PASS: heap integrity validated"),
+        Err(e) => serial_println!("  FAIL: heap integrity: {}", e),
+    }
 }
 
 /// Validate heap integrity

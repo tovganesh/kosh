@@ -65,19 +65,20 @@ set, and `CR4.OSFXSR | CR4.OSXMMEXCPT` set before any Rust code runs. Finally it
 moves the saved multiboot info pointer into RDI (System V AMD64 puts the first
 argument there) and calls `_start`.
 
-## Memory layout at hand-off
+## Memory layout
+
+Physical, at hand-off:
 
 ```
 0x00000000  ─┬─ low memory, BIOS, VGA at 0xB8000    (reserved, never allocated)
 0x00100000  ─┼─ __kernel_start
              │    .multiboot2
-             │    .text     (.text.boot32 first)
-             │    .rodata
+             │    .text     (.text.boot32 first)   __text_start/__text_end
+             │    .rodata                          __rodata_start/__rodata_end
              │    .data
-             │    .bss      ← PML4/PDPT/PD + 64 KiB boot stack live here
+             │    .bss      ← bootstrap page tables + 64 KiB boot stack
 0x00144000  ─┼─ __kernel_end
              │    physical frame bitmap
-             ├─ kernel heap (1 MiB)
              └─ free frames
 ```
 
@@ -85,6 +86,21 @@ argument there) and calls `_start`.
 `memory/physical.rs`, which excludes that range from the free list. Without it
 the allocator would happily hand out the frames holding the running kernel — and
 the boot page tables with it.
+
+Virtual, once `memory::paging` has installed the kernel's own tables:
+
+```
+0x0000_0000_0000_0000   unmapped                    null guard
+0x0000_0000_0000_1000 ┬ identity window, 4 KiB pages, W^X
+                      │   .text            R-X
+                      │   .rodata          R--  NX
+                      │   .data/.bss       RW-  NX
+                      │   VGA, frame bitmap RW- NX
+0x0000_0000_0040_0000 ┘
+        ...
+0xFFFF_8000_0000_0000   physmap: all of RAM, 2 MiB pages, RW+NX
+0xFFFF_9000_0000_0000   kernel heap window, 4 KiB pages, RW+NX
+```
 
 ## Running it
 
@@ -150,6 +166,53 @@ the correct trade.
 Self-test: `init_kernel` raises an `int3` right after loading the IDT and expects
 to resume. If the IDT were missing or malformed, that would triple-fault instead
 of printing `returned from int3 handler`.
+
+## Page tables (Phase 3)
+
+`kernel/src/memory/paging.rs` replaces the bootstrap map with tables the kernel
+builds itself. `Cr3::write` appeared nowhere in the tree before this — the
+"virtual memory manager" was reading the bootloader's CR3 and describing it.
+
+What it sets up:
+
+- **W^X on the kernel image.** `.text` is R-X, `.rodata` is R-- NX, everything
+  else is RW- NX. Nothing is both writable and executable.
+- **A physmap** at `0xFFFF_8000_0000_0000` covering all of RAM in 2 MiB pages.
+  `vmm.rs`'s `PHYSICAL_MEMORY_OFFSET` had always claimed this existed; now it
+  does, so the constant is back to its intended value.
+- **A heap window** at `0xFFFF_9000_0000_0000`. The heap used to take the raw
+  physical address of a contiguous frame run and use it as a pointer.
+- **Page 0 still unmapped.**
+
+Two flags that are easy to miss, both of which this code got wrong first time:
+
+| Flag | Without it |
+|---|---|
+| `EFER.NXE` | The NX bit is *reserved*. Setting it turns every NX mapping into a reserved-bit page fault instead of a protection. |
+| `CR0.WP` | Read-only pages do not apply to ring 0. The kernel can write straight through a read-only PTE, and W^X is decorative. A deliberate write to `.text` succeeded until this was set. |
+
+`paging::self_test()` checks that the physmap aliases the identity map, that
+`translate()` round-trips, and that page 0 is unmapped.
+
+## Heap (Phase 3)
+
+Three fixes in `memory/heap.rs`, all verified by `heap::stress_test()` — 2000
+mixed-size, mixed-alignment allocations, freed out of order:
+
+- **Alignment is honoured.** `find_free_block` ignored `layout.align()`
+  entirely: it aligned to `PAGE_SIZE` regardless of the request, then returned
+  the *unaligned* pointer anyway. It now carves a leading free block off the
+  front when the payload needs to move.
+- **Every block base is 16-aligned.** `BlockHeader` is `#[repr(C, align(16))]`
+  and allocation sizes round up to 16, so splitting preserves the invariant.
+  Without this, payloads drifted onto odd offsets and even an 8-byte alignment
+  request failed after the first split.
+- **Coalescing exists.** `coalesce_free_blocks` was an empty function with a
+  comment describing what it would do, so the heap fragmented monotonically. It
+  now walks the block chain in address order and merges adjacent free runs.
+
+The stress test asserts the heap collapses back to exactly one free block of its
+original size — which is the only way to prove coalescing works.
 
 ## What is deliberately still missing
 

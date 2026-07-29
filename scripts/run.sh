@@ -134,6 +134,10 @@ check)
         "PIC remapped" \
         "PIT channel 0" \
         "Interrupts enabled" \
+        "kernel page tables active" \
+        "physmap aliases identity map: OK" \
+        "page 0 unmapped: OK" \
+        "PASS: heap fully reclaimed" \
         "Kernel initialization complete" \
         "uptime 1s"
     do
