@@ -1,3 +1,15 @@
 [toolchain]
+# Floating nightly. Bare-metal Rust needs nightly for `-Z build-std`, but that
+# also means an upstream change can break the build on a day you touched
+# nothing — which is exactly what happened when nightly added two required
+# methods to `Step` and the x86_64 crate's (feature-gated, now disabled)
+# impls stopped satisfying it.
+#
+# To stop that recurring, pin to a nightly you have seen pass. The CI job
+# prints the exact version it used ("toolchain in use"), so take the date from
+# a green run and put it here:
+#
+#     channel = "nightly-YYYY-MM-DD"
+#
 channel = "nightly"
-components = ["rust-src"]
+components = ["rust-src", "llvm-tools-preview"]

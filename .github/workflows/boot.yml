@@ -20,6 +20,15 @@ jobs:
         with:
           components: rust-src, llvm-tools-preview
 
+      - name: Record the toolchain in use
+        # Nightly floats, so record what this run actually used. If the build
+        # breaks later from an upstream change, pin rust-toolchain.toml to the
+        # date printed by the last green run.
+        run: |
+          echo "toolchain in use:"
+          rustc --version --verbose
+          cargo --version
+
       - name: Install GRUB and QEMU
         run: |
           sudo apt-get update -qq

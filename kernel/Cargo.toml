@@ -14,7 +14,24 @@ lazy_static = { version = "1.4", features = ["spin_no_std"] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 multiboot2 = "0.24"
-x86_64 = "0.14"
+# default-features = false drops the crate's `nightly` feature, which pulls in
+# `step_trait`. x86_64 0.14.13 implements `Step` for VirtAddr and Page, and
+# nightly has since added two required methods to that trait
+# (`forward_overflowing` / `backward_overflowing`) — so the crate stops
+# compiling on newer nightlies through no fault of ours.
+#
+# We never iterate Page or VirtAddr ranges, so nothing here needs `Step`.
+#
+# Of the three features `nightly` bundles, we re-list the two we actually use.
+# `const_fn` is deliberately left off: nothing here needs the const
+# constructors, and it gates `feature(const_mut_refs)` — one more unstable
+# dependency that can rot the same way.
+#   instructions      — hlt, port I/O, segmentation, interrupt control
+#   abi_x86_interrupt — required by InterruptDescriptorTable::set_handler_fn
+x86_64 = { version = "0.14", default-features = false, features = [
+    "instructions",
+    "abi_x86_interrupt",
+] }
 uart_16550 = "0.3"
 pic8259 = "0.11"
 pc-keyboard = "0.7"
@@ -34,10 +51,6 @@ path = "src/lib.rs"
 
 [build-dependencies]
 cc = "1.0"
-
-# Test configuration
-[profile.test]
-panic = "abort"
 
 # Custom test harness configuration
 [[test]]
