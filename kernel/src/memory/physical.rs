@@ -1,7 +1,26 @@
 use multiboot2::{BootInformation, MemoryAreaType};
 use spin::Mutex;
-use crate::memory::{PAGE_SIZE, align_down};
+use crate::memory::{PAGE_SIZE, align_down, align_up};
 use crate::{serial_println, println};
+
+extern "C" {
+    /// Start of the loaded kernel image (defined by linker.ld).
+    static __kernel_start: u8;
+    /// End of the loaded kernel image, including .bss (defined by linker.ld).
+    static __kernel_end: u8;
+}
+
+/// Physical extent of the kernel image as actually loaded by the bootloader.
+/// These frames must never be handed out by the allocator — the boot page
+/// tables and the boot stack live in .bss, inside this range.
+fn kernel_image_range() -> (usize, usize) {
+    unsafe {
+        (
+            &__kernel_start as *const u8 as usize,
+            &__kernel_end as *const u8 as usize,
+        )
+    }
+}
 
 /// Physical page frame number
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -102,9 +121,11 @@ impl PhysicalMemoryManager {
         // Calculate bitmap size (1 bit per page frame)
         let bitmap_size = (total_frames + 7) / 8; // Round up to nearest byte
         
-        // Find a suitable location for the bitmap after the kernel
-        // We'll place it at 2MB to avoid low memory areas
-        let bitmap_start = 0x200000; // 2MB
+        // Place the bitmap immediately after the kernel image. The previous
+        // hardcoded 2 MiB only worked by accident (the kernel happened to be
+        // small enough) and would silently corrupt the kernel once it grew.
+        let (_kernel_start, kernel_end) = kernel_image_range();
+        let bitmap_start = align_up(kernel_end);
         let bitmap_end = bitmap_start + bitmap_size;
         
         // Ensure bitmap doesn't overlap with any reserved areas
@@ -127,11 +148,15 @@ impl PhysicalMemoryManager {
         // Clear the bitmap (all pages initially marked as used)
         bitmap.fill(0xFF);
         
+        // The bitmap is filled with 0xFF above, i.e. every frame starts out
+        // marked used. The counters have to agree with that, otherwise the
+        // first `mark_frame_free` underflows `used_frames` (panicking in debug,
+        // wrapping to ~u64::MAX in release and corrupting every memory stat).
         let mut manager = Self {
             bitmap,
             total_frames,
             free_frames: 0,
-            used_frames: 0,
+            used_frames: total_frames,
             reserved_frames: 0,
             bitmap_start,
         };
@@ -157,15 +182,22 @@ impl PhysicalMemoryManager {
             let start_frame = PageFrame::from_address(start_addr);
             let end_frame = PageFrame::from_address(end_addr - 1);
             
+            let (kernel_start, kernel_end) = kernel_image_range();
+
             if area.typ() == MemoryAreaType::Available {
-                // Mark pages as free, but avoid the bitmap area and low memory
+                // Mark pages as free, but avoid low memory, the kernel image
+                // and the bitmap itself.
                 for frame_num in start_frame.0..=end_frame.0 {
                     let frame_addr = frame_num * PAGE_SIZE;
                     
-                    // Skip low memory (first 1MB) and bitmap area
-                    if frame_addr < 0x100000 || 
-                       (frame_addr >= self.bitmap_start && 
-                        frame_addr < self.bitmap_start + self.bitmap.len()) {
+                    // Skip low memory (first 1MB), the kernel image (which
+                    // includes the boot page tables and boot stack in .bss),
+                    // and the frame bitmap.
+                    if frame_addr < 0x100000
+                        || (frame_addr >= kernel_start && frame_addr < kernel_end)
+                        || (frame_addr >= self.bitmap_start
+                            && frame_addr < self.bitmap_start + self.bitmap.len())
+                    {
                         self.reserved_frames += 1;
                         continue;
                     }
@@ -392,6 +424,27 @@ pub fn deallocate_frame(frame: PageFrame) {
 pub fn deallocate_frames(start_frame: PageFrame, count: usize) {
     if let Some(manager) = PHYSICAL_MEMORY_MANAGER.lock().as_mut() {
         manager.deallocate_frames(start_frame, count);
+    }
+}
+
+/// Physical extent of the frame bitmap, as (start, end).
+///
+/// The bitmap is accessed by physical address, so whoever builds the kernel
+/// page tables has to keep it reachable.
+pub fn bitmap_extent() -> (usize, usize) {
+    let guard = PHYSICAL_MEMORY_MANAGER.lock();
+    match guard.as_ref() {
+        Some(m) => (m.bitmap_start, m.bitmap_start + m.bitmap.len()),
+        None => (0, 0),
+    }
+}
+
+/// End of usable physical memory as reported by the bootloader.
+pub fn physical_memory_end() -> u64 {
+    let guard = PHYSICAL_MEMORY_MANAGER.lock();
+    match guard.as_ref() {
+        Some(m) => (m.total_frames * PAGE_SIZE) as u64,
+        None => 0,
     }
 }
 

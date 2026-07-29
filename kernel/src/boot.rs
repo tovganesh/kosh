@@ -1,60 +1,11 @@
 #[cfg(target_arch = "x86_64")]
 use multiboot2::BootInformation;
-#[cfg(target_arch = "x86_64")]
-use x86_64::structures::gdt::{GlobalDescriptorTable, Descriptor, SegmentSelector};
-#[cfg(target_arch = "x86_64")]
-use x86_64::structures::tss::TaskStateSegment;
-#[cfg(target_arch = "x86_64")]
-use x86_64::instructions::segmentation::Segment;
-#[cfg(target_arch = "x86_64")]
-use x86_64::VirtAddr;
-use lazy_static::lazy_static;
 use crate::{println, serial_println};
 use crate::memory;
 
-#[cfg(target_arch = "x86_64")]
-const DOUBLE_FAULT_IST_INDEX: u16 = 0;
-
-#[cfg(target_arch = "x86_64")]
-lazy_static! {
-    static ref TSS: TaskStateSegment = {
-        let mut tss = TaskStateSegment::new();
-        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
-            const STACK_SIZE: usize = 4096 * 5;
-            static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
-
-            let stack_start = VirtAddr::from_ptr(&raw const STACK);
-            let stack_end = stack_start + STACK_SIZE;
-            stack_end
-        };
-        tss
-    };
-}
-
-#[cfg(target_arch = "x86_64")]
-lazy_static! {
-    static ref GDT: (GlobalDescriptorTable, Selectors) = {
-        let mut gdt = GlobalDescriptorTable::new();
-        let code_selector = gdt.add_entry(Descriptor::kernel_code_segment());
-        let data_selector = gdt.add_entry(Descriptor::kernel_data_segment());
-        let tss_selector = gdt.add_entry(Descriptor::tss_segment(&TSS));
-        (
-            gdt,
-            Selectors {
-                code_selector,
-                data_selector,
-                tss_selector,
-            },
-        )
-    };
-}
-
-#[cfg(target_arch = "x86_64")]
-struct Selectors {
-    code_selector: SegmentSelector,
-    data_selector: SegmentSelector,
-    tss_selector: SegmentSelector,
-}
+// GDT, TSS and the double-fault IST now live in `crate::gdt`, which owns the
+// ring-3 descriptors and RSP0 as well. See that module for why the descriptor
+// order is load-bearing once SYSCALL/SYSRET exist.
 
 #[cfg(target_arch = "x86_64")]
 /// Initialize the kernel with multiboot2 information
@@ -67,8 +18,13 @@ pub fn init_kernel(boot_info: BootInformation) {
     // Set up basic CPU state first
     init_cpu_state();
     
-    // Set up GDT and TSS
-    init_gdt();
+    // Set up GDT and TSS (now including ring-3 descriptors and RSP0)
+    crate::gdt::init();
+    
+    // Install the IDT before anything else can fault. From here on a bad
+    // pointer produces a legible dump instead of a silent triple fault.
+    crate::interrupts::init();
+    crate::interrupts::test_breakpoint_exception();
     
     // Parse and display memory information
     parse_memory_map(&boot_info);
@@ -76,14 +32,26 @@ pub fn init_kernel(boot_info: BootInformation) {
     // Initialize physical memory manager
     init_physical_memory(&boot_info);
     
-    // Initialize virtual memory management
-    init_virtual_memory();
+    // Build and install the kernel's own page tables, replacing the crude
+    // identity map the boot trampoline set up. Needs only the frame allocator,
+    // so it can run before the heap exists.
+    init_paging();
     
-    // Initialize kernel heap allocator
+    // Initialize kernel heap allocator.
+    //
+    // ORDER MATTERS: after paging (the heap is now mapped into its own virtual
+    // window, so page tables must exist) and before init_virtual_memory(),
+    // which pushes region descriptors into a Vec and therefore allocates.
+    // Running the VMM first meant allocating against a null heap every boot.
     init_heap_allocator();
     
-    // Initialize swap space management
-    init_swap_management();
+    // Initialize virtual memory management bookkeeping
+    init_virtual_memory();
+    
+    // DISABLED (Phase 1): init_swap_management() allocates an 8 MiB Vec as a
+    // "swap file" out of a 1 MiB kernel heap whose MAX_ALLOC_SIZE is 1 MiB.
+    // It cannot succeed. Re-enable once there is a real block device.
+    // init_swap_management();
     
     // Initialize process management
     init_process_management();
@@ -94,11 +62,24 @@ pub fn init_kernel(boot_info: BootInformation) {
     // Initialize system call interface
     init_syscall_interface();
     
-    // Initialize power management framework
-    init_power_management();
+    // DISABLED (Phase 1): the power management subsystem is entirely simulated
+    // (no ACPI, no MSRs, constant battery level) and test_power_management()
+    // is 236 lines of printing those simulated results during boot.
+    // init_power_management();
     
     // Initialize early console output (already done in main, but ensure it's working)
     test_console_output();
+    
+    // Everything is up: remap the PIC, start the PIT and enable interrupts.
+    // Deliberately last, so a timer tick cannot arrive mid-initialisation.
+    crate::interrupts::enable_hardware_interrupts();
+    
+    // Kernel threads. Needs a live timer, so it has to come after the line
+    // above.
+    init_scheduler();
+    
+    // Ring 3.
+    init_usermode();
     
     serial_println!("Kernel initialization complete");
 }
@@ -441,29 +422,6 @@ fn test_power_management() {
 }
 
 /// Initialize Global Descriptor Table and Task State Segment
-fn init_gdt() {
-    serial_println!("Setting up GDT and TSS...");
-    
-    GDT.0.load();
-    
-    unsafe {
-        // Load code segment
-        x86_64::instructions::segmentation::CS::set_reg(GDT.1.code_selector);
-        
-        // Load data segments
-        x86_64::instructions::segmentation::DS::set_reg(GDT.1.data_selector);
-        x86_64::instructions::segmentation::ES::set_reg(GDT.1.data_selector);
-        x86_64::instructions::segmentation::FS::set_reg(GDT.1.data_selector);
-        x86_64::instructions::segmentation::GS::set_reg(GDT.1.data_selector);
-        x86_64::instructions::segmentation::SS::set_reg(GDT.1.data_selector);
-        
-        // Load TSS
-        x86_64::instructions::tables::load_tss(GDT.1.tss_selector);
-    }
-    
-    serial_println!("GDT and TSS initialized");
-}
-
 /// Parse and display memory map information from multiboot2
 fn parse_memory_map(boot_info: &BootInformation) {
     serial_println!("Parsing memory map...");
@@ -722,12 +680,130 @@ fn test_virtual_memory() {
     serial_println!("Virtual memory management test complete");
 }
 
+/// Drop into ring 3 and run the user payload.
+#[cfg(target_arch = "x86_64")]
+fn init_usermode() {
+    crate::syscall::uaccess::self_test();
+
+    let before = crate::syscall::entry::syscall_count();
+
+    // Demo 1: syscalls from ring 3, including one the kernel must refuse.
+    if let Err(e) = crate::task::spawn("user-syscall", crate::usermode::run_user_demo, 0) {
+        serial_println!("Failed to spawn user thread: {}", e);
+        return;
+    }
+    while crate::task::live_threads() > 0 {
+        x86_64::instructions::hlt();
+    }
+    serial_println!("--- back in ring 0 ---");
+    crate::task::reap_finished();
+
+    // Demo 2: a ring-3 program that dereferences kernel memory. The kernel must
+    // kill it and survive.
+    serial_println!();
+    if let Err(e) = crate::task::spawn("user-fault", crate::usermode::run_user_demo, 1) {
+        serial_println!("Failed to spawn faulting user thread: {}", e);
+        return;
+    }
+    while crate::task::live_threads() > 0 {
+        x86_64::instructions::hlt();
+    }
+    serial_println!("--- kernel survived a ring 3 fault ---");
+    crate::task::reap_finished();
+
+    let serviced = crate::syscall::entry::syscall_count() - before;
+    if serviced >= 4 {
+        serial_println!("Ring 3: PASS — {} syscalls serviced from user mode", serviced);
+    } else {
+        serial_println!("Ring 3: FAIL — only {} syscalls serviced", serviced);
+    }
+}
+
+/// Bring up preemptive kernel threading and prove it works.
+#[cfg(target_arch = "x86_64")]
+fn init_scheduler() {
+    serial_println!("Initializing kernel threads...");
+    crate::task::init();
+
+    for (i, name) in ["worker-A", "worker-B", "worker-C"].iter().enumerate() {
+        if let Err(e) = crate::task::spawn(name, scheduler_demo_thread, i) {
+            serial_println!("Failed to spawn {}: {}", name, e);
+            return;
+        }
+    }
+
+    serial_println!("Starting preemptive scheduling...");
+    serial_println!("Expect A/B/C to interleave — none of them ever yields:");
+    crate::serial_print!("  ");
+
+    crate::task::start();
+
+    // Wait for the workers. `hlt` parks the CPU until the next interrupt, which
+    // is what lets the timer preempt us into the workers in the first place.
+    while crate::task::live_threads() > 0 {
+        x86_64::instructions::hlt();
+    }
+
+    serial_println!();
+    crate::task::print_threads();
+    crate::task::reap_finished();
+
+    let switches = crate::task::switch_count();
+    if switches > 10 {
+        serial_println!("Scheduler: PASS — {} real context switches", switches);
+    } else {
+        serial_println!("Scheduler: FAIL — only {} context switches", switches);
+    }
+}
+
+/// Body of each demo thread.
+///
+/// The busy-wait is the point. These threads never call `yield_now`, never
+/// sleep, and never block on anything — so the *only* way their output can
+/// interleave is if the timer interrupt takes the CPU away from them. If the
+/// letters come out as `A A A ... B B B ... C C C`, scheduling is cooperative
+/// and something is wrong.
+#[cfg(target_arch = "x86_64")]
+fn scheduler_demo_thread(index: usize) {
+    const NAMES: [&str; 3] = ["A", "B", "C"];
+    const ROUNDS: usize = 8;
+    const BUSY_TICKS: u64 = 5; // 50 ms of work per round, slice is 20 ms
+
+    let name = NAMES[index % NAMES.len()];
+
+    for _ in 0..ROUNDS {
+        crate::serial_print!("{} ", name);
+
+        let target = crate::interrupts::timer::ticks() + BUSY_TICKS;
+        while crate::interrupts::timer::ticks() < target {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Build and install the kernel page tables.
+#[cfg(target_arch = "x86_64")]
+fn init_paging() {
+    let phys_end = memory::physical::physical_memory_end();
+
+    match memory::paging::init(phys_end) {
+        Ok(()) => {
+            memory::paging::self_test();
+        }
+        Err(e) => {
+            serial_println!("Failed to build kernel page tables: {}", e);
+            panic!("paging initialization failed");
+        }
+    }
+}
+
 /// Initialize kernel heap allocator
 fn init_heap_allocator() {
     serial_println!("Initializing kernel heap allocator...");
     
-    // Allocate 1MB (256 pages) for the kernel heap
-    const HEAP_SIZE_PAGES: usize = 256;
+    // 4 MiB of kernel heap. Frames no longer need to be physically contiguous,
+    // so this is just 1024 mapped pages.
+    const HEAP_SIZE_PAGES: usize = 1024;
     
     match memory::heap::init_kernel_heap(HEAP_SIZE_PAGES) {
         Ok(()) => {
@@ -749,6 +825,9 @@ fn test_heap_allocator() {
     
     // Test the heap allocator functionality
     memory::heap::test_heap_allocator();
+    
+    // Prove alignment and coalescing actually work.
+    memory::heap::stress_test();
     
     // Test Rust's built-in allocation using Vec
     {

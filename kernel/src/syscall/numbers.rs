@@ -55,7 +55,10 @@ pub const SYS_CHECK_CAPABILITY: u64 = 62;
 pub const SYS_LIST_CAPABILITIES: u64 = 63;
 
 /// Debug and testing system calls (only available in debug builds)
-#[cfg(debug_assertions)]
+// Deliberately NOT cfg(debug_assertions): userspace calls this unconditionally
+// (see userspace/shell/src/output.rs), and having the number vanish from
+// release kernels is exactly the kind of silent difference that hides bugs
+// until the release build is the one that matters.
 pub const SYS_DEBUG_PRINT: u64 = 100;
 #[cfg(debug_assertions)]
 pub const SYS_DEBUG_DUMP: u64 = 101;

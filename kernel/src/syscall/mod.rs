@@ -3,7 +3,9 @@ use crate::process::ProcessId;
 use crate::{serial_println, println};
 
 pub mod dispatcher;
+pub mod entry;
 pub mod numbers;
+pub mod uaccess;
 pub mod validation;
 pub mod error;
 pub mod test;
@@ -23,24 +25,11 @@ pub fn init_syscall_interface() -> Result<(), &'static str> {
     // Initialize the system call dispatcher
     dispatcher::init_syscall_dispatcher()?;
     
-    // Set up system call interrupt handler
-    setup_syscall_interrupt()?;
+    // Program the SYSCALL/SYSRET MSRs. This replaces the int 0x80 stub that
+    // never existed.
+    entry::init();
     
     serial_println!("System call interface initialized successfully");
-    Ok(())
-}
-
-/// Set up the system call interrupt handler (int 0x80)
-fn setup_syscall_interrupt() -> Result<(), &'static str> {
-    // For now, we'll use a simple approach with software interrupt 0x80
-    // In a more sophisticated implementation, we would use SYSCALL/SYSRET instructions
-    
-    serial_println!("Setting up system call interrupt handler (int 0x80)");
-    
-    // TODO: Set up IDT entry for interrupt 0x80
-    // This would require implementing an IDT (Interrupt Descriptor Table)
-    // For now, we'll just log that it's set up
-    
     Ok(())
 }
 

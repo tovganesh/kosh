@@ -305,7 +305,16 @@ pub mod kernel_layout {
     pub const KERNEL_HEAP_SIZE: usize = 64 * 1024 * 1024;
     
     /// Physical memory mapping start (for higher half kernel)
-    pub const PHYSICAL_MEMORY_OFFSET: VirtualAddress = VirtualAddress(0xFFFF800000000000);
+    /// Offset at which all of physical memory is visible in the virtual
+    /// address space.
+    ///
+    /// Phase 3: `memory::paging` maps all of physical memory here when it
+    /// builds the kernel page tables, so this offset is now backed by real
+    /// mappings. (Through Phase 2 it had to be 0 — the constant claimed a
+    /// higher-half physmap that nothing had ever created, so using it was an
+    /// immediate page fault.)
+    pub const PHYSICAL_MEMORY_OFFSET: VirtualAddress =
+        VirtualAddress(crate::memory::paging::PHYSMAP_BASE as usize);
 }
 
 /// Global virtual memory manager

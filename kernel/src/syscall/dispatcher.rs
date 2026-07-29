@@ -131,11 +131,20 @@ fn sys_exit(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
     // 3. Notify parent process
     // 4. Schedule next process
     
-    // Since we don't have direct access to the process table from here,
-    // we'll use the public interface when it's available
-    serial_println!("Process {} terminated with exit code {}", process_id.0, exit_code);
-    
-    // Return success - the process will be cleaned up by the scheduler
+    serial_println!(
+        "Process {} terminated with exit code {}",
+        process_id.0,
+        exit_code
+    );
+
+    // Actually terminate. The ring-3 program runs on a kernel thread, so
+    // retiring that thread is the exit: `exit_current` marks it finished and
+    // schedules away, and never returns. Previously this logged and returned
+    // Ok(0), leaving the caller running as if nothing had happened.
+    #[cfg(target_arch = "x86_64")]
+    crate::task::exit_current();
+
+    #[allow(unreachable_code)]
     Ok(0)
 }
 
@@ -374,23 +383,43 @@ fn sys_read(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
     }
 }
 
-fn sys_write(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
+fn sys_write(_process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
+    use crate::syscall::uaccess::copy_from_user;
+
     let fd = args[0];
     let buf_ptr = args[1];
-    let count = args[2];
-    
-    serial_println!("Process {} requesting write: fd={}, buf=0x{:x}, count={}", 
-                   process_id.0, fd, buf_ptr, count);
-    
-    // TODO: Implement file writing
-    // For now, if writing to stdout (fd=1) or stderr (fd=2), we could output to console
-    if fd == 1 || fd == 2 {
-        // TODO: Read string from user space and print it
-        serial_println!("Process {} writing {} bytes to console", process_id.0, count);
-        Ok(count) // Return number of bytes "written"
-    } else {
-        Err(SyscallError::NotSupported)
+    let count = args[2] as usize;
+
+    // Only the console for now; real file descriptors need the VFS.
+    if fd != 1 && fd != 2 {
+        return Err(SyscallError::NotSupported);
     }
+
+    // Copy through a bounded kernel buffer rather than dereferencing the user
+    // pointer directly. `copy_from_user` is what makes this safe: it checks the
+    // span is in the user half and that every page is present and
+    // USER_ACCESSIBLE. This used to return `count` without reading anything.
+    const CHUNK: usize = 256;
+    let mut buffer = [0u8; CHUNK];
+    let mut written = 0usize;
+
+    while written < count {
+        let n = core::cmp::min(CHUNK, count - written);
+        let slice = &mut buffer[..n];
+
+        copy_from_user(buf_ptr + written as u64, slice)
+            .map_err(|_| SyscallError::InvalidArgument)?;
+
+        for &byte in slice.iter() {
+            let c = byte as char;
+            crate::serial_print!("{}", c);
+            crate::print!("{}", c);
+        }
+
+        written += n;
+    }
+
+    Ok(count as u64)
 }
 
 fn sys_lseek(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {

@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
 #![feature(custom_test_frameworks)]
 #![test_runner(crate::test_runner)]
 #![reexport_test_harness_main = "test_main"]
@@ -13,6 +14,18 @@ use multiboot2::BootInformation;
 mod serial;
 mod vga_buffer;
 mod boot;
+#[cfg(target_arch = "x86_64")]
+mod interrupts;
+#[cfg(target_arch = "x86_64")]
+mod task;
+#[cfg(target_arch = "x86_64")]
+mod gdt;
+#[cfg(target_arch = "x86_64")]
+mod usermode;
+#[cfg(target_arch = "x86_64")]
+mod user_program;
+#[cfg(target_arch = "x86_64")]
+mod boot32;
 mod memory;
 mod process;
 mod ipc;
@@ -100,7 +113,7 @@ struct Multiboot2Header {
 static MULTIBOOT2_HEADER: Multiboot2Header = {
     const MAGIC: u32 = 0xE85250D6;
     const ARCH: u32 = 0;
-    const HEADER_LEN: u32 = 16; // 4 u32 fields = 16 bytes for main header
+    const HEADER_LEN: u32 = core::mem::size_of::<Multiboot2Header>() as u32;
     
     Multiboot2Header {
         magic: MAGIC,
@@ -214,6 +227,12 @@ fn parse_boot_parameters(boot_info: &BootInformation) {
     serial_println!("Boot parameter parsing complete");
 }
 
+/// Rust kernel entry point.
+///
+/// This is NOT the ELF entry point — `_start32` in `boot32.rs` is. By the time
+/// we get here the CPU is in 64-bit long mode with a bootstrap identity map in
+/// place, and the trampoline has marshalled the Multiboot2 info pointer (which
+/// the loader passes in EBX) into RDI per the System V AMD64 ABI.
 #[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub extern "C" fn _start(multiboot_info_addr: usize) -> ! {
@@ -244,14 +263,51 @@ pub extern "C" fn _start(multiboot_info_addr: usize) -> ! {
     test_main();
 
     println!("Kosh kernel initialized successfully!");
+    serial_println!("Kosh kernel initialized successfully!");
 
-    // Halt the CPU in an infinite loop
+    idle_loop()
+}
+
+/// Idle loop.
+///
+/// There is no scheduler yet, so the kernel's "steady state" is to wait for
+/// interrupts. The timer ticks in the background; anything typed on the PS/2
+/// keyboard is echoed here, which proves the IRQ path end to end and is the
+/// beginning of the console the shell will use in Phase 7.
+#[cfg(target_arch = "x86_64")]
+fn idle_loop() -> ! {
+    serial_println!("Kosh: idle loop — timer is ticking, type to echo keystrokes");
+    println!("Kosh ready. Type something:");
+
     loop {
-        #[cfg(target_arch = "x86_64")]
+        while let Some(c) = interrupts::keyboard::read_char() {
+            match c {
+                // Enter
+                '\n' | '\r' => {
+                    println!();
+                    serial_println!();
+                }
+                // Backspace
+                '\x08' | '\x7f' => {
+                    print!("\x08 \x08");
+                    serial_print!("\x08 \x08");
+                }
+                c => {
+                    print!("{}", c);
+                    serial_print!("{}", c);
+                }
+            }
+        }
+
+        // Sleep until the next interrupt rather than spinning.
         x86_64::instructions::hlt();
-        
-        #[cfg(target_arch = "aarch64")]
-        unsafe { core::arch::asm!("wfi") }; // Wait for interrupt on ARM64
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn idle_loop() -> ! {
+    loop {
+        unsafe { core::arch::asm!("wfi") };
     }
 }
 
