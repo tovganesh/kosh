@@ -514,7 +514,15 @@ pub fn test_heap_allocator() {
         let size = 32 + i * 16;
         let layout = Layout::from_size_align(size, 8).unwrap();
         
-        match KERNEL_HEAP.lock().allocate(layout) {
+        // NOTE: the lock MUST be released before `ptrs.push`. A temporary in a
+        // `match` scrutinee lives until the end of the match, so writing
+        // `match KERNEL_HEAP.lock().allocate(..)` holds the spinlock while the
+        // Vec grows — and Vec growth calls the global allocator, which tries to
+        // take the same lock. That is a hard deadlock, and it was hanging the
+        // boot right here.
+        let result = KERNEL_HEAP.lock().allocate(layout);
+
+        match result {
             Ok(ptr) => {
                 serial_println!("Allocated {} bytes at 0x{:x}", size, ptr.as_ptr() as usize);
                 ptrs.push((ptr, layout));

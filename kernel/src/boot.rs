@@ -76,14 +76,20 @@ pub fn init_kernel(boot_info: BootInformation) {
     // Initialize physical memory manager
     init_physical_memory(&boot_info);
     
+    // Initialize kernel heap allocator.
+    //
+    // ORDER MATTERS: this must come *before* init_virtual_memory(), which
+    // pushes region descriptors into a Vec and therefore allocates. Running it
+    // first meant allocating against a null heap on every boot.
+    init_heap_allocator();
+    
     // Initialize virtual memory management
     init_virtual_memory();
     
-    // Initialize kernel heap allocator
-    init_heap_allocator();
-    
-    // Initialize swap space management
-    init_swap_management();
+    // DISABLED (Phase 1): init_swap_management() allocates an 8 MiB Vec as a
+    // "swap file" out of a 1 MiB kernel heap whose MAX_ALLOC_SIZE is 1 MiB.
+    // It cannot succeed. Re-enable once there is a real block device.
+    // init_swap_management();
     
     // Initialize process management
     init_process_management();
@@ -94,8 +100,10 @@ pub fn init_kernel(boot_info: BootInformation) {
     // Initialize system call interface
     init_syscall_interface();
     
-    // Initialize power management framework
-    init_power_management();
+    // DISABLED (Phase 1): the power management subsystem is entirely simulated
+    // (no ACPI, no MSRs, constant battery level) and test_power_management()
+    // is 236 lines of printing those simulated results during boot.
+    // init_power_management();
     
     // Initialize early console output (already done in main, but ensure it's working)
     test_console_output();

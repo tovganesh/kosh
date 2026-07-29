@@ -13,6 +13,8 @@ use multiboot2::BootInformation;
 mod serial;
 mod vga_buffer;
 mod boot;
+#[cfg(target_arch = "x86_64")]
+mod boot32;
 mod memory;
 mod process;
 mod ipc;
@@ -100,7 +102,7 @@ struct Multiboot2Header {
 static MULTIBOOT2_HEADER: Multiboot2Header = {
     const MAGIC: u32 = 0xE85250D6;
     const ARCH: u32 = 0;
-    const HEADER_LEN: u32 = 16; // 4 u32 fields = 16 bytes for main header
+    const HEADER_LEN: u32 = core::mem::size_of::<Multiboot2Header>() as u32;
     
     Multiboot2Header {
         magic: MAGIC,
@@ -214,6 +216,12 @@ fn parse_boot_parameters(boot_info: &BootInformation) {
     serial_println!("Boot parameter parsing complete");
 }
 
+/// Rust kernel entry point.
+///
+/// This is NOT the ELF entry point — `_start32` in `boot32.rs` is. By the time
+/// we get here the CPU is in 64-bit long mode with a bootstrap identity map in
+/// place, and the trampoline has marshalled the Multiboot2 info pointer (which
+/// the loader passes in EBX) into RDI per the System V AMD64 ABI.
 #[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub extern "C" fn _start(multiboot_info_addr: usize) -> ! {
@@ -244,6 +252,8 @@ pub extern "C" fn _start(multiboot_info_addr: usize) -> ! {
     test_main();
 
     println!("Kosh kernel initialized successfully!");
+    serial_println!("Kosh kernel initialized successfully!");
+    serial_println!("Kosh: entering idle loop (no IDT and no timer yet — Phase 2)");
 
     // Halt the CPU in an infinite loop
     loop {
