@@ -15,11 +15,16 @@ Nothing in the kernel had ever executed. Everything below is what closed that ga
 ```
 BIOS
  └─> GRUB2  (reads the multiboot2 header in .multiboot2)
-      └─> _start32          kernel/src/boot32.rs   [32-bit protected mode]
-           └─> long_mode_start                     [64-bit long mode]
-                └─> _start   kernel/src/main.rs    [Rust]
-                     └─> boot::init_kernel         kernel/src/boot.rs
+      └─> _start32       kernel/src/boot32.rs  [32-bit, running at phys 1 MiB]
+           └─> long_mode_low                   [64-bit, running at phys 1 MiB]
+                └─> long_mode_start            [64-bit, 0xFFFFFFFF801.....]
+                     └─> _start   kernel/src/main.rs         [Rust]
+                          └─> boot::init_kernel    kernel/src/boot.rs
 ```
+
+The kernel is linked at `0xFFFF_FFFF_8010_0000` and loaded at physical 1 MiB.
+Which of those two a given line of `boot32.rs` is running at is the thing to
+track while reading it — see "The higher half" below.
 
 ### 1. `.multiboot2` header — `kernel/src/main.rs`
 
@@ -44,10 +49,14 @@ The ELF entry point (`ENTRY(_start32)` in `linker.ld`). In order:
 | Build PML4 / PDPT / PD / PT | Identity-maps the first 1 GiB (see the null guard note below) |
 | CR3, CR4.PAE, EFER.LME, CR0.PG | The actual mode switch |
 | `lgdt` + `ljmp $0x08` | Loads a 64-bit GDT and reloads CS — this is the moment we become 64-bit |
+| `movabsq` + `jmp *%rax` | ...and this is the moment we stop running at a physical address |
 
-The identity map covers the kernel at 1 MiB, the frame bitmap, the heap, VGA at
-`0xB8000` and QEMU's default RAM. It is deliberately a *bootstrap* map: the
-kernel replaces it with a proper higher-half address space in Phase 3.
+The trampoline maps physical 0..1 GiB **twice**: identity, because the code doing
+the mapping is executing at a low address and cannot pull the rug out from under
+itself, and again at `KERNEL_VMA` (PML4[511], PDPT[510]), because that is where
+the kernel is linked. Both windows point at the same PD, so the second costs one
+extra page table. `paging::init` later replaces both and keeps only the higher
+half.
 
 **Null guard page.** The first 2 MiB is mapped with 4 KiB pages rather than one
 2 MiB huge page, purely so that page 0 can be left *unmapped*. With a flat
@@ -87,20 +96,35 @@ Physical, at hand-off:
 the allocator would happily hand out the frames holding the running kernel — and
 the boot page tables with it.
 
+Those symbols are *virtual* (`0xFFFF_FFFF_8010_0000`), and the exclusion above is
+about *physical* frames, so `physical.rs` runs them through
+`paging::kernel_phys`. Before the higher-half migration the two were the same
+number and the conversion did not exist; forgetting it is not a subtle failure —
+the comparison never matches, and the allocator hands out the running kernel.
+
 Virtual, once `memory::paging` has installed the kernel's own tables:
 
 ```
-0x0000_0000_0000_0000   unmapped                    null guard
-0x0000_0000_0000_1000 ┬ identity window, 4 KiB pages, W^X
-                      │   .text            R-X
-                      │   .rodata          R--  NX
-                      │   .data/.bss       RW-  NX
-                      │   VGA, frame bitmap RW- NX
-0x0000_0000_0040_0000 ┘
+0x0000_0000_0000_0000 ┐
+        ...           │ the entire lower half belongs to userspace
+0x0000_7FFF_FFFF_FFFF ┘
         ...
-0xFFFF_8000_0000_0000   physmap: all of RAM, 2 MiB pages, RW+NX
-0xFFFF_9000_0000_0000   kernel heap window, 4 KiB pages, RW+NX
+0xFFFF_8000_0000_0000   physmap: all of RAM, 2 MiB pages, RW+NX      PML4[256]
+0xFFFF_9000_0000_0000   kernel heap window, 4 KiB pages, RW+NX       PML4[288]
+        ...
+0xFFFF_FFFF_8000_0000   unmapped                  null guard         PML4[511]
+0xFFFF_FFFF_8000_1000 ┬ kernel window, 4 KiB pages, W^X
+                      │   VGA, multiboot info, frame bitmap  RW- NX
+                      │   .text                              R-X
+                      │   .rodata                            R-- NX
+                      │   .data/.bss                         RW- NX
+0xFFFF_FFFF_8040_0000 ┘
 ```
+
+The kernel window maps `KERNEL_VMA + phys` for the low few MiB — the same frames
+the identity map used to cover, at addresses out of userspace's way. It exists
+because the frame bitmap and the VGA buffer are touched *before* `paging::init`
+builds the physmap, so they need a window that the boot trampoline can set up.
 
 ## Running it
 
@@ -860,6 +884,164 @@ running, and says so when it declines.
 `task::current_id()` now, so `getpid`, the log lines, and the task id `spawn`
 returns all agree.
 
+## The higher half (Phase 11)
+
+Until this, the kernel lived at physical 1 MiB and ran there, identity-mapped
+through PML4[0]. That is the same top-level entry a user process needs for its
+own image and stack, so "give each process its own address space" was blocked on
+"get the kernel out of the way first". This is that.
+
+The kernel is now linked at `0xFFFF_FFFF_8000_0000 + 1 MiB` and loaded at
+physical 1 MiB. `linker.ld` gives every section an explicit `AT()`, so the ELF
+program headers carry `p_vaddr` in the higher half and `p_paddr` at 1 MiB:
+
+```
+  Type   VirtAddr           PhysAddr           Flg
+  LOAD   0xffffffff80100000 0x0000000000100000 R
+  LOAD   0xffffffff80101000 0x0000000000101000 R E
+  ...
+```
+
+-2 GiB specifically, because that is what `-C code-model=kernel` assumes — a
+flag `.cargo/config.toml` had been setting since long before it was true.
+
+### The entry point is a virtual address
+
+The first attempt set `ENTRY()` to the *physical* address of the trampoline,
+reasoning that GRUB jumps there in 32-bit protected mode with paging off. GRUB
+disagreed, and said so:
+
+```
+error: entry point isn't in a segment.
+```
+
+GRUB looks `e_entry` up in `p_vaddr` space, finds the program header containing
+it, and rebases it into that header's `p_paddr` range itself. So `e_entry` is the
+higher-half address and GRUB arrives at physical 1 MiB on its own.
+
+Worth recording *how* that was found: the message goes to the VGA console, and
+`--check` only captures serial — so the symptom was a completely empty log,
+indistinguishable from a kernel that died on its first instruction. `run.sh` now
+writes a `grub.cfg` that puts GRUB's own output on COM1 for exactly this reason.
+
+### Two addresses for every symbol in the trampoline
+
+Steps 1-4 of `boot32.rs` execute at physical 1 MiB with paging off, but the file
+is linked with everything else. Every reference to a symbol in 32-bit code is
+therefore written `sym - KERNEL_VMA`:
+
+```asm
+    movl    %eax, (mb_magic - KERNEL_VMA)
+    movl    $(stack_top - KERNEL_VMA), %esp
+    movl    $(p4_table - KERNEL_VMA), %eax
+    movl    %eax, %cr3
+```
+
+Miss one and the failure is a triple fault with no output. The `%cr3` line is the
+one that bites hardest: a truncated CR3 faults on the very next instruction,
+before any of the serial output in that file can report anything.
+
+Three more places where 32 bits is not enough:
+
+- **`lgdt`.** A 32-bit LGDT consumes a 6-byte operand — 2-byte limit, 4-byte
+  base. Sharing one descriptor between the two modes silently loads a GDTR
+  pointing at the *low 32 bits* of a higher-half address, so there are now two:
+  `gdt64_ptr32` with the physical base and `gdt64_ptr` with the virtual one.
+- **The far jump.** `ljmp` takes a 32-bit offset and cannot reach the higher
+  half. It lands at the physical address of `long_mode_low`, two instructions
+  whose only job is `movabsq $long_mode_start, %rax; jmp *%rax`.
+- **`movq $stack_top, %rsp`.** `mov r64, imm32` sign-extends, which happens to
+  produce the right answer for a -2 GiB address — it worked by luck before and
+  is a `movabsq` now.
+
+### Virtual is not physical any more
+
+The migration's real cost is every place that used to get away with treating the
+two as the same number:
+
+| site | before | after |
+|---|---|---|
+| `physical::kernel_image_range` | linker symbols as physical | `paging::kernel_phys(sym)` |
+| the frame bitmap | placed and dereferenced at one address | placed physical, written through `kernel_virt` |
+| `vga_buffer` | `0xb8000 as *mut Buffer` | `kernel_virt(0xb8000)` |
+| the multiboot info pointer | dereferenced directly | `kernel_virt(phys)` |
+| `usermode`'s `.user` blob | `__user_start` passed as a frame address | `kernel_phys(__user_start)` |
+| `paging::identity_map_4k` | `PhysAddr::new(virt)` | `PhysAddr::new(kernel_phys(virt))` |
+
+`kernel_image_range` is the one that would have been worst. It feeds the check
+that keeps the allocator away from the running kernel's own frames; with virtual
+symbols the comparison simply never matches, and the failure is the allocator
+handing out the page tables it is executing on.
+
+The `.user` blob fails loudly instead, which is a mercy: `PhysAddr::new` panics
+on a value with bits above 52 set.
+
+### The bootstrap window
+
+There is an ordering problem underneath all of this. The frame bitmap is placed
+and zeroed, and the first `println!` reaches VGA, *before* `paging::init` builds
+the physmap. Neither can use `PHYSMAP_BASE`, and the identity map they used to
+rely on is what is being removed.
+
+The answer is that the trampoline's higher-half window covers a full 1 GiB, and
+`paging::init` deliberately keeps the low few MiB of it. `kernel_virt(phys)` is
+therefore valid from the first instruction of long mode through to shutdown, and
+neither the bitmap pointer nor the VGA pointer ever needs rebasing.
+
+Building the new tables has the same problem one level up: the mapper has to
+write page-table frames it just allocated, and the physmap it is constructing
+does not exist yet. So construction runs with the mapper offset set to
+`KERNEL_VMA` rather than `0`, and a `BootstrapFrameAllocator` refuses any frame
+above the 1 GiB window instead of returning a pointer that faults on first write.
+
+`phys_to_virt` was deleted rather than fixed. It answered "the kernel-virtual
+address of this frame" with either the identity or the physmap depending on a
+flag — and after the migration that question has two right answers depending on
+*when* you ask. Hiding that behind one function invites using the wrong one; the
+call sites pick `kernel_virt` or `PHYSMAP_BASE` deliberately now. It had no
+callers anyway.
+
+### Proving it
+
+`paging::self_test` gained a check, and `--check` gained a marker:
+
+```
+  kernel window   : 0xffffffff80000000 -> 0x0..0x400000 (4 KiB pages, W^X)
+  physmap         : 0xffff800000000000 -> 0x0..0x1ffe0000 (2 MiB pages, RW+NX)
+  PML4[0]         : empty — reserved for user address spaces
+  translate(0xffffffff80100000) -> 0x100000: OK
+  kernel out of PML4[0]: OK (0x100000 is unmapped, was the kernel image)
+```
+
+It checks that the kernel *image address* is gone from the lower half rather than
+that PML4[0] is empty, because PML4[0] is exactly where user mappings live — it
+is populated, just not by the kernel.
+
+Restoring the low mapping in `init` turns that line into:
+
+```
+  WARNING: 0x100000 still maps to 0x100000 — the low identity map survived
+```
+
+and the marker fails, which is the only evidence that it is checking anything.
+
+### One more thing this cleaned up
+
+`memory/vmm.rs` carried a `kernel_layout` module describing kernel code at
+`0xFFFFFFFF80000000`, data 16 MiB above it and a heap 16 MiB above that — three
+invented numbers for a layout nothing had ever built, printed in the boot log
+next to the real one. They are derived from `memory::paging` now, and the dump
+reports what the page tables actually contain:
+
+```
+  Kernel Window: 0xffffffff80000000 - 0xffffffff80400000 (4096 KB) [R-XK]
+  Physmap: 0xffff800000000000 - 0xffff80001ffe0000 (524160 KB) [RW-K]
+  Kernel Heap: 0xffff900000000000 - 0xffff900000400000 (4096 KB) [RW-K]
+```
+
+`KERNEL_CODE_START` finally being right is not a coincidence — the migration
+moved the kernel to the address that constant had been claiming all along.
+
 ## What is deliberately still missing
 - **The filesystem is read-only.** Allocating clusters and keeping both FAT
   copies consistent is a separate problem, and a read-only filesystem that is
@@ -872,11 +1054,12 @@ returns all agree.
 - **No `fork`/`exec`.** `spawn` loads a *second* program rather than duplicating
   the caller, so there is still no way for a program to replace its own image or
   to inherit one. `userspace/init` cannot do its job until `fork` exists.
-- **One address space.** Loaded programs share the kernel's page tables; they
-  are protected by page permissions, not by separation. That is why every
-  userspace program is linked at a distinct fixed address
-  (`userspace/*/user.ld`) and why `spawn` has to refuse an image that overlaps
-  one already resident.
+- **One address space, still.** The kernel is out of PML4[0], which is the
+  precondition for per-process address spaces — but nothing yet gives a process
+  its own PML4. Loaded programs share one set of tables and are protected by
+  page permissions, not separation, which is why every userspace program is
+  linked at a distinct fixed address (`userspace/*/user.ld`) and why `spawn`
+  refuses an image overlapping one already resident.
 - **No pipes or background jobs.** `ksh` parses them; running them needs two
   programs connected by a shared descriptor, which needs per-process descriptor
   tables. The table is currently global — see the note in `sys_exit`.

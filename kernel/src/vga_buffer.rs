@@ -3,11 +3,23 @@ use core::fmt;
 use spin::Mutex;
 use lazy_static::lazy_static;
 
+/// Physical address of the VGA text buffer.
+const VGA_PHYS: u64 = 0xb8000;
+
 lazy_static! {
     pub static ref WRITER: Mutex<Writer> = Mutex::new(Writer {
         column_position: 0,
         color_code: ColorCode::new(Color::Yellow, Color::Black),
-        buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
+        // Reached through the kernel window rather than by physical address.
+        //
+        // This is materialised by the first `println!`, which happens long
+        // before `paging::init` — so the physmap is not an option here, and the
+        // low identity map that used to make `0xb8000` work directly is gone.
+        // The trampoline maps `KERNEL_VMA + phys` for the low 1 GiB from the
+        // very first instruction of long mode, and `paging::init` keeps it.
+        buffer: unsafe {
+            &mut *(crate::memory::paging::kernel_virt(VGA_PHYS) as *mut Buffer)
+        },
     });
 }
 
