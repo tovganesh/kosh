@@ -276,27 +276,64 @@ pub extern "C" fn _start(multiboot_info_addr: usize) -> ! {
     idle_loop()
 }
 
-/// Hand over to the console.
+/// Hand over to userspace, then become the idle task.
 ///
-/// The console runs on its own kernel thread rather than here, so that the
-/// scheduler stays live while it blocks on the keyboard: timer ticks keep
-/// arriving, other threads keep running, and a wedged console does not wedge
-/// the machine. This thread becomes the idle task.
+/// The supervisor runs on its own kernel thread rather than here, so the
+/// scheduler stays live while it blocks: timer ticks keep arriving, other
+/// threads keep running, and a wedged shell does not wedge the machine.
 #[cfg(target_arch = "x86_64")]
 fn idle_loop() -> ! {
-    match task::spawn("console", console::run, 0) {
-        Ok(_) => serial_println!("Kosh: console started on its own thread"),
+    match task::spawn("supervisor", supervisor, 0) {
+        Ok(_) => serial_println!("Kosh: supervisor started on its own thread"),
         Err(e) => {
-            serial_println!("Kosh: could not start the console: {}", e);
+            serial_println!("Kosh: could not start the supervisor: {}", e);
             serial_println!("Kosh: falling back to the idle loop");
         }
     }
 
     loop {
-        // Nothing to do but wait for an interrupt. The scheduler will preempt
-        // us into the console as soon as there is a key to handle.
+        // Nothing to do but wait for an interrupt. The scheduler preempts us
+        // into whatever is runnable as soon as there is work.
         x86_64::instructions::hlt();
     }
+}
+
+/// Run the userspace shell, and fall back to the in-kernel console.
+///
+/// Only ever one of them at a time. Both read the same keyboard ring, so
+/// starting them together would mean two line editors racing for every
+/// keystroke. `ksh` gets the console; when it exits, the kernel's own console
+/// takes over, which is also how you get a debug prompt on a system whose
+/// userspace has died.
+#[cfg(target_arch = "x86_64")]
+fn supervisor(_arg: usize) {
+    // The boot heartbeat has done its job. It used to be turned off by the
+    // kernel console, which no longer starts first — so a line was landing in
+    // the middle of whatever was being typed at the ksh prompt.
+    interrupts::timer::set_heartbeat(false);
+
+    if usermode::boot_module_named("ksh").is_some() {
+        serial_println!("Kosh: starting the userspace shell");
+
+        match task::spawn("ksh", usermode::run_shell, 0) {
+            Ok(_) => {
+                // Wait for it. `live_threads` counts everything except thread 0,
+                // and by this point the supervisor and ksh are the only two.
+                while task::live_threads() > 1 {
+                    x86_64::instructions::hlt();
+                }
+                serial_println!();
+                serial_println!("Kosh: ksh exited, falling back to the kernel console");
+                task::reap_finished();
+            }
+            Err(e) => serial_println!("Kosh: could not start ksh: {}", e),
+        }
+    } else {
+        serial_println!("Kosh: no ksh module, using the kernel console");
+    }
+
+    // Never returns.
+    console::run(0)
 }
 
 #[cfg(target_arch = "aarch64")]

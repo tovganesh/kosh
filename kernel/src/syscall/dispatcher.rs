@@ -71,12 +71,12 @@ pub fn dispatch_syscall(
         SYS_SBRK => sys_sbrk(process_id, args),
         
         // File system
-        SYS_OPEN => sys_open(process_id, args),
-        SYS_CLOSE => sys_close(process_id, args),
-        SYS_READ => sys_read(process_id, args),
+        SYS_OPEN => crate::syscall::files::sys_open(args),
+        SYS_CLOSE => crate::syscall::files::sys_close(args),
+        SYS_READ => crate::syscall::files::sys_read(args),
         SYS_WRITE => sys_write(process_id, args),
-        SYS_LSEEK => sys_lseek(process_id, args),
-        SYS_STAT => sys_stat(process_id, args),
+        SYS_LSEEK => crate::syscall::files::sys_lseek(args),
+        SYS_STAT => crate::syscall::files::sys_stat(args),
         SYS_FSTAT => sys_fstat(process_id, args),
         SYS_MKDIR => sys_mkdir(process_id, args),
         SYS_RMDIR => sys_rmdir(process_id, args),
@@ -96,6 +96,7 @@ pub fn dispatch_syscall(
         SYS_DRIVER_RESPONSE => sys_driver_response(process_id, args),
         
         // System information
+        SYS_GETDENTS => crate::syscall::files::sys_getdents(args),
         SYS_UNAME => sys_uname(process_id, args),
         SYS_SYSINFO => sys_sysinfo(process_id, args),
         SYS_TIME => sys_time(process_id, args),
@@ -108,9 +109,7 @@ pub fn dispatch_syscall(
         SYS_LIST_CAPABILITIES => sys_list_capabilities(process_id, args),
         
         // Debug (only in debug builds)
-        #[cfg(debug_assertions)]
         SYS_DEBUG_PRINT => sys_debug_print(process_id, args),
-        #[cfg(debug_assertions)]
         SYS_DEBUG_DUMP => sys_debug_dump(process_id, args),
         
         _ => {
@@ -157,6 +156,9 @@ fn sys_exit(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
         process_id.0,
         exit_code
     );
+
+    // Nothing else will do it: there is no process teardown path yet.
+    crate::syscall::files::close_all();
 
     // Actually terminate. The ring-3 program runs on a kernel thread, so
     // retiring that thread is the exit: `exit_current` marks it finished and
@@ -329,80 +331,8 @@ fn sys_sbrk(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
 }
 
 // File system system calls
-fn sys_open(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
-    let path_ptr = args[0];
-    let flags = args[1];
-    let _mode = args[2];
-    
-    serial_println!("Process {} requesting open: path=0x{:x}, flags={}, mode={}", 
-                   process_id.0, path_ptr, flags, _mode);
-    
-    // For now, implement a basic file descriptor allocation
-    // In a real implementation, we would:
-    // 1. Read path string from user space
-    // 2. Resolve path through VFS
-    // 3. Check permissions
-    // 4. Allocate file descriptor
-    
-    // Convert flags to OpenFlags
-    let open_flags = match flags {
-        0 => kosh_types::OpenFlags::READ_ONLY,
-        1 => kosh_types::OpenFlags::WRITE_ONLY,
-        2 => kosh_types::OpenFlags::READ_WRITE,
-        _ => return Err(SyscallError::InvalidArgument),
-    };
-    
-    // For demonstration, return a dummy file descriptor
-    // In a real implementation, this would interact with the VFS
-    let fd = 3; // Start from 3 (0=stdin, 1=stdout, 2=stderr)
-    
-    serial_println!("Process {} opened file: fd={}", process_id.0, fd);
-    Ok(fd)
-}
 
-fn sys_close(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
-    let fd = args[0];
-    
-    serial_println!("Process {} requesting close: fd={}", process_id.0, fd);
-    
-    // TODO: Implement file closing
-    Err(SyscallError::NotSupported)
-}
 
-fn sys_read(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
-    let fd = args[0];
-    let _buf_ptr = args[1];
-    let count = args[2];
-    
-    serial_println!("Process {} requesting read: fd={}, buf=0x{:x}, count={}", 
-                   process_id.0, fd, _buf_ptr, count);
-    
-    // Basic implementation for standard file descriptors
-    match fd {
-        0 => {
-            // stdin - for now, return 0 (EOF)
-            serial_println!("Process {} reading from stdin", process_id.0);
-            Ok(0)
-        }
-        _ => {
-            // For other file descriptors, simulate reading some data
-            // In a real implementation, this would:
-            // 1. Validate the file descriptor
-            // 2. Check permissions
-            // 3. Read from the actual file through VFS
-            // 4. Copy data to user space buffer
-            
-            if count == 0 {
-                return Ok(0);
-            }
-            
-            // Simulate reading some data
-            let bytes_read = core::cmp::min(count, 1024);
-            serial_println!("Process {} read {} bytes from fd {}", process_id.0, bytes_read, fd);
-            Ok(bytes_read)
-        }
-    }
-}
 
 fn sys_write(_process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
     use crate::syscall::uaccess::copy_from_user;
@@ -443,28 +373,7 @@ fn sys_write(_process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
     Ok(count as u64)
 }
 
-fn sys_lseek(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
-    let fd = args[0];
-    let offset = args[1] as i64;
-    let whence = args[2];
-    
-    serial_println!("Process {} requesting lseek: fd={}, offset={}, whence={}", 
-                   process_id.0, fd, offset, whence);
-    
-    // TODO: Implement file seeking
-    Err(SyscallError::NotSupported)
-}
 
-fn sys_stat(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
-    let path_ptr = args[0];
-    let stat_buf_ptr = args[1];
-    
-    serial_println!("Process {} requesting stat: path=0x{:x}, buf=0x{:x}", 
-                   process_id.0, path_ptr, stat_buf_ptr);
-    
-    // TODO: Implement file stat
-    Err(SyscallError::NotSupported)
-}
 
 fn sys_fstat(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
     let fd = args[0];
@@ -728,7 +637,6 @@ fn sys_list_capabilities(process_id: ProcessId, args: [u64; 6]) -> SyscallResult
 }
 
 // Debug system calls (only in debug builds)
-#[cfg(debug_assertions)]
 fn sys_debug_print(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
     let message_ptr = args[0];
     let message_len = args[1];
@@ -742,7 +650,6 @@ fn sys_debug_print(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
     Ok(0)
 }
 
-#[cfg(debug_assertions)]
 fn sys_debug_dump(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
     let dump_type = args[0];
     

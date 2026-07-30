@@ -48,6 +48,11 @@ pub const SYS_SYSINFO: u64 = 51;
 pub const SYS_TIME: u64 = 52;
 pub const SYS_CLOCK_GETTIME: u64 = 53;
 
+/// Directory listing. Fixed-size records, so userspace can walk the buffer
+/// without a parser. Not in the 20..29 file-system block because that range was
+/// already allocated when this was added.
+pub const SYS_GETDENTS: u64 = 70;
+
 /// Security and capability system calls
 pub const SYS_GRANT_CAPABILITY: u64 = 60;
 pub const SYS_REVOKE_CAPABILITY: u64 = 61;
@@ -60,14 +65,17 @@ pub const SYS_LIST_CAPABILITIES: u64 = 63;
 // release kernels is exactly the kind of silent difference that hides bugs
 // until the release build is the one that matters.
 pub const SYS_DEBUG_PRINT: u64 = 100;
-#[cfg(debug_assertions)]
 pub const SYS_DEBUG_DUMP: u64 = 101;
 
-/// Maximum system call number (for validation)
-#[cfg(debug_assertions)]
+/// Maximum system call number (for validation).
+///
+/// Deliberately one value, not one per build profile. It used to be 101 in debug
+/// and 63 in release, which meant every syscall above 63 — including
+/// SYS_DEBUG_PRINT, which userspace calls unconditionally, and SYS_GETDENTS —
+/// was rejected as invalid in exactly the build that ships. A syscall surface
+/// that differs between debug and release is a bug that only appears in
+/// release.
 pub const MAX_SYSCALL_NUMBER: u64 = 101;
-#[cfg(not(debug_assertions))]
-pub const MAX_SYSCALL_NUMBER: u64 = 63;
 
 /// Check if a system call number is valid
 pub fn is_valid_syscall_number(syscall_number: u64) -> bool {
@@ -113,6 +121,7 @@ pub fn syscall_name(syscall_number: u64) -> &'static str {
         SYS_DRIVER_REQUEST => "driver_request",
         SYS_DRIVER_RESPONSE => "driver_response",
         
+        SYS_GETDENTS => "getdents",
         SYS_UNAME => "uname",
         SYS_SYSINFO => "sysinfo",
         SYS_TIME => "time",
@@ -123,9 +132,8 @@ pub fn syscall_name(syscall_number: u64) -> &'static str {
         SYS_CHECK_CAPABILITY => "check_capability",
         SYS_LIST_CAPABILITIES => "list_capabilities",
         
-        #[cfg(debug_assertions)]
         SYS_DEBUG_PRINT => "debug_print",
-        #[cfg(debug_assertions)]
+        
         SYS_DEBUG_DUMP => "debug_dump",
         
         _ => "unknown",

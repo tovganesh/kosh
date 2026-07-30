@@ -83,6 +83,12 @@ pub fn lookup(path: &str) -> Result<DirEntry, FsError> {
     with_fs(|fs| fs.lookup(path))
 }
 
+/// Read from an already-resolved entry at an offset. This is what file
+/// descriptors use, so a sequential read does not re-read the whole prefix.
+pub fn read_at(entry: &DirEntry, offset: u32, buf: &mut [u8]) -> Result<usize, FsError> {
+    with_fs(|fs| fs.read_at(entry, offset, buf))
+}
+
 /// Read a file by absolute path, up to `limit` bytes.
 pub fn read_file(path: &str, limit: usize) -> Result<Vec<u8>, FsError> {
     with_fs(|fs| {
