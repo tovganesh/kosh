@@ -178,6 +178,12 @@ All other services (filesystem, networking, drivers) run in userspace for better
 
 The system implements capability-based security where processes must have explicit capabilities to access resources, providing fine-grained access control.
 
+### Screenshots
+
+<img width="1456" height="812" alt="image" src="https://github.com/user-attachments/assets/5ed82d95-751e-447d-9177-4d340a2eed97" />
+(The first boot)
+
+
 ### Rust Language Choice
 
 Rust was chosen for its memory safety guarantees, zero-cost abstractions, and excellent support for systems programming without sacrificing performance.
