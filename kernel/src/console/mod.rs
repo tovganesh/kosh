@@ -23,11 +23,11 @@
 pub mod commands;
 pub mod editor;
 
+use alloc::string::String;
+
 use editor::LineEditor;
 
-use crate::{println, serial_println};
-
-const PROMPT: &str = "kosh> ";
+use crate::{print, println, serial_print, serial_println};
 
 /// Run the console. Never returns.
 ///
@@ -35,6 +35,7 @@ const PROMPT: &str = "kosh> ";
 /// is runnable keeps running while this blocks on the keyboard.
 pub fn run(_arg: usize) {
     let mut editor = LineEditor::new();
+    let mut cwd = String::from("/");
 
     // The boot heartbeat has done its job. Leaving it on means a line lands in
     // the middle of whatever is being typed, once a second, forever.
@@ -43,7 +44,9 @@ pub fn run(_arg: usize) {
     banner();
 
     loop {
-        let line = editor.read_line(PROMPT);
+        // The prompt carries the working directory, so `pwd` is rarely needed.
+        let prompt = build_prompt(&cwd);
+        let line = editor.read_line(&prompt);
 
         // `read_line` borrows the editor for the lifetime of the returned
         // string, but `history` needs to read the editor too. Copy the line out
@@ -53,8 +56,17 @@ pub fn run(_arg: usize) {
         owned[..n].copy_from_slice(&line.as_bytes()[..n]);
         let line = core::str::from_utf8(&owned[..n]).unwrap_or("");
 
-        commands::execute(line, &editor);
+        commands::execute(line, &mut cwd, &editor);
     }
+}
+
+/// `kosh:/docs> ` — short enough to keep the line usable, informative enough to
+/// know where `ls` will look.
+fn build_prompt(cwd: &str) -> String {
+    let mut p = String::from("kosh:");
+    p.push_str(cwd);
+    p.push_str("> ");
+    p
 }
 
 fn banner() {

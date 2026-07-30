@@ -29,11 +29,11 @@ jobs:
           rustc --version --verbose
           cargo --version
 
-      - name: Install GRUB and QEMU
+      - name: Install GRUB, QEMU and filesystem tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            qemu-system-x86 grub-pc-bin grub-common xorriso mtools
+            qemu-system-x86 grub-pc-bin grub-common xorriso mtools dosfstools
 
       - name: Cache cargo
         uses: actions/cache@v4

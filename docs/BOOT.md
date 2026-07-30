@@ -501,8 +501,92 @@ Boots, types at the `kosh>` prompt through QEMU's monitor, and asserts what the
 console answers. Both checks run in CI. A console only a human can test is a
 console that rots quietly.
 
+## Storage and a filesystem (Phase 8)
+
+```
+kosh:/> df
+FAT32 'KOSHDISK', 64 MB, 512 B/cluster, 2 FAT(s) of 1009 sectors, root at cluster 2
+kosh:/> ls
+drw         -  DOCS
+-rw       199  README.TXT
+-rw     22000  BIG.TXT
+-rw        26  A Long File Name.txt
+
+6 entries, 22280 bytes
+kosh:/> cat lines.txt
+line one
+line two
+line three
+kosh:/> cd docs
+kosh:/docs> ls
+-rw        26  NOTES.TXT
+```
+
+| File | Role |
+|---|---|
+| `block/ata.rs` | Polled PIO driver for the legacy IDE ports |
+| `block/mod.rs` | `BlockDevice` trait and the registered device |
+| `fs/fat32.rs` | FAT32, read-only: mount, chain walk, directories, long names, file reads |
+| `fs/mod.rs` | The mounted volume, and a self-test against the known test image |
+
+### Why PIO, and why FAT32
+
+**Polled PIO on the legacy ports** rather than DMA over PCI. It is the smallest
+thing that really reads a disk: no PCI enumeration, no interrupt plumbing, no
+bus-master buffers. It is also slow — one 16-bit port read per two bytes with the
+CPU spinning on a status register — which is fine for reading a filesystem and
+wrong for anything performance-sensitive. DMA and virtio-blk are for later.
+
+**FAT32 rather than ext4.** `userspace/fs-service/src/ext4.rs` already claims to
+implement ext4, and is instructive about why: `read_block` fills the buffer with
+zeroes, `write_block` returns success without writing, the superblock is
+fabricated in code, `mtime` is the literal `1234567890`, and `read_dir` returns
+only `.` and `..`. It was never connected to a disk, because there was no disk
+driver. FAT32 is a few hundred lines to read correctly, and the image can be
+mounted on the development host — so every answer the kernel gives is checkable
+against what is actually on the disk. ext4 is a lot of surface area to get wrong
+silently.
+
+### Things that cost time
+
+- **The test disk is bootable, and that broke everything.** `mkfs.vfat` writes a
+  `0xAA55` signature at offset 510, so SeaBIOS considered the FAT image bootable,
+  tried it before the CD, and hung — producing *no serial output at all*, which
+  looks exactly like a kernel that failed to start. `-boot order=d` fixes it.
+- **Validate the BPB before doing arithmetic with it.** A corrupt or hostile
+  boot sector otherwise turns directly into out-of-range reads. `mount` checks
+  sector size, cluster size, FAT count and region sizes, and rejects a root
+  cluster past the end of the volume.
+- **FAT32 is identified by `root_entry_count == 0` and `sectors_per_fat_16 == 0`**,
+  not by the filesystem-type string, which is informational and routinely wrong.
+- **Mask the top four bits of a FAT entry.** They are reserved. A free (`0`) or
+  out-of-range entry found *inside* a chain means the FAT is damaged, and saying
+  so beats reading whatever sector that implies.
+- **A zero-length file has no cluster allocated**, so the chain walk must not be
+  attempted on it.
+- **Long filenames were passing without being tested.** Every name on the first
+  test image (`DOCS`, `README.TXT`) is a valid 8.3 short name, so the ~80 lines
+  of long-filename assembly never ran. The image now contains
+  `A Long File Name.txt`, and the self-test asserts both that it lists and that
+  it opens by that name.
+
+### The self-test
+
+`fs::selftest` runs at boot and asserts against facts `scripts/run.sh`
+guarantees when it builds the image: a file whose exact contents it controls, a
+22 KB file that forces a cluster-chain walk, a subdirectory, a long filename, and
+a path that must report `NotFound`. A filesystem that returned an empty root
+without complaining would otherwise look like a pass.
+
 ## What is deliberately still missing
-- **No filesystem, and no storage driver.** Which is why there is no `ls`.
+- **The filesystem is read-only.** Allocating clusters and keeping both FAT
+  copies consistent is a separate problem, and a read-only filesystem that is
+  correct beats a read-write one that is not.
+- **No partition table support.** The BPB is read from LBA 0, so the image is a
+  bare filesystem rather than a partitioned disk.
+- **The VFS is still unwired.** `userspace/fs-service/src/vfs.rs` has a mount
+  table; it has never had a real filesystem underneath it, and connecting the
+  two is separate work from making FAT32 correct.
 - **No `fork`/`exec`.** `userspace/init` cannot do its job until those exist, so
   the ELF payload is `userspace/hello` rather than init.
 - **One address space.** Loaded programs share the kernel's page tables; they

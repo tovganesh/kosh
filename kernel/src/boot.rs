@@ -53,6 +53,11 @@ pub fn init_kernel(boot_info: BootInformation) {
     // Initialize virtual memory management bookkeeping
     init_virtual_memory();
     
+    // Storage. Needs the heap (the device is boxed), nothing else.
+    crate::block::init();
+    init_storage_selftest();
+    crate::fs::init();
+    
     // DISABLED (Phase 1): init_swap_management() allocates an 8 MiB Vec as a
     // "swap file" out of a 1 MiB kernel heap whose MAX_ALLOC_SIZE is 1 MiB.
     // It cannot succeed. Re-enable once there is a real block device.
@@ -683,6 +688,44 @@ fn test_virtual_memory() {
     }
     
     serial_println!("Virtual memory management test complete");
+}
+
+/// Read the first sector and check it looks like something.
+///
+/// The point is to prove the ATA driver moves real bytes before any filesystem
+/// code is written on top of it. A boot sector is a convenient oracle: it has a
+/// fixed signature at a fixed offset, so a driver that is silently returning
+/// zeroes or reading the wrong sector cannot pass.
+#[cfg(target_arch = "x86_64")]
+fn init_storage_selftest() {
+    use crate::block::BLOCK_SIZE;
+
+    if !crate::block::is_present() {
+        serial_println!("Storage: no device, skipping self-test");
+        return;
+    }
+
+    let mut sector = [0u8; BLOCK_SIZE];
+    match crate::block::read_block(0, &mut sector) {
+        Ok(()) => {
+            let signature = u16::from_le_bytes([sector[510], sector[511]]);
+            let oem = core::str::from_utf8(&sector[3..11]).unwrap_or("????????");
+
+            serial_println!("Storage self-test:");
+            serial_println!("  LBA 0 signature : 0x{:04x}", signature);
+            serial_println!("  OEM name        : '{}'", oem.trim());
+
+            if signature == 0xAA55 {
+                serial_println!("Storage: PASS — read a valid boot sector from LBA 0");
+            } else {
+                serial_println!(
+                    "Storage: FAIL — LBA 0 signature is 0x{:04x}, expected 0xaa55",
+                    signature
+                );
+            }
+        }
+        Err(e) => serial_println!("Storage: FAIL — read error {:?}", e),
+    }
 }
 
 /// Drop into ring 3 and run the user payload.
