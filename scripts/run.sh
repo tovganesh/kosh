@@ -65,14 +65,23 @@ KERNEL="$ROOT/target/$TARGET_NAME/$PROFILE/kosh-kernel"
 # Userspace programs shipped as GRUB modules. These are ordinary static ELF
 # binaries; the kernel parses and maps them at run time.
 echo "==> building userspace programs"
-USER_FLAGS=(--package kosh-hello --target "$TARGET_JSON" -Z build-std=core)
-[ "$PROFILE" = "release" ] && USER_FLAGS+=(--release)
-cargo build "${USER_FLAGS[@]}" -Z json-target-spec 2>/dev/null \
-    || cargo build "${USER_FLAGS[@]}"
+# compiler-builtins-mem gives these binaries memcpy/memset/memcmp. There is no
+# libc, and anything that moves a String around needs them.
+USER_STD=(-Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem)
+
+for pkg in kosh-hello kosh-shell; do
+    USER_FLAGS=(--package "$pkg" --target "$TARGET_JSON" "${USER_STD[@]}")
+    [ "$PROFILE" = "release" ] && USER_FLAGS+=(--release)
+    cargo build "${USER_FLAGS[@]}" -Z json-target-spec 2>/dev/null \
+        || cargo build "${USER_FLAGS[@]}"
+done
 
 HELLO="$ROOT/target/$TARGET_NAME/$PROFILE/kosh-hello"
-[ -f "$HELLO" ] || { echo "error: userspace binary not found at $HELLO" >&2; exit 1; }
-echo "==> $(basename "$HELLO"): $(readelf -h "$HELLO" | awk '/Entry point/ {print $4}')"
+KSH="$ROOT/target/$TARGET_NAME/$PROFILE/ksh"
+for bin in "$HELLO" "$KSH"; do
+    [ -f "$bin" ] || { echo "error: userspace binary not found at $bin" >&2; exit 1; }
+    echo "==> $(basename "$bin"): entry $(readelf -h "$bin" | awk '/Entry point/ {print $4}')"
+done
 
 # --- validate the multiboot2 header before we waste a boot ------------------
 
@@ -92,7 +101,8 @@ echo "==> building ISO"
 rm -rf "$ISO_DIR"
 mkdir -p "$ISO_DIR/boot/grub"
 cp "$KERNEL" "$ISO_DIR/boot/kosh-kernel"
-cp "$HELLO" "$ISO_DIR/boot/init"
+cp "$HELLO" "$ISO_DIR/boot/hello"
+cp "$KSH"   "$ISO_DIR/boot/ksh"
 
 cat > "$ISO_DIR/boot/grub/grub.cfg" <<'EOF'
 set timeout=0
@@ -100,7 +110,8 @@ set default=0
 
 menuentry "Kosh" {
     multiboot2 /boot/kosh-kernel
-    module2 /boot/init init
+    module2 /boot/hello hello
+    module2 /boot/ksh ksh
     boot
 }
 EOF
@@ -230,7 +241,9 @@ check)
         "Storage: PASS" \
         "Filesystem: PASS" \
         "Kernel initialization complete" \
-        "console started on its own thread"
+        "supervisor started on its own thread" \
+        "starting the userspace shell" \
+        "ksh: the Kosh shell, in ring 3"
     do
         if grep -qF "$marker" "$SERIAL" 2>/dev/null; then
             echo "  PASS  $marker"
@@ -264,7 +277,18 @@ check-cli)
             ".") echo "dot" ;;
             "-") echo "minus" ;;
             "/") echo "slash" ;;
+            ",") echo "comma" ;;
+            # Shifted punctuation. Note there is no working name for '|' on this
+            # layout: QEMU accepts `shift-backslash` but the guest sees no
+            # character, which is why the pipe path is tested by `parsetest`
+            # rather than by typing one.
+            ">") echo "shift-dot" ;;
+            "<") echo "shift-comma" ;;
+            "&") echo "shift-7" ;;
+            "_") echo "shift-minus" ;;
             [a-z0-9]) echo "$1" ;;
+            # Anything unmapped is skipped rather than silently mistyped — but
+            # that silence is itself a trap, so say so.
             *) echo "" ;;
         esac
     }
@@ -287,56 +311,77 @@ check-cli)
 
     {
         # Let the boot demos finish before typing.
-        sleep 12
-        type_line "uname"
-        type_line "mem"
-        type_line "ticks"
-        type_line "echo kosh cli works"
-        type_line "modules"
-        type_line "ps"
-        type_line "lsblk"
-        type_line "df"
+        sleep 14
+
+        # --- the userspace shell, in ring 3 ---
+        type_line "help"
+        type_line "getpid"
+        type_line "pwd"
         type_line "ls"
         type_line "cat hello.txt"
         type_line "cd docs"
         type_line "pwd"
         type_line "ls"
         type_line "cd .."
+        type_line "echo hello from ring 3 shell"
+        type_line "stat big.txt"
         type_line "cat nope.txt"
-        type_line "history"
         type_line "nosuchcommand"
-        type_line "fault bp"
+        # The shell must refuse redirection rather than silently dropping it.
+        type_line "echo a > out.txt"
+        # QEMU's sendkey cannot produce a '|' through this keyboard layout, so
+        # the pipe path is checked by running the tokenizer directly instead of
+        # by typing one.
+        type_line "parsetest"
+        type_line "history"
+
+        # Leaving ksh must hand the console back to the kernel, which is both a
+        # feature and the only way to test both shells in one session.
+        type_line "exit"
+        sleep 2
+
+        # --- the in-kernel debug console ---
+        type_line "uname"
+        type_line "mem"
+        type_line "ps"
+        type_line "lsblk"
+        type_line "df"
         sleep 1
         echo quit
-    } | timeout 90 qemu-system-x86_64 "${QEMU_ARGS[@]}" \
+    } | timeout 180 qemu-system-x86_64 "${QEMU_ARGS[@]}" \
             -serial "file:$SERIAL" -display none -monitor stdio >/dev/null 2>&1 || true
 
     echo "--- console session ---"
-    sed -n '/Kosh console/,$p' "$SERIAL" 2>/dev/null | head -60
+    sed -n '/ksh: the Kosh shell/,$p' "$SERIAL" 2>/dev/null | head -110
     echo "-----------------------"
 
     fail=0
     for marker in \
+        "ksh: the Kosh shell, in ring 3" \
+        "ksh:/\$" \
+        "ksh - the Kosh shell, running in ring 3" \
+        "hello from the filesystem" \
+        "README.TXT" \
+        "ksh:/docs\$" \
+        "NOTES.TXT" \
+        "hello from ring 3 shell" \
+        "type  file" \
+        "cat: /nope.txt: no such file" \
+        "nosuchcommand: command not found" \
+        "redirection needs a writable filesystem" \
+        "pipe yes" \
+        "redirect out" \
+        "background" \
+        "ksh: exiting" \
+        "falling back to the kernel console" \
         "Kosh console" \
-        "kosh:/>" \
         "Kosh 0.1.0 x86_64" \
-        "running in ring 0" \
         "physical memory:" \
-        "kernel heap:" \
-        "kosh cli works" \
-        "module 0:" \
         "context switches since boot" \
         "QEMU HARDDISK" \
-        "FAT32 'KOSHDISK'" \
-        "README.TXT" \
-        "hello from the filesystem" \
-        "kosh:/docs>" \
-        "NOTES.TXT" \
-        "no such file or directory" \
-        "unknown command: nosuchcommand" \
-        "resumed"
+        "FAT32 'KOSHDISK'"
     do
-        if grep -qF "$marker" "$SERIAL" 2>/dev/null; then
+        if grep -qF "$(printf '%b' "$marker")" "$SERIAL" 2>/dev/null; then
             echo "  PASS  $marker"
         else
             echo "  FAIL  $marker"

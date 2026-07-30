@@ -362,6 +362,64 @@ impl Fat32 {
         Ok(current)
     }
 
+    /// Read into `buf` starting `offset` bytes into the file.
+    ///
+    /// Sequential reads need this. Re-reading from byte 0 and discarding the
+    /// prefix — which is what `read_file` would have to do — turns reading a
+    /// file in N chunks into O(N^2) disk traffic, and every one of those sectors
+    /// is a polled PIO transfer.
+    pub fn read_at(
+        &self,
+        entry: &DirEntry,
+        offset: u32,
+        buf: &mut [u8],
+    ) -> Result<usize, FsError> {
+        if entry.is_dir {
+            return Err(FsError::IsADirectory);
+        }
+        if offset >= entry.size || buf.is_empty() || entry.first_cluster == 0 {
+            return Ok(0);
+        }
+
+        let want = core::cmp::min(buf.len(), (entry.size - offset) as usize);
+        let cluster_size = self.cluster_size();
+
+        // Walk to the cluster containing `offset` rather than reading the ones
+        // before it.
+        let skip = offset / cluster_size;
+        let mut within = (offset % cluster_size) as usize;
+
+        let mut cluster = entry.first_cluster;
+        for _ in 0..skip {
+            cluster = self.next_cluster(cluster)?.ok_or(FsError::CorruptChain)?;
+        }
+
+        let mut scratch = vec![0u8; cluster_size as usize];
+        let mut done = 0usize;
+
+        while done < want {
+            self.read_cluster(cluster, &mut scratch)?;
+
+            let available = cluster_size as usize - within;
+            let take = core::cmp::min(available, want - done);
+            buf[done..done + take].copy_from_slice(&scratch[within..within + take]);
+
+            done += take;
+            within = 0;
+
+            if done < want {
+                match self.next_cluster(cluster)? {
+                    Some(next) => cluster = next,
+                    // The chain ended before the size said it should. The
+                    // directory entry and the FAT disagree; report it.
+                    None => return Err(FsError::CorruptChain),
+                }
+            }
+        }
+
+        Ok(done)
+    }
+
     /// Read up to `limit` bytes of a file.
     pub fn read_file(&self, entry: &DirEntry, limit: usize) -> Result<Vec<u8>, FsError> {
         if entry.is_dir {

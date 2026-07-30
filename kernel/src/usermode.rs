@@ -34,11 +34,20 @@ use crate::serial_println;
 pub struct BootModule {
     pub start: u64,
     pub end: u64,
+    /// The module's GRUB command line, which is how `module2 /boot/ksh ksh`
+    /// names it. Stored as a fixed array because this lives in a static and
+    /// nothing here should allocate before the heap exists.
+    name: [u8; 32],
 }
 
 impl BootModule {
     pub fn len(&self) -> usize {
         (self.end - self.start) as usize
+    }
+
+    pub fn name(&self) -> &str {
+        let end = self.name.iter().position(|&b| b == 0).unwrap_or(self.name.len());
+        core::str::from_utf8(&self.name[..end]).unwrap_or("")
     }
 
     /// The module's bytes, viewed through the physmap.
@@ -66,10 +75,16 @@ pub fn record_boot_modules(boot_info: &multiboot2::BootInformation) {
             break;
         }
 
-        let name = module.cmdline().unwrap_or("<no cmdline>");
+        let name = module.cmdline().unwrap_or("");
+        let mut name_buf = [0u8; 32];
+        let bytes = name.as_bytes();
+        let take = core::cmp::min(bytes.len(), name_buf.len() - 1);
+        name_buf[..take].copy_from_slice(&bytes[..take]);
+
         slots[n] = Some(BootModule {
             start: module.start_address() as u64,
             end: module.end_address() as u64,
+            name: name_buf,
         });
 
         serial_println!(
@@ -91,6 +106,19 @@ pub fn record_boot_modules(boot_info: &multiboot2::BootInformation) {
 /// The nth boot module, if present.
 pub fn boot_module(index: usize) -> Option<BootModule> {
     BOOT_MODULES.lock().get(index).copied().flatten()
+}
+
+/// Find a module by the name given on its `module2` line.
+///
+/// By name rather than by index, so adding a module to grub.cfg cannot silently
+/// change which one something else loads.
+pub fn boot_module_named(name: &str) -> Option<BootModule> {
+    BOOT_MODULES
+        .lock()
+        .iter()
+        .flatten()
+        .find(|m| m.name() == name)
+        .copied()
 }
 
 /// Where the user blob is mapped. 1 GiB — clear of the kernel's low identity
@@ -197,13 +225,26 @@ pub fn run_user_demo(which: usize) {
 /// This is the real path: a program the kernel was not compiled with, parsed
 /// out of an ELF, mapped at the addresses it was linked for, and entered.
 pub fn run_boot_module(_arg: usize) {
-    let Some(module) = boot_module(0) else {
-        serial_println!("No boot module to load — skipping ELF loader demo.");
-        serial_println!("  (add `module2 /boot/init` to grub.cfg)");
+    run_module("hello", ELF_USER_STACK_TOP)
+}
+
+/// Load the userspace shell and hand it the console.
+pub fn run_shell(_arg: usize) {
+    run_module("ksh", SHELL_USER_STACK_TOP)
+}
+
+/// Stack for the shell. Distinct from the loader demo's so a fault dump makes it
+/// obvious which program was running.
+const SHELL_USER_STACK_TOP: u64 = 0x0000_0000_7000_0000;
+
+fn run_module(name: &str, stack_top: u64) {
+    let Some(module) = boot_module_named(name) else {
+        serial_println!("No boot module named '{}'", name);
+        serial_println!("  (add `module2 /boot/{} {}` to grub.cfg)", name, name);
         return;
     };
 
-    serial_println!("Loading boot module 0 as ELF:");
+    serial_println!("Loading boot module '{}' as ELF:", name);
     let image = unsafe { module.bytes() };
     crate::elf::describe(image);
 
@@ -223,14 +264,13 @@ pub fn run_boot_module(_arg: usize) {
     );
 
     // A fresh stack, well clear of the image's own segments.
-    let stack_top = ELF_USER_STACK_TOP;
-    let stack_bottom = stack_top - (USER_STACK_PAGES * PAGE_SIZE) as u64;
+    let stack_bottom = stack_top - (SHELL_STACK_PAGES * PAGE_SIZE) as u64;
     let stack_flags = PageTableFlags::PRESENT
         | PageTableFlags::WRITABLE
         | PageTableFlags::USER_ACCESSIBLE
         | PageTableFlags::NO_EXECUTE;
 
-    if let Err(e) = paging::map_user_pages(stack_bottom, USER_STACK_PAGES, stack_flags) {
+    if let Err(e) = paging::map_user_pages(stack_bottom, SHELL_STACK_PAGES, stack_flags) {
         serial_println!("  failed to map stack for loaded image: {}", e);
         return;
     }
@@ -249,6 +289,10 @@ pub fn run_boot_module(_arg: usize) {
 /// Stack for the ELF-loaded program. Separate from the built-in payload's, so
 /// the two demos cannot interfere.
 const ELF_USER_STACK_TOP: u64 = 0x0000_0000_6000_0000;
+
+/// Loaded programs get more stack than the hand-written payload: the shell has a
+/// recursive-descent parser and formats strings on the stack.
+const SHELL_STACK_PAGES: usize = 16;
 
 /// Drop to ring 3 at `entry` with `stack_top`.
 ///

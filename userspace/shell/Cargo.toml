@@ -3,6 +3,14 @@ name = "kosh-shell"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "kosh_shell"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ksh"
+path = "src/main.rs"
+
 [dependencies]
 kosh-types = { path = "../../shared/kosh-types" }
 kosh-ipc = { path = "../../shared/kosh-ipc" }

@@ -578,6 +578,117 @@ guarantees when it builds the image: a file whose exact contents it controls, a
 a path that must report `NotFound`. A filesystem that returned an empty root
 without complaining would otherwise look like a pass.
 
+## Userspace (Phase 9)
+
+```
+ksh: the Kosh shell, in ring 3. Type 'help'.
+ksh:/$ ls
+d           -  DOCS
+-         199  README.TXT
+-       22000  BIG.TXT
+-          26  A Long File Name.txt
+
+6 entries, 22280 bytes
+ksh:/$ cat lines.txt
+line one
+line two
+line three
+ksh:/$ getpid
+pid 1
+ksh:/$ cd docs
+ksh:/docs$
+```
+
+The shell is now a ring-3 process that reaches the kernel only through system
+calls. It is loaded from a GRUB module by the ELF loader, like any other program.
+
+### File descriptors
+
+`kernel/src/syscall/files.rs` implements `open`, `close`, `read`, `lseek`,
+`getdents` and `stat` against FAT32. What was there before: `sys_open` returned
+the literal `3` for every path ("for demonstration, return a dummy file
+descriptor"), `sys_read` returned `min(count, 1024)` without touching the buffer
+("simulate reading some data"), and `close` and `lseek` returned `NotSupported`.
+There was no descriptor table because there was nothing to put in one.
+
+`getdents` is path-based, not fd-based — opening a directory as a byte stream is
+a category error that `open` already refuses — and returns fixed-size records so
+userspace needs no parser.
+
+`fat32::read_at` was added for this. Re-reading from byte 0 and discarding the
+prefix, which is what `read_file` would have to do, turns reading a file in N
+chunks into O(N²) disk traffic, and every one of those sectors is a polled PIO
+transfer.
+
+### The trap: a blocking syscall with interrupts masked
+
+`SFMASK` clears the interrupt flag on syscall entry, so a syscall runs with
+interrupts **masked**. `read` on fd 0 blocks on the keyboard — and halting with
+interrupts masked means the keyboard IRQ that would wake it can never fire. The
+machine simply stops, with the shell's prompt on screen, looking exactly like a
+program waiting for input.
+
+`wait_for_key` therefore enables interrupts while it waits (via `enable_and_hlt`,
+which does the sti/hlt atomically) and masks them again before returning. That is
+safe only because exactly one thread is ever in ring 3 — the same reason the
+single static syscall stack works.
+
+### Which shell has the keyboard
+
+Both `ksh` and the in-kernel console read the same keyboard ring, so starting
+them together would mean two line editors racing for every keystroke. A
+supervisor thread runs `ksh`, waits for it, and then hands the console to the
+kernel's own. That is also how you get a debug prompt on a system whose userspace
+has died — and it means one scripted session can test both.
+
+### What was deleted
+
+`userspace/shell` kept `parser.rs` (952 lines: tokenizer, quotes, escapes,
+variable expansion, pipes, redirects, conditionals) and `history.rs` (769 lines).
+Both were real code that nothing had ever run — the old binary did not even
+declare them as modules.
+
+Removed: `service_client.rs` and `infrastructure.rs` (1,399 and ~450 lines, zero
+`asm!` between them, `wait_for_response` returned a fabricated success, service
+discovery was three hardcoded PIDs, and they were near-duplicates of each other);
+`fs_commands.rs` (every path fell through to `simulated_listing()`);
+`commands.rs` (canned strings); `input.rs` (`read_line` replayed a hardcoded
+array of six commands, `read_char` always returned `None`); `output.rs` (wrote
+through a `syscall` wrapped in `#[cfg(debug_assertions)]`, so release builds
+printed nothing); and `tests.rs` (558 host-side tests against the above).
+
+### Honest about what does not work
+
+The parser understands pipes, redirection, conditionals and background jobs.
+Executing any of them needs `fork` and `exec`. The shell reports that rather than
+accepting the syntax and ignoring it:
+
+```
+ksh:/$ echo a > out.txt
+ksh: redirection needs a writable filesystem, which does not exist yet
+```
+
+`parsetest` runs the tokenizer over sample inputs and prints what it found. It
+exists because most of that grammar is otherwise unreachable — and because it is
+the only practical way to test the pipe path: QEMU's `sendkey` cannot produce a
+`|` through this keyboard layout, so a scripted session can never type one.
+
+### Two more validator bugs this surfaced
+
+- **`validate_stat_args` checked the wrong argument.** It validated `args[1]` as
+  a 144-byte writable buffer, but `args[1]` is the path *length* — so it was
+  asking whether the address `9` was mapped. It never is: that is page 0, the
+  null guard. Every `stat` failed before its handler ran, while `open` and
+  `getdents` worked because their validators happened to match their ABIs.
+- **`MAX_SYSCALL_NUMBER` was 101 in debug and 63 in release.** Every syscall
+  above 63 — including `SYS_DEBUG_PRINT`, which userspace calls
+  unconditionally, and the new `SYS_GETDENTS` — was rejected as invalid in
+  exactly the build that ships. It is now one value.
+
+`validate_user_pointer` and `validate_user_string` also no longer consist of a
+null check and two TODOs; they delegate to `syscall::uaccess`, and take a
+`writable` flag so `read` and `write` are checked in the right direction.
+
 ## What is deliberately still missing
 - **The filesystem is read-only.** Allocating clusters and keeping both FAT
   copies consistent is a separate problem, and a read-only filesystem that is

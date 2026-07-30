@@ -37,8 +37,8 @@ pub fn run(_arg: usize) {
     let mut editor = LineEditor::new();
     let mut cwd = String::from("/");
 
-    // The boot heartbeat has done its job. Leaving it on means a line lands in
-    // the middle of whatever is being typed, once a second, forever.
+    // The supervisor already silenced the boot heartbeat; do it again in case
+    // the console was reached by some other path.
     crate::interrupts::timer::set_heartbeat(false);
 
     banner();

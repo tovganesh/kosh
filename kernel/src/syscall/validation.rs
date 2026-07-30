@@ -57,9 +57,9 @@ pub fn validate_syscall_args(
         SYS_CHECK_CAPABILITY => validate_check_capability_args(process_id, args),
         SYS_LIST_CAPABILITIES => validate_list_capabilities_args(args),
         
-        #[cfg(debug_assertions)]
+        SYS_GETDENTS => validate_getdents_args(process_id, args),
+
         SYS_DEBUG_PRINT => validate_debug_print_args(args),
-        #[cfg(debug_assertions)]
         SYS_DEBUG_DUMP => validate_debug_dump_args(args),
         
         _ => {
@@ -70,16 +70,25 @@ pub fn validate_syscall_args(
 }
 
 /// Validate that a pointer argument is valid for the given process
-fn validate_user_pointer(process_id: ProcessId, ptr: u64, size: usize) -> Result<(), SyscallError> {
+/// Check that a user pointer really is one.
+///
+/// This used to be a null check and two TODOs. The checks now exist, in
+/// `syscall::uaccess`, so this delegates to them: the span must lie in the lower
+/// canonical half and every page must be present and USER_ACCESSIBLE. The
+/// copy helpers verify the same thing when they run, but failing here means a
+/// bad pointer is rejected before any handler starts acting on the call.
+fn validate_user_pointer(
+    _process_id: ProcessId,
+    ptr: u64,
+    size: usize,
+    writable: bool,
+) -> Result<(), SyscallError> {
     if ptr == 0 {
         return Err(SyscallError::InvalidArgument);
     }
-    
-    // TODO: Check that the pointer is within the process's valid address space
-    // TODO: Check that the memory region is accessible (readable/writable as needed)
-    // For now, we'll just check for null pointers
-    
-    Ok(())
+
+    crate::syscall::uaccess::validate_user_range(ptr, size, writable)
+        .map_err(|_| SyscallError::InvalidArgument)
 }
 
 /// Validate that a string pointer is valid and null-terminated
@@ -87,9 +96,12 @@ fn validate_user_string(process_id: ProcessId, ptr: u64, max_len: usize) -> Resu
     if ptr == 0 {
         return Err(SyscallError::InvalidArgument);
     }
-    
-    // TODO: Validate that the string is null-terminated within max_len
-    // TODO: Check that the string is in valid user memory
+
+    // Only the first byte can be checked cheaply — the length is not known until
+    // the terminator is found, and walking user memory to find it is the copy
+    // helper's job. This at least rejects a pointer into the kernel half.
+    validate_user_pointer(process_id, ptr, 1, false)?;
+    let _ = max_len;
     
     Ok(())
 }
@@ -122,11 +134,11 @@ fn validate_exec_args(process_id: ProcessId, args: &[u64; 6]) -> Result<(), Sysc
     validate_user_string(process_id, path_ptr, 4096)?;
     
     if argv_ptr != 0 {
-        validate_user_pointer(process_id, argv_ptr, 8)?; // At least one pointer
+        validate_user_pointer(process_id, argv_ptr, 8, false)?; // At least one pointer
     }
     
     if envp_ptr != 0 {
-        validate_user_pointer(process_id, envp_ptr, 8)?; // At least one pointer
+        validate_user_pointer(process_id, envp_ptr, 8, false)?; // At least one pointer
     }
     
     Ok(())
@@ -232,6 +244,25 @@ fn validate_open_args(process_id: ProcessId, args: &[u64; 6]) -> Result<(), Sysc
     Ok(())
 }
 
+fn validate_getdents_args(process_id: ProcessId, args: &[u64; 6]) -> Result<(), SyscallError> {
+    let path_ptr = args[0];
+    let path_len = args[1];
+    let buf_ptr = args[2];
+    let buf_len = args[3];
+
+    if path_len == 0 || path_len > 4096 {
+        return Err(SyscallError::InvalidArgument);
+    }
+    validate_user_pointer(process_id, path_ptr, path_len as usize, false)?;
+
+    if buf_len == 0 {
+        return Err(SyscallError::InvalidArgument);
+    }
+    validate_user_pointer(process_id, buf_ptr, buf_len as usize, true)?;
+
+    Ok(())
+}
+
 fn validate_close_args(args: &[u64; 6]) -> Result<(), SyscallError> {
     let fd = args[0];
     validate_file_descriptor(fd)
@@ -244,8 +275,9 @@ fn validate_read_args(process_id: ProcessId, args: &[u64; 6]) -> Result<(), Sysc
     
     validate_file_descriptor(fd)?;
     
+    // read() writes into the caller's buffer, so it must be writable.
     if count > 0 {
-        validate_user_pointer(process_id, buf_ptr, count as usize)?;
+        validate_user_pointer(process_id, buf_ptr, count as usize, true)?;
     }
     
     Ok(())
@@ -258,8 +290,9 @@ fn validate_write_args(process_id: ProcessId, args: &[u64; 6]) -> Result<(), Sys
     
     validate_file_descriptor(fd)?;
     
+    // write() only reads the caller's buffer.
     if count > 0 {
-        validate_user_pointer(process_id, buf_ptr, count as usize)?;
+        validate_user_pointer(process_id, buf_ptr, count as usize, false)?;
     }
     
     Ok(())
@@ -281,11 +314,22 @@ fn validate_lseek_args(args: &[u64; 6]) -> Result<(), SyscallError> {
 }
 
 fn validate_stat_args(process_id: ProcessId, args: &[u64; 6]) -> Result<(), SyscallError> {
-    let path_or_fd = args[0];
-    let stat_buf_ptr = args[1];
-    
-    validate_user_pointer(process_id, stat_buf_ptr, 144)?; // sizeof(struct stat)
-    
+    // ABI: (path_ptr, path_len, out_ptr). This used to validate args[1] as a
+    // 144-byte writable buffer — but args[1] is the path *length*, so it was
+    // checking whether the address `9` (or whatever the path length happened to
+    // be) was mapped. It never is: that is page 0, the null guard. Every stat
+    // call failed with InvalidArgument before its handler ran, while open and
+    // getdents — whose validators happen to match their ABIs — worked.
+    let path_ptr = args[0];
+    let path_len = args[1];
+    let out_ptr = args[2];
+
+    if path_len == 0 || path_len > 4096 {
+        return Err(SyscallError::InvalidArgument);
+    }
+    validate_user_pointer(process_id, path_ptr, path_len as usize, false)?;
+    validate_user_pointer(process_id, out_ptr, core::mem::size_of::<crate::syscall::files::UserDirEntry>(), true)?;
+
     Ok(())
 }
 
@@ -314,7 +358,7 @@ fn validate_send_message_args(process_id: ProcessId, args: &[u64; 6]) -> Result<
     }
     
     if message_len > 0 {
-        validate_user_pointer(process_id, message_ptr, message_len as usize)?;
+        validate_user_pointer(process_id, message_ptr, message_len as usize, false)?;
     }
     
     Ok(())
@@ -335,7 +379,7 @@ fn validate_reply_message_args(process_id: ProcessId, args: &[u64; 6]) -> Result
     }
     
     if reply_len > 0 {
-        validate_user_pointer(process_id, reply_ptr, reply_len as usize)?;
+        validate_user_pointer(process_id, reply_ptr, reply_len as usize, false)?;
     }
     
     Ok(())
@@ -364,7 +408,7 @@ fn validate_destroy_channel_args(args: &[u64; 6]) -> Result<(), SyscallError> {
 // Driver interface syscall validations
 fn validate_driver_register_args(process_id: ProcessId, args: &[u64; 6]) -> Result<(), SyscallError> {
     let driver_info_ptr = args[0];
-    validate_user_pointer(process_id, driver_info_ptr, 64) // Basic driver info struct size
+    validate_user_pointer(process_id, driver_info_ptr, 64, false) // Basic driver info struct size
 }
 
 fn validate_driver_unregister_args(process_id: ProcessId, args: &[u64; 6]) -> Result<(), SyscallError> {
@@ -387,7 +431,7 @@ fn validate_driver_request_args(process_id: ProcessId, args: &[u64; 6]) -> Resul
     }
     
     if request_len > 0 {
-        validate_user_pointer(process_id, request_ptr, request_len as usize)?;
+        validate_user_pointer(process_id, request_ptr, request_len as usize, false)?;
     }
     
     Ok(())
@@ -403,7 +447,7 @@ fn validate_driver_response_args(process_id: ProcessId, args: &[u64; 6]) -> Resu
     }
     
     if response_len > 0 {
-        validate_user_pointer(process_id, response_ptr, response_len as usize)?;
+        validate_user_pointer(process_id, response_ptr, response_len as usize, true)?;
     }
     
     Ok(())
@@ -437,7 +481,7 @@ fn validate_grant_capability_args(process_id: ProcessId, args: &[u64; 6]) -> Res
     }
     
     if resource_ptr != 0 {
-        validate_user_pointer(process_id, resource_ptr, 64)?; // Basic resource descriptor size
+        validate_user_pointer(process_id, resource_ptr, 64, false)?; // Basic resource descriptor size
     }
     
     Ok(())
@@ -459,7 +503,7 @@ fn validate_check_capability_args(process_id: ProcessId, args: &[u64; 6]) -> Res
     let resource_ptr = args[1];
     
     if resource_ptr != 0 {
-        validate_user_pointer(process_id, resource_ptr, 64)?; // Basic resource descriptor size
+        validate_user_pointer(process_id, resource_ptr, 64, false)?; // Basic resource descriptor size
     }
     
     Ok(())
@@ -471,13 +515,11 @@ fn validate_list_capabilities_args(args: &[u64; 6]) -> Result<(), SyscallError> 
 }
 
 // Debug syscall validations (only in debug builds)
-#[cfg(debug_assertions)]
 fn validate_debug_print_args(args: &[u64; 6]) -> Result<(), SyscallError> {
     // Debug print can take any arguments
     Ok(())
 }
 
-#[cfg(debug_assertions)]
 fn validate_debug_dump_args(args: &[u64; 6]) -> Result<(), SyscallError> {
     // Debug dump can take any arguments
     Ok(())
