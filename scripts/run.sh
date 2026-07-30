@@ -21,10 +21,11 @@ ISO="$BUILD_DIR/kosh.iso"
 
 MODE="run"
 case "${1:-}" in
-    --debug) MODE="debug" ;;
-    --check) MODE="check" ;;
-    "")      ;;
-    *)       echo "unknown option: $1" >&2; exit 2 ;;
+    --debug)     MODE="debug" ;;
+    --check)     MODE="check" ;;
+    --check-cli) MODE="check-cli" ;;
+    "")          ;;
+    *)           echo "unknown option: $1" >&2; exit 2 ;;
 esac
 
 # --- toolchain sanity -------------------------------------------------------
@@ -58,6 +59,18 @@ fi
 KERNEL="$ROOT/target/$TARGET_NAME/$PROFILE/kosh-kernel"
 [ -f "$KERNEL" ] || { echo "error: kernel binary not found at $KERNEL" >&2; exit 1; }
 
+# Userspace programs shipped as GRUB modules. These are ordinary static ELF
+# binaries; the kernel parses and maps them at run time.
+echo "==> building userspace programs"
+USER_FLAGS=(--package kosh-hello --target "$TARGET_JSON" -Z build-std=core)
+[ "$PROFILE" = "release" ] && USER_FLAGS+=(--release)
+cargo build "${USER_FLAGS[@]}" -Z json-target-spec 2>/dev/null \
+    || cargo build "${USER_FLAGS[@]}"
+
+HELLO="$ROOT/target/$TARGET_NAME/$PROFILE/kosh-hello"
+[ -f "$HELLO" ] || { echo "error: userspace binary not found at $HELLO" >&2; exit 1; }
+echo "==> $(basename "$HELLO"): $(readelf -h "$HELLO" | awk '/Entry point/ {print $4}')"
+
 # --- validate the multiboot2 header before we waste a boot ------------------
 
 if grub-file --is-x86-multiboot2 "$KERNEL"; then
@@ -76,6 +89,7 @@ echo "==> building ISO"
 rm -rf "$ISO_DIR"
 mkdir -p "$ISO_DIR/boot/grub"
 cp "$KERNEL" "$ISO_DIR/boot/kosh-kernel"
+cp "$HELLO" "$ISO_DIR/boot/init"
 
 cat > "$ISO_DIR/boot/grub/grub.cfg" <<'EOF'
 set timeout=0
@@ -83,6 +97,7 @@ set default=0
 
 menuentry "Kosh" {
     multiboot2 /boot/kosh-kernel
+    module2 /boot/init init
     boot
 }
 EOF
@@ -134,6 +149,7 @@ check)
         "PIC remapped" \
         "PIT channel 0" \
         "Interrupts enabled" \
+        "Timer: PASS" \
         "kernel page tables active" \
         "physmap aliases identity map: OK" \
         "page 0 unmapped: OK" \
@@ -144,8 +160,12 @@ check)
         "ring 3 fault — terminating the process" \
         "Ring 3: PASS" \
         "kernel survived a ring 3 fault" \
+        "hello from a loaded ELF binary" \
+        ".bss was zeroed correctly" \
+        "stack is writable and readable" \
+        "ELF loader: PASS" \
         "Kernel initialization complete" \
-        "uptime 1s"
+        "console started on its own thread"
     do
         if grep -qF "$marker" "$SERIAL" 2>/dev/null; then
             echo "  PASS  $marker"
@@ -159,6 +179,89 @@ check)
         echo "  FAIL  triple fault in qemu.log"
         fail=1
     fi
+
+    exit $fail
+    ;;
+
+check-cli)
+    # Boot, then type at the console through QEMU's monitor and check what it
+    # answers. Nothing else in this repo exercises the keyboard IRQ, the line
+    # editor and the command table end to end — and a console that only a human
+    # can test is a console that silently rots.
+    SERIAL="$BUILD_DIR/serial-cli.txt"
+    rm -f "$SERIAL"
+    echo "==> console check"
+
+    # QEMU's `sendkey` speaks key names, not characters.
+    keyname() {
+        case "$1" in
+            " ") echo "spc" ;;
+            ".") echo "dot" ;;
+            "-") echo "minus" ;;
+            "/") echo "slash" ;;
+            [a-z0-9]) echo "$1" ;;
+            *) echo "" ;;
+        esac
+    }
+
+    type_line() {
+        local text="$1" i c k
+        for (( i=0; i<${#text}; i++ )); do
+            c="${text:$i:1}"
+            k="$(keyname "$c")"
+            [ -n "$k" ] && echo "sendkey $k"
+            # Deliberately unhurried. QEMU drops sendkeys if you push them
+            # faster than the guest drains the PS/2 controller, and a flaky
+            # console test is worse than a slow one.
+            sleep 0.04
+        done
+        sleep 0.2
+        echo "sendkey ret"
+        sleep 0.8
+    }
+
+    {
+        # Let the boot demos finish before typing.
+        sleep 12
+        type_line "uname"
+        type_line "mem"
+        type_line "ticks"
+        type_line "echo kosh cli works"
+        type_line "modules"
+        type_line "ps"
+        type_line "history"
+        type_line "nosuchcommand"
+        type_line "fault bp"
+        sleep 1
+        echo quit
+    } | timeout 90 qemu-system-x86_64 "${QEMU_ARGS[@]}" \
+            -serial "file:$SERIAL" -display none -monitor stdio >/dev/null 2>&1 || true
+
+    echo "--- console session ---"
+    sed -n '/Kosh console/,$p' "$SERIAL" 2>/dev/null | head -60
+    echo "-----------------------"
+
+    fail=0
+    for marker in \
+        "Kosh console" \
+        "kosh>" \
+        "Kosh 0.1.0 x86_64" \
+        "running in ring 0" \
+        "physical memory:" \
+        "kernel heap:" \
+        "kosh cli works" \
+        "module 0:" \
+        "context switches since boot" \
+        "unknown command: nosuchcommand" \
+        "resumed"
+    do
+        if grep -qF "$marker" "$SERIAL" 2>/dev/null; then
+            echo "  PASS  $marker"
+        else
+            echo "  FAIL  $marker"
+            fail=1
+        fi
+    done
 
     exit $fail
     ;;

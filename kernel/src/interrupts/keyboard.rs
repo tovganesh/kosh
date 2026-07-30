@@ -6,13 +6,18 @@
 //! is the real thing: an interrupt handler reading port 0x60.
 //!
 //! The handler does the minimum possible work — read the port, decode, push a
-//! byte — and never allocates or blocks. Everything else happens in
-//! `read_char()`, called from normal kernel context.
+//! key — and never allocates or blocks. Everything else happens in
+//! [`read_key`], called from normal kernel context.
+//!
+//! The buffer carries a [`Key`] rather than a byte, because a line editor needs
+//! to tell an arrow key from the character it would otherwise be conflated
+//! with. Squeezing cursor keys into spare ASCII control codes works right up
+//! until something wants to type one of those control codes.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use lazy_static::lazy_static;
-use pc_keyboard::{layouts, DecodedKey, HandleControl, Keyboard, ScancodeSet1};
+use pc_keyboard::{layouts, DecodedKey, HandleControl, KeyCode, Keyboard, ScancodeSet1};
 use spin::Mutex;
 use x86_64::instructions::port::Port;
 use x86_64::structures::idt::InterruptStackFrame;
@@ -22,9 +27,26 @@ use crate::serial_println;
 
 const PS2_DATA_PORT: u16 = 0x60;
 
-/// Capacity of the decoded-character ring. A power of two so the modulo is a
-/// mask. 128 characters is far more than a human can type between polls.
+/// Capacity of the key ring. A power of two so the modulo is a mask. 128 keys
+/// is far more than a human can type between polls.
 const BUFFER_SIZE: usize = 128;
+
+/// A decoded keypress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    Char(char),
+    Enter,
+    Backspace,
+    Delete,
+    Tab,
+    Escape,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+}
 
 lazy_static! {
     static ref KEYBOARD: Mutex<Keyboard<layouts::Us104Key, ScancodeSet1>> = Mutex::new(
@@ -35,7 +57,7 @@ lazy_static! {
 /// Lock-free-ish SPSC ring: the IRQ handler is the only producer, kernel
 /// context is the only consumer.
 struct KeyBuffer {
-    data: [u8; BUFFER_SIZE],
+    data: [Key; BUFFER_SIZE],
     read: AtomicUsize,
     write: AtomicUsize,
 }
@@ -43,13 +65,13 @@ struct KeyBuffer {
 impl KeyBuffer {
     const fn new() -> Self {
         Self {
-            data: [0; BUFFER_SIZE],
+            data: [Key::Char('\0'); BUFFER_SIZE],
             read: AtomicUsize::new(0),
             write: AtomicUsize::new(0),
         }
     }
 
-    fn push(&mut self, byte: u8) {
+    fn push(&mut self, key: Key) {
         let write = self.write.load(Ordering::Relaxed);
         let next = (write + 1) % BUFFER_SIZE;
 
@@ -59,19 +81,19 @@ impl KeyBuffer {
             return;
         }
 
-        self.data[write] = byte;
+        self.data[write] = key;
         self.write.store(next, Ordering::Release);
     }
 
-    fn pop(&self) -> Option<u8> {
+    fn pop(&self) -> Option<Key> {
         let read = self.read.load(Ordering::Relaxed);
         if read == self.write.load(Ordering::Acquire) {
             return None;
         }
 
-        let byte = self.data[read];
+        let key = self.data[read];
         self.read.store((read + 1) % BUFFER_SIZE, Ordering::Release);
-        Some(byte)
+        Some(key)
     }
 
     fn is_empty(&self) -> bool {
@@ -91,27 +113,59 @@ pub fn init() {
     serial_println!("  PS/2 keyboard: IRQ1 handler installed (US layout, set 1)");
 }
 
-/// Take one decoded character, if any is waiting. Non-blocking.
-pub fn read_char() -> Option<char> {
-    crate::interrupts::without_interrupts(|| BUFFER.lock().pop().map(|b| b as char))
+/// Take one key, if any is waiting. Non-blocking.
+pub fn read_key() -> Option<Key> {
+    crate::interrupts::without_interrupts(|| BUFFER.lock().pop())
 }
 
-/// Block until a character is available.
+/// Block until a key is available.
 ///
-/// Uses `hlt` rather than a spin so an idle wait does not burn the CPU. This
-/// is the primitive the shell's line editor will sit on in Phase 7.
-pub fn read_char_blocking() -> char {
+/// Uses `hlt` rather than a spin so an idle wait does not burn the CPU — and,
+/// now that the kernel is preemptive, so other threads keep running while the
+/// console waits for a human.
+pub fn read_key_blocking() -> Key {
     loop {
-        if let Some(c) = read_char() {
-            return c;
+        if let Some(key) = read_key() {
+            return key;
         }
         x86_64::instructions::hlt();
     }
 }
 
+/// Take one character, ignoring keys that have no character. Non-blocking.
+pub fn read_char() -> Option<char> {
+    match read_key() {
+        Some(Key::Char(c)) => Some(c),
+        Some(Key::Enter) => Some('\n'),
+        Some(Key::Backspace) => Some('\x08'),
+        _ => None,
+    }
+}
+
 /// Whether any input is pending.
 pub fn has_input() -> bool {
-    crate::interrupts::without_interrupts(|| BUFFER.lock().is_empty()) == false
+    !crate::interrupts::without_interrupts(|| BUFFER.lock().is_empty())
+}
+
+fn translate(key: DecodedKey) -> Option<Key> {
+    match key {
+        DecodedKey::Unicode('\n') | DecodedKey::Unicode('\r') => Some(Key::Enter),
+        DecodedKey::Unicode('\u{8}') | DecodedKey::Unicode('\u{7f}') => Some(Key::Backspace),
+        DecodedKey::Unicode('\t') => Some(Key::Tab),
+        DecodedKey::Unicode('\u{1b}') => Some(Key::Escape),
+        DecodedKey::Unicode(c) if c.is_ascii() => Some(Key::Char(c)),
+        DecodedKey::Unicode(_) => None,
+
+        DecodedKey::RawKey(KeyCode::ArrowUp) => Some(Key::Up),
+        DecodedKey::RawKey(KeyCode::ArrowDown) => Some(Key::Down),
+        DecodedKey::RawKey(KeyCode::ArrowLeft) => Some(Key::Left),
+        DecodedKey::RawKey(KeyCode::ArrowRight) => Some(Key::Right),
+        DecodedKey::RawKey(KeyCode::Home) => Some(Key::Home),
+        DecodedKey::RawKey(KeyCode::End) => Some(Key::End),
+        DecodedKey::RawKey(KeyCode::Delete) => Some(Key::Delete),
+        DecodedKey::RawKey(KeyCode::Backspace) => Some(Key::Backspace),
+        DecodedKey::RawKey(_) => None,
+    }
 }
 
 pub extern "x86-interrupt" fn keyboard_interrupt_handler(_frame: InterruptStackFrame) {
@@ -125,23 +179,10 @@ pub extern "x86-interrupt" fn keyboard_interrupt_handler(_frame: InterruptStackF
     // machine. Dropping a keystroke is the correct trade.
     if let Some(mut keyboard) = KEYBOARD.try_lock() {
         if let Ok(Some(key_event)) = keyboard.add_byte(scancode) {
-            if let Some(key) = keyboard.process_keyevent(key_event) {
-                let byte = match key {
-                    DecodedKey::Unicode(c) => {
-                        if c.is_ascii() {
-                            Some(c as u8)
-                        } else {
-                            None
-                        }
-                    }
-                    // Arrow keys, function keys and friends have no ASCII
-                    // encoding. Phase 7 will map these to editor commands.
-                    DecodedKey::RawKey(_) => None,
-                };
-
-                if let Some(byte) = byte {
+            if let Some(decoded) = keyboard.process_keyevent(key_event) {
+                if let Some(key) = translate(decoded) {
                     if let Some(mut buffer) = BUFFER.try_lock() {
-                        buffer.push(byte);
+                        buffer.push(key);
                     }
                 }
             }

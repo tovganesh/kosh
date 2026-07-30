@@ -21,11 +21,77 @@
 //! with every reference RIP-relative, so it runs correctly at an address it was
 //! not linked for.
 
+use spin::Mutex;
 use x86_64::structures::paging::PageTableFlags;
 
-use crate::memory::paging;
+use crate::memory::paging::{self, PHYSMAP_BASE};
 use crate::memory::PAGE_SIZE;
 use crate::serial_println;
+
+/// A boot module as GRUB placed it, copied out of the multiboot2 structure
+/// before that borrow ends.
+#[derive(Debug, Clone, Copy)]
+pub struct BootModule {
+    pub start: u64,
+    pub end: u64,
+}
+
+impl BootModule {
+    pub fn len(&self) -> usize {
+        (self.end - self.start) as usize
+    }
+
+    /// The module's bytes, viewed through the physmap.
+    ///
+    /// # Safety
+    /// Only valid after `paging::init`, and only while the frames remain
+    /// reserved — which `physical::reserve_boot_modules` guarantees.
+    pub unsafe fn bytes(&self) -> &'static [u8] {
+        core::slice::from_raw_parts((PHYSMAP_BASE + self.start) as *const u8, self.len())
+    }
+}
+
+const MAX_BOOT_MODULES: usize = 4;
+static BOOT_MODULES: Mutex<[Option<BootModule>; MAX_BOOT_MODULES]> =
+    Mutex::new([None; MAX_BOOT_MODULES]);
+
+/// Copy the module table out of the multiboot2 info.
+pub fn record_boot_modules(boot_info: &multiboot2::BootInformation) {
+    let mut slots = BOOT_MODULES.lock();
+    let mut n = 0;
+
+    for module in boot_info.module_tags() {
+        if n >= MAX_BOOT_MODULES {
+            serial_println!("  (ignoring boot modules beyond {})", MAX_BOOT_MODULES);
+            break;
+        }
+
+        let name = module.cmdline().unwrap_or("<no cmdline>");
+        slots[n] = Some(BootModule {
+            start: module.start_address() as u64,
+            end: module.end_address() as u64,
+        });
+
+        serial_println!(
+            "Boot module {}: 0x{:x}..0x{:x} ({} bytes) '{}'",
+            n,
+            module.start_address(),
+            module.end_address(),
+            module.end_address() - module.start_address(),
+            name
+        );
+        n += 1;
+    }
+
+    if n == 0 {
+        serial_println!("No boot modules supplied by the bootloader");
+    }
+}
+
+/// The nth boot module, if present.
+pub fn boot_module(index: usize) -> Option<BootModule> {
+    BOOT_MODULES.lock().get(index).copied().flatten()
+}
 
 /// Where the user blob is mapped. 1 GiB — clear of the kernel's low identity
 /// window and nowhere near the higher half.
@@ -126,7 +192,72 @@ pub fn run_user_demo(which: usize) {
     unsafe { enter_ring3(user_entry, stack_top) }
 }
 
+/// Load boot module 0 as an ELF and run it in ring 3.
+///
+/// This is the real path: a program the kernel was not compiled with, parsed
+/// out of an ELF, mapped at the addresses it was linked for, and entered.
+pub fn run_boot_module(_arg: usize) {
+    let Some(module) = boot_module(0) else {
+        serial_println!("No boot module to load — skipping ELF loader demo.");
+        serial_println!("  (add `module2 /boot/init` to grub.cfg)");
+        return;
+    };
+
+    serial_println!("Loading boot module 0 as ELF:");
+    let image = unsafe { module.bytes() };
+    crate::elf::describe(image);
+
+    let loaded = match unsafe { crate::elf::load(image) } {
+        Ok(l) => l,
+        Err(e) => {
+            serial_println!("  ELF load FAILED: {:?}", e);
+            return;
+        }
+    };
+
+    serial_println!(
+        "  loaded {} segment(s), {} bytes, entry 0x{:x}",
+        loaded.segments,
+        loaded.bytes_mapped,
+        loaded.entry
+    );
+
+    // A fresh stack, well clear of the image's own segments.
+    let stack_top = ELF_USER_STACK_TOP;
+    let stack_bottom = stack_top - (USER_STACK_PAGES * PAGE_SIZE) as u64;
+    let stack_flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
+
+    if let Err(e) = paging::map_user_pages(stack_bottom, USER_STACK_PAGES, stack_flags) {
+        serial_println!("  failed to map stack for loaded image: {}", e);
+        return;
+    }
+    serial_println!(
+        "  stack          : 0x{:x}..0x{:x} (RW-, user, NX)",
+        stack_bottom,
+        stack_top
+    );
+
+    serial_println!("Entering loaded ELF in ring 3...");
+    serial_println!("--- loaded program output ---");
+
+    unsafe { enter_ring3(loaded.entry, stack_top) }
+}
+
+/// Stack for the ELF-loaded program. Separate from the built-in payload's, so
+/// the two demos cannot interfere.
+const ELF_USER_STACK_TOP: u64 = 0x0000_0000_6000_0000;
+
 /// Drop to ring 3 at `entry` with `stack_top`.
+///
+/// `stack_top` is passed through as RSP unchanged, so the contract with
+/// userspace is the System V one: **RSP is 16-byte aligned at process entry**.
+/// It is the program's `_start` that must then establish the call-boundary
+/// alignment its compiled code expects — which is exactly what a real crt0
+/// does, and what `userspace/hello` does. Getting this wrong shows up as a #GP
+/// on the first `movaps` spill, not as anything obviously stack-related.
 ///
 /// # Safety
 /// `entry` and `stack_top` must be mapped `USER_ACCESSIBLE`, and the GDT must

@@ -163,6 +163,12 @@ impl PhysicalMemoryManager {
         
         // Mark available memory areas as free
         manager.parse_memory_map(&memory_map)?;
+
+        // Boot modules live in RAM that the memory map reports as *available*,
+        // because from the firmware's point of view it is. If we do not claim
+        // them here, the first allocation lands on top of the init binary we
+        // are about to load.
+        manager.reserve_boot_modules(boot_info);
         
         serial_println!("Physical memory manager initialized:");
         serial_println!("  Total frames: {}", manager.total_frames);
@@ -219,6 +225,32 @@ impl PhysicalMemoryManager {
         Ok(())
     }
     
+    /// Mark every frame holding a multiboot2 boot module as used.
+    fn reserve_boot_modules(&mut self, boot_info: &BootInformation) {
+        for module in boot_info.module_tags() {
+            let start = module.start_address() as usize;
+            let end = module.end_address() as usize;
+
+            let first = PageFrame::from_address(start);
+            let last = PageFrame::from_address(end.saturating_sub(1));
+
+            let mut count = 0usize;
+            for frame_num in first.0..=last.0 {
+                if frame_num < self.total_frames {
+                    self.mark_frame_used(PageFrame(frame_num));
+                    count += 1;
+                }
+            }
+
+            serial_println!(
+                "  reserved boot module 0x{:x}..0x{:x} ({} frames)",
+                start,
+                end,
+                count
+            );
+        }
+    }
+
     /// Allocate a single page frame
     pub fn allocate_frame(&mut self) -> Option<PageFrame> {
         if self.free_frames == 0 {

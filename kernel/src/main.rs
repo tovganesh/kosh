@@ -21,6 +21,10 @@ mod task;
 #[cfg(target_arch = "x86_64")]
 mod gdt;
 #[cfg(target_arch = "x86_64")]
+mod console;
+#[cfg(target_arch = "x86_64")]
+mod elf;
+#[cfg(target_arch = "x86_64")]
 mod usermode;
 #[cfg(target_arch = "x86_64")]
 mod user_program;
@@ -268,38 +272,25 @@ pub extern "C" fn _start(multiboot_info_addr: usize) -> ! {
     idle_loop()
 }
 
-/// Idle loop.
+/// Hand over to the console.
 ///
-/// There is no scheduler yet, so the kernel's "steady state" is to wait for
-/// interrupts. The timer ticks in the background; anything typed on the PS/2
-/// keyboard is echoed here, which proves the IRQ path end to end and is the
-/// beginning of the console the shell will use in Phase 7.
+/// The console runs on its own kernel thread rather than here, so that the
+/// scheduler stays live while it blocks on the keyboard: timer ticks keep
+/// arriving, other threads keep running, and a wedged console does not wedge
+/// the machine. This thread becomes the idle task.
 #[cfg(target_arch = "x86_64")]
 fn idle_loop() -> ! {
-    serial_println!("Kosh: idle loop — timer is ticking, type to echo keystrokes");
-    println!("Kosh ready. Type something:");
+    match task::spawn("console", console::run, 0) {
+        Ok(_) => serial_println!("Kosh: console started on its own thread"),
+        Err(e) => {
+            serial_println!("Kosh: could not start the console: {}", e);
+            serial_println!("Kosh: falling back to the idle loop");
+        }
+    }
 
     loop {
-        while let Some(c) = interrupts::keyboard::read_char() {
-            match c {
-                // Enter
-                '\n' | '\r' => {
-                    println!();
-                    serial_println!();
-                }
-                // Backspace
-                '\x08' | '\x7f' => {
-                    print!("\x08 \x08");
-                    serial_print!("\x08 \x08");
-                }
-                c => {
-                    print!("{}", c);
-                    serial_print!("{}", c);
-                }
-            }
-        }
-
-        // Sleep until the next interrupt rather than spinning.
+        // Nothing to do but wait for an interrupt. The scheduler will preempt
+        // us into the console as soon as there is a key to handle.
         x86_64::instructions::hlt();
     }
 }

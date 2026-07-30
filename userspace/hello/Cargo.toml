@@ -1,0 +1,14 @@
+[package]
+name = "kosh-hello"
+version = "0.1.0"
+edition = "2021"
+
+# A deliberately tiny userspace program: no dependencies, no allocator, no
+# runtime. Its whole job is to be a real static ELF that the kernel's loader has
+# to parse, map and enter — so that when it prints, the loader is proven.
+
+[dependencies]
+
+[[bin]]
+name = "kosh-hello"
+path = "src/main.rs"

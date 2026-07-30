@@ -409,10 +409,108 @@ by the kernel checking itself. The second bypasses syscalls entirely and touches
 kernel memory directly, so page protection rather than argument validation has
 to stop it.
 
+## Loading programs (Phase 6)
+
+`kernel/src/elf.rs` parses static `ET_EXEC` ELF64: walk the program headers, map
+each `PT_LOAD` at its `p_vaddr` with permissions from `p_flags`, copy
+`p_filesz` bytes, leave the rest zero. No dynamic linking, no relocations, no
+interpreter.
+
+Segments are populated **through the physmap**, not through the mapping being
+created — so a read-only segment never has to be temporarily writable just to be
+filled in. `map_user_pages` already zeroes each frame, which makes the `.bss`
+tail (`p_memsz > p_filesz`) correct without extra work.
+
+Two things about GRUB modules that are easy to get wrong:
+
+- **The frames must be reserved before the allocator starts.** The memory map
+  reports them as available, because from the firmware's point of view they are.
+  `physical.rs` claims them, or the first allocation lands on top of the binary.
+- **A module can land outside the low identity window**, so its bytes are read
+  through the physmap rather than by physical address.
+
+`userspace/hello` is the payload — an ordinary Rust binary linked at 4 MiB, not
+position-independent assembly. It only runs if the loader honoured `p_vaddr`,
+and it self-checks the three things the loader must get right: executing at the
+linked address, resolving `.rodata` through absolute addresses, and reading a
+`.bss` static that exists only because the loader zeroed the tail.
+
+**Its `_start` is assembly, exactly like a real crt0.** System V says RSP is
+16-byte aligned at process entry, but a Rust `extern "C"` function is compiled
+as an ordinary callee and assumes RSP is 8 *past* a boundary — the state a
+`call` leaves. Wiring Rust straight to the entry point makes the first `movaps`
+spill fault with #GP. That is what happened on the first run, and the symptom
+(a #GP deep inside integer formatting) points nowhere near the cause.
+
+## The console (Phase 7)
+
+`kernel/src/console/` is an in-kernel shell: `editor.rs` does line editing and
+history, `commands.rs` is the command table.
+
+```
+kosh> uname
+Kosh 0.1.0 x86_64
+  microkernel, Rust, multiboot2
+  running in ring 0
+  CR3            0x176000
+  physmap base   0xffff800000000000
+kosh> ps
+2 thread(s):
+   id  name         state        ticks
+    0  kmain        ready          642
+    1  console      running        616
+
+661 context switches since boot
+```
+
+**Why in-kernel, in a microkernel.** Because a kernel you can interrogate while
+it is running is worth more than architectural purity at this stage. Every
+command reports live state — real frame counts, real heap statistics, the real
+thread table, a real page-table walk. That makes it a debugging instrument, and
+it is why serious kernels keep a debug console permanently even after userspace
+exists. The userspace shell is still the goal; it needs a blocking read syscall
+and a filesystem to be worth using, and this is what lets you inspect the kernel
+while building those.
+
+**What it deliberately does not have:** `ls`, `cat`, `cd`. There is no
+filesystem, and inventing commands that return plausible-looking strings is
+exactly the habit that let this project accumulate 27 commits of code that had
+never run.
+
+The console runs on **its own kernel thread**, so the scheduler stays live while
+it blocks on the keyboard — timer ticks keep arriving, other threads keep
+running, and a wedged console does not wedge the machine.
+
+Two things it changed elsewhere:
+
+- The keyboard ring now carries a `Key` enum rather than a byte. A line editor
+  has to tell an arrow key from the character it would otherwise be conflated
+  with; squeezing cursor keys into spare ASCII control codes works right up
+  until something wants to type one of those codes.
+- The once-a-second tick heartbeat is now off by default once the console
+  starts. A line that appears in the middle of what you are typing makes the
+  console unusable. `heartbeat on` brings it back.
+
+### Testing it
+
+```bash
+./scripts/run.sh --check-cli
+```
+
+Boots, types at the `kosh>` prompt through QEMU's monitor, and asserts what the
+console answers. Both checks run in CI. A console only a human can test is a
+console that rots quietly.
+
 ## What is deliberately still missing
-- **`PHYSICAL_MEMORY_OFFSET` is 0**, because the map is flat identity. It
-  becomes `0xFFFF_8000_0000_0000` when the kernel builds its own page tables in
-  Phase 3.
+- **No filesystem, and no storage driver.** Which is why there is no `ls`.
+- **No `fork`/`exec`.** `userspace/init` cannot do its job until those exist, so
+  the ELF payload is `userspace/hello` rather than init.
+- **One address space.** Loaded programs share the kernel's page tables; they
+  are protected by page permissions, not by separation. Per-process address
+  spaces come with `fork`.
+- **One ring-3 thread at a time.** The syscall path uses a single static kernel
+  stack, which is only safe because `SFMASK` masks IF and nothing else is in
+  user mode. Several user threads need `swapgs` and per-CPU data.
 - **Swap and power management are disabled** in `init_kernel`. Both were
   simulated, and swap tried to allocate 8 MiB from a 1 MiB heap.
 - **Only IRQ0 and IRQ1 are unmasked.** Everything else on the PIC has a

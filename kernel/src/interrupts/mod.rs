@@ -133,6 +133,27 @@ pub fn enable_hardware_interrupts() {
 
     x86_64::instructions::interrupts::enable();
     serial_println!("Interrupts enabled");
+
+    verify_timer();
+}
+
+/// Prove the timer is actually advancing.
+///
+/// This used to be inferred from a once-a-second heartbeat line, which stopped
+/// being a reliable signal the moment the console started before the first
+/// second elapsed. Measuring directly is both faster and unambiguous.
+fn verify_timer() {
+    let before = timer::ticks();
+    timer::sleep_ms(50);
+    let elapsed = timer::ticks() - before;
+
+    // 50 ms at 100 Hz is 5 ticks. Allow slack for a slow emulator, but any
+    // movement at all is the thing being tested.
+    if elapsed >= 3 {
+        serial_println!("Timer: PASS — {} ticks in 50 ms", elapsed);
+    } else {
+        serial_println!("Timer: FAIL — only {} ticks in 50 ms", elapsed);
+    }
 }
 
 /// Run `f` with interrupts disabled, restoring the previous state afterwards.

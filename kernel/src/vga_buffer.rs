@@ -106,6 +106,14 @@ impl Writer {
         self.column_position = 0;
     }
 
+    /// Blank the whole screen and put the cursor back at the top.
+    pub fn clear_screen(&mut self) {
+        for row in 0..BUFFER_HEIGHT {
+            self.clear_row(row);
+        }
+        self.column_position = 0;
+    }
+
     fn clear_row(&mut self, row: usize) {
         let blank = ScreenChar {
             ascii_character: b' ',
@@ -133,6 +141,17 @@ macro_rules! print {
 macro_rules! println {
     () => ($crate::print!("\n"));
     ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
+}
+
+/// Blank the VGA text buffer.
+pub fn clear_screen() {
+    #[cfg(target_arch = "x86_64")]
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        WRITER.lock().clear_screen();
+    });
+
+    #[cfg(not(target_arch = "x86_64"))]
+    WRITER.lock().clear_screen();
 }
 
 #[doc(hidden)]
