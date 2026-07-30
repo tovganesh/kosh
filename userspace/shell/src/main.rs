@@ -257,6 +257,7 @@ fn cmd_help() {
     println("  stat <path>           file details");
     println("  history               previous commands");
     println("  parsetest             run the tokenizer over sample inputs");
+    println("  date                  the wall clock, from the RTC");
     println("  getpid                this process's id");
     println("  exit                  leave the shell");
     println("");
@@ -476,6 +477,75 @@ fn report_unsupported(parsed: &ParsedCommand) -> bool {
     false
 }
 
+/// The wall clock, from the kernel's RTC.
+///
+/// Formatted here rather than in the kernel because a shell is the right place to
+/// decide how a date looks. `sys_time` used to return `Ok(0)` under a TODO, which
+/// would have printed a confident 1970-01-01.
+fn cmd_date() {
+    let secs = sys::time();
+    if secs < 0 {
+        println("date: the kernel has no clock");
+        return;
+    }
+
+    let (y, mo, d, h, mi, s) = civil_from_unix(secs as u64);
+    print_u64_padded(y, 4);
+    print("-");
+    print_two(mo);
+    print("-");
+    print_two(d);
+    print(" ");
+    print_two(h);
+    print(":");
+    print_two(mi);
+    print(":");
+    print_two(s);
+    println(" UTC");
+}
+
+fn print_two(v: u64) {
+    if v < 10 {
+        print("0");
+    }
+    print_u64(v);
+}
+
+/// Unix seconds to a civil date. UTC only — the kernel does not know a timezone
+/// and neither does this.
+fn civil_from_unix(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
+    const LENGTHS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let is_leap = |y: u64| (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+
+    let mut days = secs / 86_400;
+    let rem = secs % 86_400;
+
+    let mut year = 1970;
+    loop {
+        let len = if is_leap(year) { 366 } else { 365 };
+        if days < len {
+            break;
+        }
+        days -= len;
+        year += 1;
+    }
+
+    let mut month = 1;
+    loop {
+        let mut len = LENGTHS[(month - 1) as usize];
+        if month == 2 && is_leap(year) {
+            len += 1;
+        }
+        if days < len {
+            break;
+        }
+        days -= len;
+        month += 1;
+    }
+
+    (year, month, days + 1, rem / 3600, (rem % 3600) / 60, rem % 60)
+}
+
 /// Run an external program: spawn it, wait for it, report a non-zero exit.
 ///
 /// The shell blocks in the kernel's `wait` — `State::Blocked`, not a yield loop —
@@ -596,6 +666,7 @@ pub extern "C" fn ksh_main() -> ! {
             "stat" => cmd_stat(&cwd, &parsed.args),
             "history" => cmd_history(&history),
             "parsetest" => cmd_parsetest(&parser),
+            "date" => cmd_date(),
             "getpid" => {
                 print("pid ");
                 print_u64(sys::getpid() as u64);

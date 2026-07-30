@@ -219,8 +219,10 @@ pub fn self_test() {
     use crate::memory::paging::{map_user_pages_in, translate_in};
     use crate::memory::PAGE_SIZE;
 
-    // Somewhere in the lower half nothing else uses.
-    const PROBE: u64 = 0x0000_0000_1000_0000;
+    // Somewhere in the lower half nothing else uses. Above the `mmap` region, so
+    // the two are not confusable in a log even though these spaces are private
+    // and thrown away.
+    const PROBE: u64 = 0x0000_0000_2800_0000;
     const VALUE_A: u64 = 0xAAAA_AAAA_AAAA_AAAA;
     const VALUE_B: u64 = 0xBBBB_BBBB_BBBB_BBBB;
 

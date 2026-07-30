@@ -549,7 +549,6 @@ pub fn map_user_pages_in(
 ///
 /// # Safety
 /// Nothing may still be using these addresses.
-#[allow(dead_code)]
 pub unsafe fn unmap_user_pages_in(
     mut mapper: OffsetPageTable<'static>,
     virt: u64,
