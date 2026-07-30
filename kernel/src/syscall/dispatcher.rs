@@ -336,10 +336,15 @@ fn sys_getpid(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
     Ok(process_id.0 as u64)
 }
 
-fn sys_getppid(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
-    // TODO: Get actual parent process ID
-    // For now, return 0 (no parent)
-    Ok(0)
+/// Not implemented, and no longer pretending otherwise.
+///
+/// This returned `Ok(0)` under a TODO, which userspace cannot tell apart from a
+/// genuine "no parent" — and 0 is what a real `getppid` returns for the process
+/// that has none. There is no parent to report: `spawn` hands back a task id and
+/// records nothing about who called it, so a process hierarchy does not exist
+/// yet. Refusing says that; returning 0 says the opposite.
+fn sys_getppid(_process_id: ProcessId, _args: [u64; 6]) -> SyscallResult {
+    Err(SyscallError::NotSupported)
 }
 
 fn sys_kill(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
@@ -359,55 +364,207 @@ fn sys_kill(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
 }
 
 // Memory management system calls
+
+/// Where anonymous mappings go when the caller does not ask for an address.
+///
+/// A fixed base is safe because each process has the lower half to itself; the
+/// only thing it has to stay clear of is that process's own image and stack.
+/// 256 MiB is above every `p_vaddr` the userspace link scripts use and below the
+/// stack at [`crate::usermode::USER_STACK_TOP`].
+const MMAP_BASE: u64 = 0x0000_0000_1000_0000;
+
+/// Highest address `mmap` will hand out.
+const MMAP_LIMIT: u64 = 0x0000_0000_2000_0000;
+
+/// `mmap` flags. Only anonymous private mappings exist, so these are the only
+/// two that mean anything — but `MAP_ANONYMOUS` must be set, because it is the
+/// one argument the kernel can trust the caller to have passed deliberately.
+const MAP_ANONYMOUS: u64 = 0x20;
+#[allow(dead_code)]
+const MAP_PRIVATE: u64 = 0x02;
+
+/// `mmap(addr, length, prot, flags, fd, offset)` -> address
+///
+/// Anonymous private mappings only. What this replaces is the clearest example
+/// of the pattern this project keeps unwinding: it validated `length`, built a
+/// `MemoryProtection` struct, threw it away, and returned the constant
+/// `0x40000000` — then logged "mmap successful: mapped at 0x40000000" and
+/// returned it as a success. No frame was allocated and no page table was
+/// touched, so a caller that wrote to the pointer took a page fault, having been
+/// told the mapping existed.
+///
+/// It works now because per-process address spaces made it easy: the pages go
+/// into the calling process's own tables, so there is no shared region to
+/// arbitrate and no chance of handing out an address another program is using.
+#[cfg(target_arch = "x86_64")]
 fn sys_mmap(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
+    use x86_64::structures::paging::PageTableFlags;
+
     let addr = args[0];
     let length = args[1];
     let prot = args[2];
     let flags = args[3];
-    let _fd = args[4];
-    let _offset = args[5];
-    
-    serial_println!("Process {} requesting mmap: addr=0x{:x}, len={}, prot={}, flags={}", 
-                   process_id.0, addr, length, prot, flags);
-    
-    // Basic implementation for anonymous memory mapping
+    let fd = args[4] as i64;
+
     if length == 0 {
         return Err(SyscallError::InvalidArgument);
     }
-    
-    // Convert protection flags to MemoryProtection
-    let protection = crate::memory::vmm::MemoryProtection {
-        readable: (prot & 0x1) != 0,    // PROT_READ
-        writable: (prot & 0x2) != 0,    // PROT_WRITE
-        executable: (prot & 0x4) != 0,  // PROT_EXEC
-        user_accessible: true,
-    };
-    
-    // For now, implement simple anonymous mapping
-    // In a real implementation, we would:
-    // 1. Find suitable virtual address space
-    // 2. Allocate physical pages
-    // 3. Set up page table entries
-    
-    // Return a dummy address for now (in user space)
-    let mapped_addr = if addr == 0 {
-        0x40000000u64 // Default user space address
-    } else {
+
+    // `MAP_ANONYMOUS` has to be asked for explicitly, and `fd` is deliberately
+    // *not* consulted.
+    //
+    // Both because of a bug this test found: the first version checked
+    // `args[4] >= 0` and refused, reasoning that a non-negative fd meant a
+    // file-backed mapping. But `args[4]` arrives in R8, and a caller using a
+    // three-argument syscall wrapper never sets R8 — so the check read whatever
+    // was left in that register and refused every mapping. Discriminating on a
+    // flag the caller definitely passed is the only safe way to read an argument
+    // this ABI does not require them to set.
+    //
+    // File-backed mappings need the page-fault handler to read through the VFS,
+    // which does not exist; that is what the refusal below is about.
+    if flags & MAP_ANONYMOUS == 0 {
+        serial_println!(
+            "Process {} mmap without MAP_ANONYMOUS: file mappings are not implemented",
+            process_id.0
+        );
+        return Err(SyscallError::NotSupported);
+    }
+    let _ = fd;
+
+    let pages = (length as usize).div_ceil(crate::memory::PAGE_SIZE);
+
+    let mut page_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    if prot & 0x2 != 0 {
+        page_flags |= PageTableFlags::WRITABLE;
+    }
+    if prot & 0x4 == 0 {
+        page_flags |= PageTableFlags::NO_EXECUTE;
+    }
+    // W^X, for userspace too. A caller asking for both gets neither rather than
+    // a writable code page.
+    if prot & 0x2 != 0 && prot & 0x4 != 0 {
+        serial_println!("Process {} mmap asked for write+execute; refused", process_id.0);
+        return Err(SyscallError::InvalidArgument);
+    }
+
+    let base = if addr != 0 {
+        // MAP_FIXED semantics without the flag: honour the hint exactly or fail,
+        // rather than silently moving it somewhere the caller will not look.
+        if addr % crate::memory::PAGE_SIZE as u64 != 0 {
+            return Err(SyscallError::InvalidArgument);
+        }
+        if !region_free(addr, pages) {
+            return Err(SyscallError::AddressInUse);
+        }
         addr
+    } else {
+        find_free_region(pages).ok_or(SyscallError::OutOfMemory)?
     };
-    
-    serial_println!("Process {} mmap successful: mapped at 0x{:x}", process_id.0, mapped_addr);
-    Ok(mapped_addr)
+
+    crate::memory::paging::map_user_pages(base, pages, page_flags)
+        .map_err(|e| {
+            serial_println!("Process {} mmap failed: {}", process_id.0, e);
+            SyscallError::OutOfMemory
+        })?;
+
+    if syscall_trace_enabled() {
+        serial_println!(
+            "Process {} mmap: {} page(s) at 0x{:x} (prot {}, flags {})",
+            process_id.0,
+            pages,
+            base,
+            prot,
+            flags
+        );
+    }
+
+    Ok(base)
 }
 
+#[cfg(not(target_arch = "x86_64"))]
+fn sys_mmap(_process_id: ProcessId, _args: [u64; 6]) -> SyscallResult {
+    Err(SyscallError::NotSupported)
+}
+
+/// Is every page of this span currently unmapped in the calling process?
+#[cfg(target_arch = "x86_64")]
+fn region_free(base: u64, pages: usize) -> bool {
+    (0..pages).all(|i| {
+        crate::memory::paging::translate(base + (i * crate::memory::PAGE_SIZE) as u64).is_none()
+    })
+}
+
+/// First `pages`-page hole in the mmap region.
+///
+/// A linear scan of the process's own tables rather than a bump pointer, because
+/// a bump pointer would need per-process state to live in and would leak address
+/// space across `munmap`. The region is 256 MiB, so the scan is bounded.
+#[cfg(target_arch = "x86_64")]
+fn find_free_region(pages: usize) -> Option<u64> {
+    let step = crate::memory::PAGE_SIZE as u64;
+    let mut base = MMAP_BASE;
+
+    while base + (pages as u64 * step) <= MMAP_LIMIT {
+        if region_free(base, pages) {
+            return Some(base);
+        }
+        base += step;
+    }
+
+    None
+}
+
+/// `munmap(addr, length)`
+///
+/// Previously a `NotSupported` under a TODO — which was at least honest, but it
+/// meant a program could not give memory back. The pages return to the frame
+/// allocator immediately.
+#[cfg(target_arch = "x86_64")]
 fn sys_munmap(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
     let addr = args[0];
     let length = args[1];
-    
-    serial_println!("Process {} requesting munmap: addr=0x{:x}, len={}", 
-                   process_id.0, addr, length);
-    
-    // TODO: Implement memory unmapping
+
+    if length == 0 || addr % crate::memory::PAGE_SIZE as u64 != 0 {
+        return Err(SyscallError::InvalidArgument);
+    }
+
+    // Only addresses this syscall could have handed out. Letting a process
+    // unmap its own `.text` is a good way to turn a userspace bug into an
+    // unexplainable fault.
+    if addr < MMAP_BASE || addr >= MMAP_LIMIT {
+        serial_println!(
+            "Process {} munmap 0x{:x} is outside the mmap region",
+            process_id.0,
+            addr
+        );
+        return Err(SyscallError::InvalidArgument);
+    }
+
+    let pages = (length as usize).div_ceil(crate::memory::PAGE_SIZE);
+    let freed = unsafe {
+        crate::memory::paging::unmap_user_pages_in(
+            crate::memory::paging::active_mapper(),
+            addr,
+            pages,
+        )
+    };
+
+    if syscall_trace_enabled() {
+        serial_println!(
+            "Process {} munmap: {} of {} page(s) at 0x{:x}",
+            process_id.0,
+            freed,
+            pages,
+            addr
+        );
+    }
+
+    Ok(freed as u64)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn sys_munmap(_process_id: ProcessId, _args: [u64; 6]) -> SyscallResult {
     Err(SyscallError::NotSupported)
 }
 
@@ -527,64 +684,60 @@ fn sys_unlink(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
 }
 
 // IPC system calls
+/// `send_message(receiver, ptr, len)`
+///
+/// Not implemented, and it now says so instead of delivering something else.
+///
+/// What it used to do is the most subtle fabrication in this kernel, because
+/// most of it was real. It reached `ipc::message::send_message`, which genuinely
+/// validates the sender and receiver, checks a `SendMessage` capability and
+/// enqueues — but `args[1]`, the caller's buffer, was bound to `_message_ptr`
+/// and never read. In its place went:
+///
+/// ```text
+/// MessageData::Text(format!("Message from process {} (len={})", pid, len))
+/// ```
+///
+/// so the receiver got a synthetic string describing the message instead of the
+/// message, and the sender got `Ok(0)`.
+///
+/// Copying the payload is the easy part — `uaccess::copy_from_user` already
+/// exists. What blocks this is that there are **two unrelated id namespaces**:
+/// `syscall/entry.rs` passes the calling *thread's* id as the `ProcessId`, while
+/// `ipc::message::send_message` looks the sender up in `process::ProcessTable`,
+/// whose only entries are the three synthetic ones the boot self-test creates.
+/// A ring-3 caller is not in that table, so every send would fail
+/// `SenderNotFound` even with a real payload.
+///
+/// Reconciling those namespaces — one process table that `spawn` registers into,
+/// with the thread as a member of a process rather than a synonym for one — is
+/// the work. `kernel/src/ipc/` is ~85 KB of implemented queueing and capability
+/// machinery waiting on it.
 fn sys_send_message(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
-    let receiver_pid = args[0];
-    let _message_ptr = args[1];
-    let message_len = args[2];
-    
-    serial_println!("Process {} sending message to process {}: ptr=0x{:x}, len={}", 
-                   process_id.0, receiver_pid, _message_ptr, message_len);
-    
-    // Basic implementation using existing IPC system
-    if message_len > 4096 {
-        return Err(SyscallError::InvalidArgument);
-    }
-    
-    // Create a simple text message for demonstration
-    // In a real implementation, we would read the actual message data from user space
-    let message_data = crate::ipc::message::MessageData::Text(
-        alloc::format!("Message from process {} (len={})", process_id.0, message_len)
+    serial_println!(
+        "Process {} called send_message({}, 0x{:x}, {}): IPC needs one process-id namespace first",
+        process_id.0,
+        args[0],
+        args[1],
+        args[2]
     );
-    
-    let message = crate::ipc::message::create_message(
-        process_id,
-        ProcessId::new(receiver_pid as u32),
-        crate::ipc::message::MessageType::ServiceRequest,
-        message_data,
-    );
-    
-    match crate::ipc::message::send_message(message) {
-        Ok(()) => {
-            serial_println!("Process {} successfully sent message to process {}", 
-                           process_id.0, receiver_pid);
-            Ok(0)
-        }
-        Err(e) => {
-            serial_println!("Process {} failed to send message: {:?}", process_id.0, e);
-            Err(e.into())
-        }
-    }
+    Err(SyscallError::NotSupported)
 }
 
+/// `receive_message(timeout_ms)`
+///
+/// Not implemented, for the same reason as [`sys_send_message`]. This one did
+/// dequeue for real — and then returned only `message_id`, dropping the payload
+/// on the floor under a `// In a real implementation, we would copy the message
+/// data to user space`. A caller that got a message id had no way to read the
+/// message.
 fn sys_receive_message(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
-    let _timeout_ms = args[0];
-    
-    serial_println!("Process {} receiving message with timeout {}", process_id.0, _timeout_ms);
-    
-    // Basic implementation using existing IPC system
-    match crate::ipc::message::receive_message(process_id) {
-        Ok(message) => {
-            serial_println!("Process {} received message {} from process {}", 
-                           process_id.0, message.header.message_id.0, message.header.sender.0);
-            // Return the message ID for now
-            // In a real implementation, we would copy the message data to user space
-            Ok(message.header.message_id.0)
-        }
-        Err(e) => {
-            serial_println!("Process {} failed to receive message: {:?}", process_id.0, e);
-            Err(e.into())
-        }
-    }
+    serial_println!(
+        "Process {} called receive_message({}): IPC needs one process-id namespace first",
+        process_id.0,
+        args[0]
+    );
+    Err(SyscallError::NotSupported)
 }
 
 fn sys_reply_message(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
@@ -680,24 +833,65 @@ fn sys_sysinfo(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
     Err(SyscallError::NotSupported)
 }
 
-fn sys_time(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
-    let time_ptr = args[0];
-    
-    serial_println!("Process {} requesting time: buf=0x{:x}", process_id.0, time_ptr);
-    
-    // TODO: Implement time getting
-    // For now, return 0 (epoch time)
+/// `time()` -> seconds since the Unix epoch
+///
+/// Read from the CMOS RTC. It used to return `Ok(0)` under a TODO, which is a
+/// perfectly valid timestamp — midnight on 1 January 1970 — so a caller had no
+/// way to know the clock was fiction.
+fn sys_time(_process_id: ProcessId, _args: [u64; 6]) -> SyscallResult {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match crate::platform::rtc::unix_time() {
+            Some(secs) => Ok(secs),
+            None => Err(SyscallError::NotSupported),
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    Err(SyscallError::NotSupported)
+}
+
+/// Clock ids, matching Linux's for the two that exist here.
+const CLOCK_REALTIME: u64 = 0;
+const CLOCK_MONOTONIC: u64 = 1;
+
+/// `clock_gettime(clock_id, timespec_ptr)`
+///
+/// `CLOCK_MONOTONIC` comes from the PIT tick counter, which is the only clock
+/// this kernel has that is guaranteed to move forwards; `CLOCK_REALTIME` comes
+/// from the RTC and therefore has one-second resolution, which the nanoseconds
+/// field reports honestly as zero rather than interpolating.
+#[cfg(target_arch = "x86_64")]
+fn sys_clock_gettime(_process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
+    let clock_id = args[0];
+    let out = args[1];
+
+    let (secs, nanos) = match clock_id {
+        CLOCK_MONOTONIC => {
+            let ms = crate::interrupts::timer::uptime_ms();
+            (ms / 1000, (ms % 1000) * 1_000_000)
+        }
+        CLOCK_REALTIME => match crate::platform::rtc::unix_time() {
+            // No sub-second source behind the RTC, so nanoseconds is 0. Faking
+            // it from the tick counter would drift against the seconds field.
+            Some(secs) => (secs, 0),
+            None => return Err(SyscallError::NotSupported),
+        },
+        _ => return Err(SyscallError::InvalidArgument),
+    };
+
+    // struct timespec { i64 tv_sec; i64 tv_nsec; }
+    let mut buf = [0u8; 16];
+    buf[..8].copy_from_slice(&secs.to_le_bytes());
+    buf[8..].copy_from_slice(&nanos.to_le_bytes());
+
+    crate::syscall::uaccess::copy_to_user(out, &buf)
+        .map_err(|_| SyscallError::InvalidArgument)?;
+
     Ok(0)
 }
 
-fn sys_clock_gettime(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
-    let clock_id = args[0];
-    let timespec_ptr = args[1];
-    
-    serial_println!("Process {} requesting clock_gettime: clock={}, buf=0x{:x}", 
-                   process_id.0, clock_id, timespec_ptr);
-    
-    // TODO: Implement high-resolution time getting
+#[cfg(not(target_arch = "x86_64"))]
+fn sys_clock_gettime(_process_id: ProcessId, _args: [u64; 6]) -> SyscallResult {
     Err(SyscallError::NotSupported)
 }
 
@@ -748,28 +942,87 @@ fn sys_list_capabilities(process_id: ProcessId, args: [u64; 6]) -> SyscallResult
 }
 
 // Debug system calls (only in debug builds)
+/// `debug_print(ptr, len)`
+///
+/// Prints the caller's message. It used to print
+/// `DEBUG[1]: <message at 0x800abc>` — the *address* of the string, under a
+/// `// TODO: Read string from user space and print it` — and return `Ok(0)`. A
+/// debug facility that tells you it printed something it did not read is worse
+/// than no debug facility, because you spend the time doubting the program
+/// instead of the kernel.
 fn sys_debug_print(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
-    let message_ptr = args[0];
-    let message_len = args[1];
-    
-    serial_println!("Process {} debug print: ptr=0x{:x}, len={}", 
-                   process_id.0, message_ptr, message_len);
-    
-    // TODO: Read string from user space and print it
-    println!("DEBUG[{}]: <message at 0x{:x}>", process_id.0, message_ptr);
-    
+    const MAX_DEBUG_LEN: usize = 256;
+
+    let ptr = args[0];
+    let len = args[1] as usize;
+
+    if len == 0 || len > MAX_DEBUG_LEN {
+        return Err(SyscallError::InvalidArgument);
+    }
+
+    let mut buf = [0u8; MAX_DEBUG_LEN];
+    crate::syscall::uaccess::copy_from_user(ptr, &mut buf[..len])
+        .map_err(|_| SyscallError::InvalidArgument)?;
+
+    match core::str::from_utf8(&buf[..len]) {
+        Ok(text) => {
+            serial_println!("DEBUG[{}]: {}", process_id.0, text);
+            Ok(len as u64)
+        }
+        Err(_) => Err(SyscallError::InvalidArgument),
+    }
+}
+
+/// What `debug_dump` will report.
+const DUMP_MEMORY: u64 = 0;
+const DUMP_THREADS: u64 = 1;
+const DUMP_SYSCALLS: u64 = 2;
+const DUMP_FILES: u64 = 3;
+
+/// `debug_dump(what)`
+///
+/// Dumps real kernel state to the serial log. It used to print
+/// `DEBUG DUMP[1]: type 0` and return `Ok(0)`, having dumped nothing.
+///
+/// Everything it reports is already available to the in-kernel console; the
+/// point of the syscall is that a ring-3 program can ask for it when something
+/// has gone wrong from its side.
+#[cfg(target_arch = "x86_64")]
+fn sys_debug_dump(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
+    let what = args[0];
+
+    match what {
+        DUMP_MEMORY => {
+            serial_println!("DUMP[{}] physical memory:", process_id.0);
+            crate::memory::physical::print_memory_stats();
+            crate::memory::heap::print_heap_stats();
+        }
+        DUMP_THREADS => {
+            serial_println!("DUMP[{}] threads:", process_id.0);
+            crate::task::print_threads();
+        }
+        DUMP_SYSCALLS => {
+            serial_println!(
+                "DUMP[{}] {} syscalls serviced since boot",
+                process_id.0,
+                crate::syscall::entry::syscall_count()
+            );
+        }
+        DUMP_FILES => {
+            serial_println!("DUMP[{}] {} open file(s):", process_id.0, crate::syscall::files::open_count());
+            crate::syscall::files::describe_open(|fd, path, size, offset| {
+                serial_println!("  fd {} {} ({} bytes, at {})", fd, path, size, offset);
+            });
+        }
+        _ => return Err(SyscallError::InvalidArgument),
+    }
+
     Ok(0)
 }
 
-fn sys_debug_dump(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
-    let dump_type = args[0];
-    
-    serial_println!("Process {} debug dump: type={}", process_id.0, dump_type);
-    
-    // TODO: Implement various debug dumps (memory, processes, etc.)
-    println!("DEBUG DUMP[{}]: type {}", process_id.0, dump_type);
-    
-    Ok(0)
+#[cfg(not(target_arch = "x86_64"))]
+fn sys_debug_dump(_process_id: ProcessId, _args: [u64; 6]) -> SyscallResult {
+    Err(SyscallError::NotSupported)
 }
 
 #[cfg(test)]

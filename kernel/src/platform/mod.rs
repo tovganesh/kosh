@@ -7,6 +7,8 @@
 use core::fmt;
 
 pub mod traits;
+#[cfg(target_arch = "x86_64")]
+pub mod rtc;
 pub mod x86_64;
 pub mod aarch64;
 

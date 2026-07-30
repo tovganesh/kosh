@@ -68,11 +68,17 @@ pub const SYS_REVOKE_CAPABILITY: u64 = 61;
 pub const SYS_CHECK_CAPABILITY: u64 = 62;
 pub const SYS_LIST_CAPABILITIES: u64 = 63;
 
-/// Debug and testing system calls (only available in debug builds)
-// Deliberately NOT cfg(debug_assertions): userspace calls this unconditionally
-// (see userspace/shell/src/output.rs), and having the number vanish from
-// release kernels is exactly the kind of silent difference that hides bugs
-// until the release build is the one that matters.
+/// Debug and testing system calls.
+//
+// Deliberately NOT cfg(debug_assertions): a syscall number that exists in debug
+// builds and vanishes in release is exactly the kind of silent difference that
+// hides bugs until the release build is the one that matters.
+//
+// (An earlier version of this comment cited `userspace/shell/src/output.rs` as a
+// caller. That file was deleted two phases ago along with the rest of the shell's
+// fake service layer. The reasoning still holds on its own — SYS_GETDENTS, which
+// ksh does call, is above the old release-only limit of 63 — but the citation was
+// stale, which is its own small lesson about comments that name files.)
 pub const SYS_DEBUG_PRINT: u64 = 100;
 pub const SYS_DEBUG_DUMP: u64 = 101;
 

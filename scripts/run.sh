@@ -251,6 +251,11 @@ check)
         "hello from a loaded ELF binary" \
         ".bss was zeroed correctly" \
         "stack is writable and readable" \
+        "mmap gave me 8192 usable bytes" \
+        "munmap returned the pages" \
+        "CLOCK_MONOTONIC moves forwards" \
+        "debug_print echoed my message" \
+        "seconds since the epoch" \
         "ELF loader: PASS" \
         "Storage: PASS" \
         "Filesystem: PASS" \
@@ -330,6 +335,7 @@ check-cli)
         # --- the userspace shell, in ring 3 ---
         type_line "help"
         type_line "getpid"
+        type_line "date"
         type_line "pwd"
         type_line "ls"
         type_line "cat hello.txt"
@@ -396,6 +402,7 @@ check-cli)
         "NOTES.TXT" \
         "hello from ring 3 shell" \
         "type  file" \
+        " UTC" \
         "cat: /nope.txt: no such file" \
         "nosuchcommand: command not found" \
         "spawn 'hello': thread" \

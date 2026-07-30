@@ -1164,6 +1164,110 @@ up until the first ring-3 demo ran. It gets its own address space now, like
 everything else, and the two demos share a stack address instead of being handed
 regions a megabyte apart.
 
+## Telling the truth about the syscall surface (Phase 13)
+
+An audit of every syscall against what its handler actually does turned up **six
+that reported success for work they had not done**. That is the specific failure
+mode this whole series has been unwinding, and it was still present in the ABI.
+
+| syscall | what it did | now |
+|---|---|---|
+| `mmap` | returned the constant `0x40000000` and logged "mmap successful" | allocates and maps real pages |
+| `debug_print` | printed the *address* of the string under a `// TODO: Read string from user space` | prints the message |
+| `debug_dump` | printed `DEBUG DUMP[1]: type 0` and dumped nothing | dumps memory, threads, syscall count or open files |
+| `time` | returned `Ok(0)` — a valid timestamp, 1 Jan 1970 | reads the CMOS RTC |
+| `getppid` | returned `Ok(0)` under a TODO, indistinguishable from "no parent" | `NotSupported` |
+| `send_message` | substituted a synthetic string for the caller's payload | `NotSupported` |
+| `receive_message` | dequeued for real, then dropped the payload | `NotSupported` |
+
+`mmap` is the clearest case. It validated `length`, built a `MemoryProtection`
+struct, threw it away, and returned a hardcoded address — then logged
+`mmap successful: mapped at 0x40000000`. A caller that wrote to the pointer took
+a page fault, having been told the mapping existed.
+
+### mmap, for real
+
+Per-process address spaces are what made this easy: the pages go into the calling
+process's own tables, so there is no shared region to arbitrate. Anonymous
+private mappings only, in a 256 MiB window at `0x10000000`, with W^X enforced —
+a request for write+execute is refused rather than quietly granted.
+
+Address selection is a linear scan of the process's own page tables for a hole,
+rather than a bump pointer. A bump pointer would need somewhere per-process to
+live and would leak address space across `munmap`.
+
+`munmap` works too, and refuses anything outside the mmap window: letting a
+process unmap its own `.text` turns a userspace bug into an unexplainable fault.
+
+### A bug the test found immediately
+
+The first version discriminated file-backed mappings on `fd`:
+
+```rust
+if args[4] >= 0 { return Err(NotSupported); }   // wrong
+```
+
+`args[4]` arrives in **R8**, and a caller using a three-argument syscall wrapper
+never sets R8 — so the check read whatever was left in that register and refused
+every mapping. `hello` printed `WARNING: mmap failed` on the first run.
+
+The fix is to discriminate on `MAP_ANONYMOUS`, a flag the caller definitely
+passed. The general lesson is worth stating: **a syscall must not read an
+argument the ABI does not require the caller to set.** There is no way to tell a
+deliberate zero from a stale register.
+
+### The RTC
+
+`platform/rtc.rs`, and the two things that make it more than a port read:
+
+The RTC updates its registers once a second, and a read part-way through an
+update returns a mix of old and new fields — 10:59:59 can read as 11:59:59. So it
+waits for the update-in-progress flag, reads everything, reads everything again,
+and only accepts values the two agree on. The wait is bounded, because a machine
+with no RTC leaves that flag set forever and hanging the kernel on `time()` would
+be worse than having no clock.
+
+Status register B says whether the values are BCD or binary, and whether the hour
+is 12- or 24-hour. Both are checked rather than assumed: a kernel that assumes
+BCD on a binary RTC reports plausible-looking nonsense.
+
+Verified against the host: the kernel logged 1785411504 while `date -u +%s` on
+the host said 1785411523, and the difference is the boot delay.
+
+### Why the IPC calls became errors instead of working
+
+Copying the payload is the easy part; `uaccess::copy_from_user` already exists.
+The blocker is that there are **two unrelated id namespaces**. `syscall/entry.rs`
+passes the calling *thread's* id as a `ProcessId`, while
+`ipc::message::send_message` looks the sender up in `process::ProcessTable`, whose
+only entries are the three synthetic ones the boot self-test creates. A ring-3
+caller is not in that table, so every send would fail `SenderNotFound` even with
+a real payload.
+
+Making `send_message` copy the buffer would have turned a fabrication into a
+different fabrication. One process table that `spawn` registers into — with a
+thread as a *member* of a process rather than a synonym for one — is the actual
+work, and `kernel/src/ipc/` is ~85 KB of implemented queueing and capability
+machinery waiting on it.
+
+### Testing
+
+`hello` gained the new calls, so each is exercised from ring 3 rather than by the
+kernel checking itself:
+
+```
+hello from a loaded ELF binary
+  mmap gave me 8192 usable bytes at 0x0000000010000000
+  munmap returned the pages
+  CLOCK_MONOTONIC moves forwards
+DEBUG[1]: hello reached the kernel log through debug_print
+  debug_print echoed my message
+```
+
+It writes to the first and last word of the mapping and reads both back, so a
+mapping that is present but wrong fails rather than passing. `ksh` gained `date`,
+which is the RTC end to end: RTC → `sys_time` → ring 3 → civil date.
+
 ## What is deliberately still missing
 - **The filesystem is read-only.** Allocating clusters and keeping both FAT
   copies consistent is a separate problem, and a read-only filesystem that is
@@ -1185,6 +1289,9 @@ regions a megabyte apart.
 - **The descriptor table is still global.** One table for the system, because
   `Program` has nowhere to hang a per-process one yet. `sys_exit` works around
   it by only closing everything when it is the last program running.
+- **No IPC or capabilities from ring 3.** Both subsystems are implemented
+  in-kernel and unreachable, waiting on a single process-id namespace — see
+  Phase 13 above.
 - **No pipes or background jobs.** `ksh` parses them; running them needs two
   programs connected by a shared descriptor, which needs per-process descriptor
   tables. The table is currently global — see the note in `sys_exit`.

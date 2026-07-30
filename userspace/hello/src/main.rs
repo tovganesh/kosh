@@ -20,7 +20,22 @@ use core::panic::PanicInfo;
 
 const SYS_EXIT: u64 = 1;
 const SYS_GETPID: u64 = 5;
+const SYS_MMAP: u64 = 10;
+const SYS_MUNMAP: u64 = 11;
 const SYS_WRITE: u64 = 23;
+const SYS_CLOCK_GETTIME: u64 = 53;
+const SYS_DEBUG_PRINT: u64 = 100;
+
+/// mmap protection bits, as the kernel reads them.
+const PROT_READ: u64 = 0x1;
+const PROT_WRITE: u64 = 0x2;
+
+/// mmap flags. `MAP_ANONYMOUS` is not optional: the kernel discriminates on it
+/// rather than on `fd`, because `fd` lives in R8 and `syscall3` never sets it.
+const MAP_PRIVATE: u64 = 0x02;
+const MAP_ANONYMOUS: u64 = 0x20;
+
+const CLOCK_MONOTONIC: u64 = 1;
 
 /// Zero-initialised, so it occupies no space in the file. If the loader forgets
 /// to zero the gap between `p_filesz` and `p_memsz`, this reads as garbage.
@@ -43,12 +58,54 @@ unsafe fn syscall3(number: u64, a1: u64, a2: u64, a3: u64) -> i64 {
     ret
 }
 
+#[inline(always)]
+unsafe fn syscall4(number: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 {
+    let ret: i64;
+    core::arch::asm!(
+        "syscall",
+        inlateout("rax") number => ret,
+        in("rdi") a1,
+        in("rsi") a2,
+        in("rdx") a3,
+        // Argument four is in R10, not RCX: `syscall` destroys RCX.
+        in("r10") a4,
+        lateout("rcx") _,
+        lateout("r11") _,
+        options(nostack)
+    );
+    ret
+}
+
 fn write(fd: u64, bytes: &[u8]) -> i64 {
     unsafe { syscall3(SYS_WRITE, fd, bytes.as_ptr() as u64, bytes.len() as u64) }
 }
 
 fn getpid() -> i64 {
     unsafe { syscall3(SYS_GETPID, 0, 0, 0) }
+}
+
+fn mmap(length: u64, prot: u64) -> i64 {
+    // addr = 0: let the kernel choose.
+    unsafe { syscall4(SYS_MMAP, 0, length, prot, MAP_PRIVATE | MAP_ANONYMOUS) }
+}
+
+fn munmap(addr: u64, length: u64) -> i64 {
+    unsafe { syscall3(SYS_MUNMAP, addr, length, 0) }
+}
+
+fn clock_gettime(clock: u64, out: &mut [u64; 2]) -> i64 {
+    unsafe { syscall3(SYS_CLOCK_GETTIME, clock, out.as_mut_ptr() as u64, 0) }
+}
+
+fn debug_print(message: &str) -> i64 {
+    unsafe {
+        syscall3(
+            SYS_DEBUG_PRINT,
+            message.as_ptr() as u64,
+            message.len() as u64,
+            0,
+        )
+    }
 }
 
 fn exit(code: u64) -> ! {
@@ -152,8 +209,83 @@ pub extern "C" fn kosh_main() -> ! {
         print("  WARNING: stack check failed\n");
     }
 
+    // mmap: memory the program was not given at load time. Until this release
+    // `mmap` returned the constant 0x40000000 and reported success, so writing
+    // to the result faulted.
+    let mapped = mmap(8192, PROT_READ | PROT_WRITE);
+    if mapped < 0 {
+        print("  WARNING: mmap failed\n");
+    } else {
+        let p = mapped as u64 as *mut u64;
+        unsafe {
+            core::ptr::write_volatile(p, 0x1234_5678_9abc_def0);
+            core::ptr::write_volatile(p.add(1023), 0x0fed_cba9_8765_4321);
+        }
+        let ok = unsafe {
+            core::ptr::read_volatile(p) == 0x1234_5678_9abc_def0
+                && core::ptr::read_volatile(p.add(1023)) == 0x0fed_cba9_8765_4321
+        };
+        if ok {
+            print("  mmap gave me 8192 usable bytes at 0x");
+            print_hex(mapped as u64);
+            print("\n");
+        } else {
+            print("  WARNING: mmap memory did not hold its contents\n");
+        }
+
+        if munmap(mapped as u64, 8192) < 0 {
+            print("  WARNING: munmap failed\n");
+        } else {
+            print("  munmap returned the pages\n");
+        }
+    }
+
+    // A clock that moves. CLOCK_MONOTONIC comes from the PIT, so two reads
+    // either side of some work must not go backwards.
+    let mut first = [0u64; 2];
+    let mut second = [0u64; 2];
+    if clock_gettime(CLOCK_MONOTONIC, &mut first) == 0 {
+        let mut spin = 0u64;
+        for i in 0..2_000_000u64 {
+            spin = spin.wrapping_add(i);
+        }
+        core::hint::black_box(spin);
+        if clock_gettime(CLOCK_MONOTONIC, &mut second) == 0 {
+            let a = first[0] * 1_000_000_000 + first[1];
+            let b = second[0] * 1_000_000_000 + second[1];
+            if b >= a {
+                print("  CLOCK_MONOTONIC moves forwards\n");
+            } else {
+                print("  WARNING: CLOCK_MONOTONIC went backwards\n");
+            }
+        } else {
+            print("  WARNING: second clock_gettime failed\n");
+        }
+    } else {
+        print("  WARNING: clock_gettime failed\n");
+    }
+
+    // debug_print used to log the *address* of this string.
+    if debug_print("hello reached the kernel log through debug_print") < 0 {
+        print("  WARNING: debug_print failed\n");
+    } else {
+        print("  debug_print echoed my message\n");
+    }
+
     print("  exiting cleanly\n");
     exit(0)
+}
+
+fn print_hex(mut value: u64) {
+    let mut buf = [0u8; 16];
+    for i in (0..16).rev() {
+        buf[i] = match (value & 0xF) as u8 {
+            d @ 0..=9 => b'0' + d,
+            d => b'a' + (d - 10),
+        };
+        value >>= 4;
+    }
+    write(1, &buf);
 }
 
 #[panic_handler]

@@ -21,6 +21,7 @@ pub const SYS_READ: u64 = 22;
 pub const SYS_WRITE: u64 = 23;
 pub const SYS_LSEEK: u64 = 24;
 pub const SYS_STAT: u64 = 25;
+pub const SYS_TIME: u64 = 52;
 pub const SYS_GETDENTS: u64 = 70;
 
 pub const STDIN: u64 = 0;
@@ -118,6 +119,11 @@ pub fn stat(path: &str, out: &mut RawDirEntry) -> i64 {
     }
 }
 
+/// Seconds since the Unix epoch, from the CMOS RTC. Negative on failure.
+pub fn time() -> i64 {
+    unsafe { syscall(SYS_TIME, 0, 0, 0, 0) }
+}
+
 pub fn getpid() -> i64 {
     unsafe { syscall(SYS_GETPID, 0, 0, 0, 0) }
 }
@@ -133,8 +139,10 @@ pub const ENOENT: i64 = -2;
 
 /// Load a program by name and run it on its own task. Returns the task id.
 ///
-/// Not `fork`/`exec` — the kernel has one address space, so there is nothing to
-/// duplicate. The name is a boot-module name, not a filesystem path.
+/// Not `fork`/`exec`: the child starts from an ELF rather than as a copy of the
+/// caller. It does get its own address space, so it can be — and `hello` is —
+/// linked at the same address as this shell. The name is a boot-module name, not
+/// a filesystem path.
 pub fn spawn(name: &str) -> i64 {
     unsafe { syscall(SYS_SPAWN, name.as_ptr() as u64, name.len() as u64, 0, 0) }
 }
