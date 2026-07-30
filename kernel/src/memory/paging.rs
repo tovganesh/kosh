@@ -99,21 +99,6 @@ unsafe impl FrameAllocator<Size4KiB> for KoshFrameAllocator {
     }
 }
 
-/// True once `init` has switched CR3 and the physmap covers all of RAM.
-///
-/// There used to be a `phys_to_virt` here that consulted this and returned
-/// either the physical address unchanged (identity map) or `PHYSMAP_BASE + phys`.
-/// It had no callers, and the higher-half migration is what made it a trap
-/// rather than a convenience: "the kernel-virtual address of this frame" now has
-/// two right answers depending on *when* you ask, and hiding that behind one
-/// function invites using the wrong one. Call [`kernel_virt`] before `init` and
-/// add [`PHYSMAP_BASE`] after it, deliberately.
-static PHYSMAP_ACTIVE: Mutex<bool> = Mutex::new(false);
-
-/// Whether the physmap covers all of physical memory yet.
-pub fn physmap_active() -> bool {
-    *PHYSMAP_ACTIVE.lock()
-}
 
 /// How much physical memory `init` actually mapped into the kernel window.
 ///
@@ -125,6 +110,47 @@ static KERNEL_WINDOW_END: Mutex<u64> = Mutex::new(0);
 pub fn kernel_window_end() -> u64 {
     *KERNEL_WINDOW_END.lock()
 }
+
+/// The PML4 `init` built. Every user address space starts as a copy of its
+/// higher half.
+static KERNEL_PML4: Mutex<u64> = Mutex::new(0);
+
+pub fn kernel_pml4_phys() -> u64 {
+    *KERNEL_PML4.lock()
+}
+
+/// First PML4 index belonging to the kernel.
+///
+/// Entries 0..256 are the lower canonical half and belong entirely to whichever
+/// process is running; 256..512 are the kernel's and are shared by every address
+/// space. The split is the whole reason the higher-half migration happened.
+pub const KERNEL_PML4_FIRST: usize = 256;
+
+/// Borrow an arbitrary PML4 as a mapper, whatever CR3 currently holds.
+///
+/// This is what lets one process load a program into *another* process's
+/// address space — `sys_spawn` runs in the parent and has to populate the
+/// child. It works because the physmap is in the shared higher half, so every
+/// address space can reach every physical frame, including another space's
+/// page tables.
+///
+/// # Safety
+/// `pml4_phys` must be a live PML4, and the caller must not hold two aliasing
+/// mappers over it.
+pub unsafe fn mapper_for(pml4_phys: u64) -> OffsetPageTable<'static> {
+    let table: &'static mut PageTable = &mut *((PHYSMAP_BASE + pml4_phys) as *mut PageTable);
+    OffsetPageTable::new(table, VirtAddr::new(PHYSMAP_BASE))
+}
+
+/// Marks a leaf mapping whose frame belongs to the address space and must be
+/// freed when it is torn down.
+///
+/// `map_user_pages` allocates fresh frames and sets this; `map_user_range` maps
+/// frames it does not own — the `.user` blob lives inside the kernel image — and
+/// does not. Without the distinction, tearing down an address space that had run
+/// the built-in payload would hand the kernel's own text back to the frame
+/// allocator.
+pub const OWNED_BY_ADDRESS_SPACE: PageTableFlags = PageTableFlags::BIT_9;
 
 /// Build the kernel's own page tables and install them.
 ///
@@ -187,8 +213,8 @@ pub fn init(phys_mem_end: u64) -> Result<(), &'static str> {
         );
     }
 
-    *PHYSMAP_ACTIVE.lock() = true;
     *KERNEL_WINDOW_END.lock() = window_end;
+    *KERNEL_PML4.lock() = pml4_phys;
 
     serial_println!("  CR3 -> 0x{:x} (kernel page tables active)", pml4_phys);
     serial_println!(
@@ -422,7 +448,18 @@ pub fn map_user_range(
     pages: usize,
     flags: PageTableFlags,
 ) -> Result<(), &'static str> {
-    let mut mapper = unsafe { active_mapper() };
+    map_user_range_in(unsafe { active_mapper() }, virt, phys, pages, flags)
+}
+
+/// As [`map_user_range`], but into a named address space rather than the live
+/// one. The frames are borrowed, not owned — see [`OWNED_BY_ADDRESS_SPACE`].
+pub fn map_user_range_in(
+    mut mapper: OffsetPageTable<'static>,
+    virt: u64,
+    phys: u64,
+    pages: usize,
+    flags: PageTableFlags,
+) -> Result<(), &'static str> {
     let mut frames = KoshFrameAllocator;
 
     let table_flags =
@@ -451,8 +488,21 @@ pub fn map_user_pages(
     pages: usize,
     flags: PageTableFlags,
 ) -> Result<(), &'static str> {
-    let mut mapper = unsafe { active_mapper() };
+    map_user_pages_in(unsafe { active_mapper() }, virt, pages, flags)
+}
+
+/// As [`map_user_pages`], but into a named address space.
+///
+/// The frames are freshly allocated, so the leaf entries are tagged
+/// [`OWNED_BY_ADDRESS_SPACE`] and tearing the space down returns them.
+pub fn map_user_pages_in(
+    mut mapper: OffsetPageTable<'static>,
+    virt: u64,
+    pages: usize,
+    flags: PageTableFlags,
+) -> Result<(), &'static str> {
     let mut frames = KoshFrameAllocator;
+    let flags = flags | OWNED_BY_ADDRESS_SPACE;
 
     let table_flags =
         PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
@@ -487,23 +537,24 @@ pub fn map_user_pages(
     Ok(())
 }
 
-/// Unmap `pages` user pages at `virt` and return their frames to the allocator.
+/// Unmap `pages` user pages in a named address space and free their frames.
 ///
-/// The counterpart to [`map_user_pages`], and the reason a program can be run
-/// twice. Without it, the second `spawn` of the same binary failed in
-/// `map_to_with_table_flags` with `PageAlreadyMapped` — after the loader had
-/// already allocated a frame for that page, so each attempt also leaked one.
+/// Kept as the surgical counterpart to [`map_user_pages_in`]. Whole-process
+/// teardown does not come through here any more — `AddressSpace::free` walks the
+/// lower half and frees everything tagged [`OWNED_BY_ADDRESS_SPACE`], which is
+/// both cheaper and, unlike a recorded list of ranges, cannot go out of date.
 ///
 /// Returns how many pages were actually unmapped; a page that was not mapped is
-/// skipped rather than treated as an error, so tearing down a partially-loaded
-/// image is safe.
+/// skipped rather than treated as an error.
 ///
 /// # Safety
-/// Nothing may still be using these addresses. In particular the caller must not
-/// be running *on* them — which is why teardown happens from the reaping thread,
-/// not from the exiting one.
-pub unsafe fn unmap_user_pages(virt: u64, pages: usize) -> usize {
-    let mut mapper = active_mapper();
+/// Nothing may still be using these addresses.
+#[allow(dead_code)]
+pub unsafe fn unmap_user_pages_in(
+    mut mapper: OffsetPageTable<'static>,
+    virt: u64,
+    pages: usize,
+) -> usize {
     let mut freed = 0;
 
     for i in 0..pages {
@@ -518,9 +569,7 @@ pub unsafe fn unmap_user_pages(virt: u64, pages: usize) -> usize {
                 ));
                 freed += 1;
             }
-            Err(_) => {
-                // Already absent. Nothing to free, nothing to complain about.
-            }
+            Err(_) => {}
         }
     }
 
@@ -543,6 +592,17 @@ pub unsafe fn active_mapper() -> OffsetPageTable<'static> {
 pub fn translate(virt: u64) -> Option<u64> {
     use x86_64::structures::paging::Translate;
     let mapper = unsafe { active_mapper() };
+    mapper.translate_addr(VirtAddr::new(virt)).map(|p| p.as_u64())
+}
+
+/// Translate an address in a *named* address space rather than the live one.
+///
+/// The ELF loader needs this: it runs in the parent's address space and writes
+/// segment bytes into the child's, so "which frame is this vaddr" has to be
+/// asked of the child's tables.
+pub fn translate_in(pml4_phys: u64, virt: u64) -> Option<u64> {
+    use x86_64::structures::paging::Translate;
+    let mapper = unsafe { mapper_for(pml4_phys) };
     mapper.translate_addr(VirtAddr::new(virt)).map(|p| p.as_u64())
 }
 

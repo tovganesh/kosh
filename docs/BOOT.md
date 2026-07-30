@@ -1042,6 +1042,128 @@ reports what the page tables actually contain:
 `KERNEL_CODE_START` finally being right is not a coincidence — the migration
 moved the kernel to the address that constant had been claiming all along.
 
+## Per-process address spaces (Phase 12)
+
+Phase 11 got the kernel out of PML4[0]. This puts a process in it.
+
+An address space is a PML4 of its own: entries 0..256 — the whole lower half —
+are the process's alone, and 256..512 are copied from the kernel's table at
+creation. It copies the *entries*, not the tables under them, so every process
+walks the same PDPTs for the physmap, the heap window and the kernel image. That
+is what makes it safe for a syscall to allocate: a page added to the kernel heap
+after a process was created is already visible to it.
+
+```
+  0x10000000 -> frame 0x5a4000 in one space, 0x5a8000 in the other
+  same address 0x10000000: 0xaaaaaaaaaaaaaaaa in one space, 0xbbbbbbbbbbbbbbbb in the other
+  Address spaces: PASS — 3 kernel PML4 entries shared, lower half private
+```
+
+Three entries: 256 (physmap), 288 (heap), 511 (kernel image). The copy happens
+once, at creation, so a *new* top-level kernel entry appearing later would be
+invisible to processes that already exist — a syscall would fault on a valid
+kernel address, intermittently, depending on which process was running. Nothing
+creates one; `check_kernel_half` says so rather than assuming it.
+
+### Switching
+
+`task::schedule` reloads CR3 when the incoming thread lives somewhere else. It
+can do that in the middle of the scheduler only because everything it touches
+from that instruction until the incoming thread is running — RIP, RSP, the
+scheduler's statics, the GDT, the IDT, the per-CPU block — is in the shared upper
+half. That was not true one phase ago, which is why this could not be written
+until now.
+
+CR3 is compared before being written, because writing it flushes the TLB and
+most switches here are between kernel threads.
+
+### Teardown, and the order that matters
+
+`exit_current` returns CR3 to the kernel's tables **first**, then frees the
+space. The other order hands the frame holding the live top-level table to the
+allocator, and the next allocation overwrites the address space out from under
+the CPU walking it.
+
+Freeing walks the lower half and returns every page table it visits — but a leaf
+frame only if the entry carries `OWNED_BY_ADDRESS_SPACE`. `map_user_pages_in`
+allocates fresh frames and sets that bit; `map_user_range_in` maps frames the
+space does not own and does not. The distinction is not theoretical: the built-in
+ring-3 payload lives inside the kernel image and is mapped straight into user
+space, so an untagged teardown would hand the kernel's own `.user` section to the
+frame allocator.
+
+```
+  address space of thread 3 released: 98 frame(s)
+```
+
+### What this deletes
+
+The interesting part of the diff is the removals.
+
+| gone | why it existed |
+|---|---|
+| the `Resident` address-range table | to refuse a `spawn` whose image overlapped a resident one |
+| `elf::extent_of` | to answer "where would this go" before mapping it |
+| `LoadedImage::ranges`, `MappedRange`, `MAX_SEGMENTS`, `TooManySegments` | so somebody could unmap exactly what the loader had mapped |
+| `SpawnError::AddressConflict` | there is nothing left to conflict with |
+| `paging::unmap_user_pages` (whole-process form) | teardown walks the tables instead |
+| `SPAWN_STACK_REGION_TOP`, `ELF_USER_STACK_TOP`, `SHELL_USER_STACK_TOP`, the per-slot 1 MiB stack stride | to keep programs' stacks from colliding |
+
+All of it was bookkeeping around a shared lower half. Every program now loads at
+its own `p_vaddr` and gets a stack at one `USER_STACK_TOP`.
+
+### Two programs at one address
+
+`userspace/hello/user.ld` is now `. = 0x800000` — the same address as `ksh`. That
+is deliberate, and it is the test: `ksh` executing at 0x800000 spawns `hello`,
+which is also linked at 0x800000, twice in the scripted session.
+
+`ksh` can also spawn `ksh`:
+
+```
+ksh:/$ ksh
+Loading 'ksh' into a new address space:
+  segment: vaddr 0x800000 filesz 39813 memsz 39813 [r-x] -> 10 page(s)
+spawn 'ksh': thread 3, entry 0x800000
+
+ksh: the Kosh shell, in ring 3. Type 'help'.
+ksh:/$ getpid
+pid 3
+ksh:/$ exit
+  address space of thread 3 released: 98 frame(s)
+ksh:/$ getpid
+pid 2
+```
+
+Two shells, both executing at 0x800000, one nested inside the other. The previous
+phase refused this with `error -98` because a second copy would have overwritten
+the `.text` the first one was running.
+
+### Proving it can fail
+
+`address_space::self_test` maps one page at the same user virtual address in two
+spaces, writes a different value into each through the physmap, then activates
+each in turn and reads that address.
+
+Pointing both maps at the *same* space — which is what the kernel did until now —
+produces:
+
+```
+  Address spaces: FAIL — could not map the probe page: failed to map user page
+```
+
+`PageAlreadyMapped`, which is exactly the error `spawn` used to pre-empt with its
+overlap check.
+
+### One inconsistency this surfaced
+
+`run_user_demo` — the built-in payload — mapped its code and stack into the
+*kernel's* PML4[0] and left them there. That quietly contradicted the previous
+phase's "PML4[0] is empty, reserved for user address spaces": it was empty right
+up until the first ring-3 demo ran. It gets its own address space now, like
+everything else, and the two demos share a stack address instead of being handed
+regions a megabyte apart.
+
 ## What is deliberately still missing
 - **The filesystem is read-only.** Allocating clusters and keeping both FAT
   copies consistent is a separate problem, and a read-only filesystem that is
@@ -1054,12 +1176,15 @@ moved the kernel to the address that constant had been claiming all along.
 - **No `fork`/`exec`.** `spawn` loads a *second* program rather than duplicating
   the caller, so there is still no way for a program to replace its own image or
   to inherit one. `userspace/init` cannot do its job until `fork` exists.
-- **One address space, still.** The kernel is out of PML4[0], which is the
-  precondition for per-process address spaces — but nothing yet gives a process
-  its own PML4. Loaded programs share one set of tables and are protected by
-  page permissions, not separation, which is why every userspace program is
-  linked at a distinct fixed address (`userspace/*/user.ld`) and why `spawn`
-  refuses an image overlapping one already resident.
+- **No `fork`.** Every process starts from an ELF. Duplicating a *running*
+  address space needs the page tables copied and every writable page marked
+  copy-on-write, plus a `#PF` handler that does the copying — none of which
+  exists. The address space is now the right shape for it.
+- **No demand paging.** Every page of a program is allocated and populated at
+  load time, so a 256 KiB `.bss` costs 65 frames whether or not it is touched.
+- **The descriptor table is still global.** One table for the system, because
+  `Program` has nowhere to hang a per-process one yet. `sys_exit` works around
+  it by only closing everything when it is the last program running.
 - **No pipes or background jobs.** `ksh` parses them; running them needs two
   programs connected by a shared descriptor, which needs per-process descriptor
   tables. The table is currently global — see the note in `sys_exit`.

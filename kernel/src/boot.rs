@@ -758,6 +758,8 @@ fn init_storage_selftest() {
 #[cfg(target_arch = "x86_64")]
 fn init_usermode() {
     crate::syscall::uaccess::self_test();
+    crate::memory::address_space::self_test();
+    serial_println!();
 
     let before = crate::syscall::entry::syscall_count();
 

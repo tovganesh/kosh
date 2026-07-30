@@ -237,6 +237,7 @@ check)
         "physmap aliases identity map: OK" \
         "page 0 unmapped: OK" \
         "kernel out of PML4[0]: OK" \
+        "Address spaces: PASS" \
         "PASS: heap fully reclaimed" \
         "Scheduler: PASS" \
         "hello from ring 3" \
@@ -348,10 +349,14 @@ check-cli)
         # of the first one's mappings.
         type_line "hello"
         type_line "hello"
-        # One address space, so a program cannot be loaded on top of one that is
-        # already resident. Spawning ksh from ksh has to be refused, not
-        # attempted — it would overwrite the .text currently executing.
+        # ksh inside ksh. This was *refused* until per-process address spaces:
+        # both are linked at 8 MiB, so a second copy in one address space would
+        # have overwritten the .text the first one was executing. Now each has
+        # its own PML4 and the same address means different memory.
         type_line "ksh"
+        type_line "getpid"
+        type_line "exit"
+        type_line "getpid"
         # The shell must refuse redirection rather than silently dropping it.
         type_line "echo a > out.txt"
         # QEMU's sendkey cannot produce a '|' through this keyboard layout, so
@@ -396,8 +401,9 @@ check-cli)
         "spawn 'hello': thread" \
         "hello from a loaded ELF binary" \
         "released 'hello'" \
-        "overlaps resident 'ksh'" \
-        "ksh: could not start (error -98)" \
+        "Loading 'ksh' into a new address space" \
+        "spawn 'ksh': thread" \
+        "address space of thread" \
         "redirection needs a writable filesystem" \
         "pipe yes" \
         "redirect out" \

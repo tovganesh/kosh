@@ -1,5 +1,9 @@
-/* Link ksh at 8 MiB — clear of the kernel's low identity window and of
- * userspace/hello at 4 MiB, so the two are easy to tell apart in a fault dump.
+/* Link ksh at 8 MiB.
+ *
+ * `userspace/hello` is linked at the same address on purpose — see the comment
+ * in its own `user.ld`. Two programs at one address is a thing per-process page
+ * tables make unremarkable and a shared address space made impossible.
+ *
  * The ELF loader honours p_vaddr, so this is where it genuinely runs.
  */
 

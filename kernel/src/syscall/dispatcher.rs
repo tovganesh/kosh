@@ -246,10 +246,11 @@ fn sys_exec(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
 
 /// `spawn(path, path_len)` -> task id
 ///
-/// Deliberately not called `exec`: `exec` replaces the calling image, and
-/// `fork`+`exec` needs two address spaces. This loads a *second* program into
-/// the one address space that exists and runs it on its own thread — which is
-/// enough for a shell to launch a program, and honest about what it is.
+/// Still not called `exec` — `exec` replaces the *calling* image, and nothing
+/// here does that. But it is no longer "a second program in the one address
+/// space that exists": the child gets a PML4 of its own, so it can be linked at
+/// the same address as its parent, and the overlap check that used to refuse
+/// `ksh` spawning `ksh` is gone along with the reason for it.
 ///
 /// `path` names a boot module (`module2 /boot/hello hello` in grub.cfg), not a
 /// file on the FAT32 volume. Loading from disk needs the loader to read through
@@ -268,9 +269,12 @@ fn sys_spawn(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
         // A shell turns this one into "command not found", so it must not be
         // lumped in with the others.
         Err(SpawnError::NotFound) => Err(SyscallError::NotFound),
-        Err(SpawnError::AddressConflict) => Err(SyscallError::AddressInUse),
         Err(SpawnError::TooManyPrograms) | Err(SpawnError::NoThread(_)) => {
             Err(SyscallError::ResourceExhausted)
+        }
+        Err(SpawnError::Space(e)) => {
+            serial_println!("  spawn could not build an address space: {}", e);
+            Err(SyscallError::OutOfMemory)
         }
         Err(SpawnError::Map(e)) => {
             serial_println!("  spawn mapping failed: {}", e);
