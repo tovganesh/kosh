@@ -1,5 +1,6 @@
 pub mod physical;
 pub mod paging;
+pub mod address_space;
 pub mod vmm;
 pub mod heap;
 pub mod swap;

@@ -34,6 +34,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 use crate::interrupts::without_interrupts;
+use crate::memory::address_space::AddressSpace;
 use crate::serial_println;
 use switch::kosh_switch_context;
 
@@ -86,6 +87,13 @@ pub struct Thread {
     entry: Option<(fn(usize), usize)>,
     /// Ticks this thread has been scheduled for — a cheap fairness check.
     ticks: u64,
+    /// This thread's page tables, if it has its own.
+    ///
+    /// `None` means "the kernel's" — every kernel thread, and thread 0. Only a
+    /// thread running a loaded program owns one, and it owns it exclusively:
+    /// `AddressSpace` is deliberately not `Clone`, so there is no way to end up
+    /// with two threads freeing the same PML4.
+    address_space: Option<AddressSpace>,
     /// Set by `sys_exit` before the thread retires, collected by `wait_for`.
     exit_code: i32,
     /// Another thread is in `wait_for` on this one, so `reap_finished` must
@@ -187,6 +195,7 @@ pub fn init() {
             state: State::Running,
             entry: None,
             ticks: 0,
+            address_space: None,
             exit_code: 0,
             awaited: false,
         });
@@ -225,6 +234,7 @@ pub fn spawn(name: &'static str, entry: fn(usize), arg: usize) -> Result<usize, 
             state: State::Ready,
             entry: Some((entry, arg)),
             ticks: 0,
+            address_space: None,
             exit_code: 0,
             awaited: false,
         });
@@ -310,21 +320,54 @@ pub fn schedule() {
 
                     let next_rsp = sched.threads[next].as_ref().unwrap().rsp;
                     let next_top = sched.threads[next].as_ref().unwrap().kernel_stack_top;
+                    // The PML4 the incoming thread needs. `None` means the
+                    // kernel's, which is also what CR3 holds while a plain
+                    // kernel thread runs.
+                    let next_cr3 = sched.threads[next]
+                        .as_ref()
+                        .unwrap()
+                        .address_space
+                        .as_ref()
+                        .map(|a| a.pml4_phys())
+                        .unwrap_or_else(crate::memory::paging::kernel_pml4_phys);
                     let prev_rsp = sched.threads[current].as_mut().unwrap().rsp_ptr();
 
-                    Some((prev_rsp, next_rsp, next, next_top))
+                    Some((prev_rsp, next_rsp, next, next_top, next_cr3))
                 }
             }
         }
         // lock dropped here, before the switch
     };
 
-    if let Some((prev_rsp, next_rsp, next, next_top)) = plan {
+    if let Some((prev_rsp, next_rsp, next, next_top, next_cr3)) = plan {
         // Before the switch, not after: the incoming thread may resume straight
         // into `sysretq` and be in ring 3 — able to fault or syscall — before
         // any instruction after `kosh_switch_context` in *this* frame runs.
         // Interrupts are off, so publishing early is not visible to anyone else.
         publish_kernel_stack(next as u64, next_top);
+
+        // Switch page tables if the incoming thread lives somewhere else.
+        //
+        // Safe to do here, mid-scheduler, only because everything this code
+        // touches from now until the incoming thread is running — RIP, RSP, the
+        // scheduler's statics, the GDT, the IDT, the per-CPU block — is in the
+        // kernel's higher half, which every address space shares. That was not
+        // true before the kernel moved out of PML4[0], and is the reason this
+        // could not be written until now.
+        //
+        // Compared rather than written unconditionally: reloading CR3 flushes
+        // the TLB, and most switches here are between kernel threads.
+        let (current_cr3, _) = x86_64::registers::control::Cr3::read();
+        if current_cr3.start_address().as_u64() != next_cr3 {
+            unsafe {
+                x86_64::registers::control::Cr3::write(
+                    x86_64::structures::paging::PhysFrame::containing_address(
+                        x86_64::PhysAddr::new(next_cr3),
+                    ),
+                    x86_64::registers::control::Cr3Flags::empty(),
+                );
+            }
+        }
 
         unsafe { kosh_switch_context(prev_rsp, next_rsp) };
     }
@@ -403,6 +446,33 @@ pub fn current_id() -> usize {
     without_interrupts(|| SCHEDULER.lock().current)
 }
 
+/// Give the running thread its own page tables.
+///
+/// Called once, by the thread itself, before it drops to ring 3. Doing it from
+/// the thread rather than from whoever spawned it means there is no window in
+/// which the scheduler could pick a thread whose `address_space` field has not
+/// been filled in yet.
+pub fn adopt_address_space(space: AddressSpace) {
+    without_interrupts(|| {
+        let mut sched = SCHEDULER.lock();
+        let current = sched.current;
+        if let Some(t) = sched.threads[current].as_mut() {
+            t.address_space = Some(space);
+        }
+    });
+
+    // The thread is already running; the scheduler will not switch CR3 for it
+    // until the next time it is picked, so do it now.
+    without_interrupts(|| {
+        let sched = SCHEDULER.lock();
+        let current = sched.current;
+        if let Some(space) = sched.threads[current].as_ref().and_then(|t| t.address_space.as_ref())
+        {
+            unsafe { space.activate() };
+        }
+    });
+}
+
 /// Retire the running thread and never come back.
 pub fn exit_current() -> ! {
     // Release this thread's address-space reservations before it becomes
@@ -410,6 +480,34 @@ pub fn exit_current() -> ! {
     // table keyed on thread ids is about to stop having an entry for it.
     let id = current_id();
     crate::usermode::on_thread_exit(id);
+
+    // Hand this thread's page tables back.
+    //
+    // Order matters and is not negotiable: return CR3 to the kernel's tables
+    // *first*, then free. Freeing a PML4 that is still in CR3 hands the frame
+    // holding the live top-level table to the allocator, and the next allocation
+    // overwrites the address space out from under the CPU walking it.
+    //
+    // Safe to switch here because this runs on the thread's kernel stack, which
+    // is in the higher half every address space shares.
+    let space = without_interrupts(|| {
+        let mut sched = SCHEDULER.lock();
+        let current = sched.current;
+        sched.threads[current].as_mut().and_then(|t| t.address_space.take())
+    });
+
+    if let Some(space) = space {
+        unsafe {
+            x86_64::registers::control::Cr3::write(
+                x86_64::structures::paging::PhysFrame::containing_address(
+                    x86_64::PhysAddr::new(crate::memory::paging::kernel_pml4_phys()),
+                ),
+                x86_64::registers::control::Cr3Flags::empty(),
+            );
+            let freed = space.free();
+            serial_println!("  address space of thread {} released: {} frame(s)", id, freed);
+        }
+    }
 
     without_interrupts(|| {
         let mut sched = SCHEDULER.lock();

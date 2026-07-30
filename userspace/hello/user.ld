@@ -1,16 +1,24 @@
-/* Link userspace programs at 4 MiB.
+/* Link at 8 MiB — the *same* address as ksh (userspace/shell/user.ld).
  *
- * Clear of the kernel's low identity window (which ends around 4 MiB) and far
- * below the higher half. The ELF loader honours p_vaddr, so this is where the
- * program genuinely runs — unlike the Phase 5 payload, which was
- * position-independent assembly mapped wherever we liked.
+ * Deliberately the same, as a standing test. Until per-process address spaces
+ * every program had to be given its own address so their images would not land
+ * on top of each other in the one set of page tables, and `spawn` refused any
+ * image that overlapped a resident one. Two programs sharing a link address
+ * would have meant one overwriting the other's `.text` while it executed.
+ *
+ * With a PML4 each, 0x800000 in `hello` and 0x800000 in `ksh` are simply
+ * different memory. `ksh` spawning `hello` — which the scripted console session
+ * does twice — exercises exactly that, and would fail loudly if the spaces were
+ * ever shared again.
+ *
+ * The ELF loader honours p_vaddr, so this is where the program genuinely runs.
  */
 
 ENTRY(_start)
 
 SECTIONS
 {
-    . = 0x400000;
+    . = 0x800000;
 
     .text ALIGN(4K) : { *(.text .text.*) }
     .rodata ALIGN(4K) : { *(.rodata .rodata.*) }
