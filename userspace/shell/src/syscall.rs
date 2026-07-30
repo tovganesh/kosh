@@ -11,7 +11,10 @@
 #![allow(dead_code)]
 
 pub const SYS_EXIT: u64 = 1;
+pub const SYS_WAIT: u64 = 4;
 pub const SYS_GETPID: u64 = 5;
+pub const SYS_YIELD: u64 = 8;
+pub const SYS_SPAWN: u64 = 9;
 pub const SYS_OPEN: u64 = 20;
 pub const SYS_CLOSE: u64 = 21;
 pub const SYS_READ: u64 = 22;
@@ -117,6 +120,36 @@ pub fn stat(path: &str, out: &mut RawDirEntry) -> i64 {
 
 pub fn getpid() -> i64 {
     unsafe { syscall(SYS_GETPID, 0, 0, 0, 0) }
+}
+
+pub fn yield_now() -> i64 {
+    unsafe { syscall(SYS_YIELD, 0, 0, 0, 0) }
+}
+
+/// ENOENT, as `SyscallError::NotFound` encodes it. The one error `spawn` returns
+/// that means "no such program" rather than "something went wrong", so it is the
+/// only one a shell should turn into "command not found".
+pub const ENOENT: i64 = -2;
+
+/// Load a program by name and run it on its own task. Returns the task id.
+///
+/// Not `fork`/`exec` — the kernel has one address space, so there is nothing to
+/// duplicate. The name is a boot-module name, not a filesystem path.
+pub fn spawn(name: &str) -> i64 {
+    unsafe { syscall(SYS_SPAWN, name.as_ptr() as u64, name.len() as u64, 0, 0) }
+}
+
+/// Block until `task` finishes; returns its exit code through `status`.
+pub fn wait(task: i64, status: &mut i32) -> i64 {
+    unsafe {
+        syscall(
+            SYS_WAIT,
+            task as u64,
+            status as *mut i32 as u64,
+            0,
+            0,
+        )
+    }
 }
 
 pub fn exit(code: u64) -> ! {

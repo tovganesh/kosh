@@ -348,9 +348,9 @@ and is the first thing the stub does.
 Argument 4 travels in R10 rather than RCX precisely because `syscall` destroys
 RCX.
 
-`SFMASK` masks IF, so a syscall cannot be interrupted. That is what makes the
-single static kernel syscall stack safe for now; multiple user threads will need
-`swapgs` and a per-CPU block.
+`SFMASK` masks IF, so a syscall *starts* uninterruptible. Phase 10 replaced the
+single static kernel syscall stack this once justified — see
+"Several ring-3 threads" below.
 
 ### Trusting nothing from ring 3
 
@@ -689,6 +689,177 @@ the only practical way to test the pipe path: QEMU's `sendkey` cannot produce a
 null check and two TODOs; they delegate to `syscall::uaccess`, and take a
 `writable` flag so `read` and `write` are checked in the right direction.
 
+## Several ring-3 threads, and launching programs (Phase 10)
+
+Everything up to Phase 9 ran **one** ring-3 thread at a time, and the syscall
+path was built on that assumption: a single `static SYSCALL_STACK`, a single
+`SAVED_USER_RSP`, and a comment in three places saying so. Phase 10 removes the
+assumption, and then uses what that buys.
+
+### Per-thread kernel stacks
+
+`syscall` gives the kernel no stack. It leaves RSP pointing at the *user* stack,
+and no register is free — RCX and R11 carry the return state, everything else
+belongs to the caller. So the hop to a kernel stack has to go through memory
+without a register to address it with, which is what `gs:` addressing is for.
+
+`kernel/src/percpu.rs` holds the per-CPU block:
+
+```
+gs:0   syscall_rsp        kernel stack top for the running thread
+gs:8   user_rsp_scratch   where the stub parks the user RSP for two instructions
+gs:16  current_thread
+```
+
+The offsets are asserted with `offset_of!` at compile time, because the assembly
+addresses them numerically.
+
+The stub is now:
+
+```
+    movq    %rsp, %gs:8         /* park the user RSP                    */
+    movq    %gs:0, %rsp         /* this thread's own kernel stack        */
+    pushq   %gs:8               /* ...and onto the stack, where it is    */
+    ...                         /*    per-thread rather than per-CPU     */
+```
+
+`user_rsp` is a field of `SyscallFrame` now. That is the part that actually
+matters: the scratch slot at `gs:8` is only live while `SFMASK` has interrupts
+masked, and one instruction later the value is on a stack nobody else can touch.
+
+`task::schedule()` publishes the incoming thread's stack to two places on every
+switch — `TSS.RSP0`, used by the CPU when an interrupt arrives in ring 3, and
+`gs:0`, read by the syscall stub. `gdt.rs` stopped being a `lazy_static` for
+this: `set_kernel_stack` used to be `unimplemented!()` because a `lazy_static`
+hands out `&TSS` and no way to mutate it.
+
+**Why there is no `swapgs`.** The textbook mechanism swaps GS.base with
+`IA32_KERNEL_GS_BASE` on each kernel entry and exit. That invariant only holds if
+*every* transition swaps, and this kernel cannot honour it: its interrupt
+handlers are Rust functions using `x86-interrupt`, which offers no place to put a
+`swapgs` before the compiler's prologue. Once a timer tick can land inside a
+syscall — which `files::wait_for_key` makes reachable — the swap count stops
+being even, and a later `swapgs` leaves GS.base holding user data. So both MSRs
+point at the same block, and any `swapgs` is a no-op. Ring 3 cannot subvert this:
+`wrgsbase` needs CR4.FSGSBASE (clear) and `swapgs` itself is #GP in ring 3. The
+cost is that user-mode TLS through GS is unavailable until interrupt entry gets
+naked stubs.
+
+### Proving it needed doing
+
+A test that cannot fail proves nothing, so this one was checked against a
+deliberately broken kernel.
+
+`SYS_YIELD` (syscall 8) gives up the rest of a slice. It is the only way for
+userspace to force a context switch *from inside a system call* — which is
+exactly the situation per-thread stacks exist for. `kosh_user_pingpong_entry` in
+`user_program.rs` loops twelve times over "yield, then write one byte", and two
+threads run it concurrently with different tag bytes:
+
+```
+Two ring-3 threads, each yielding from inside a syscall:
+  ring 3 'A': entry 0x400000e7, user stack 0x58000000, kernel stack 0xffff900000054da0
+  ring 3 'B': entry 0x400000e7, user stack 0x57f00000, kernel stack 0xffff90000005cdd0
+ABABABABABABABABABABAB
+A: survived 12 yields inside a syscall
+B: survived 12 yields inside a syscall
+Concurrent ring 3: PASS — 52 syscalls across 39 context switches
+```
+
+With `publish_kernel_stack` patched to hand every thread the *same* stack — the
+Phase 9 behaviour — the same test produces:
+
+```
+BBBBBBBBBBBBB: survived 12 yields inside a syscall
+[#DB debug at 0x0000000000101216] — resuming
+...
+==================== PAGE FAULT ====================
+  cause : protection violation while fetching an instruction in kernel mode
+  rip   : 0x0000000000175df4
+```
+
+Thread A never finishes. B's syscall entry took the shared stack from the top and
+overwrote A's parked frame, so A's `sysretq` returned to a garbage RIP with
+garbage RFLAGS — TF among them, hence the single-step storm — and then tried to
+execute its own kernel stack.
+
+The completion line is assembled in one buffer and written with a single
+`write`, because two writes would let the other thread's byte land between the
+tag and the message.
+
+### spawn and wait
+
+With more than one ring-3 thread possible, a shell can launch a program:
+
+```
+ksh:/$ hello
+hello from a loaded ELF binary
+  my pid is 3
+  .bss was zeroed correctly
+  stack is writable and readable
+  exiting cleanly
+ksh:/$ ksh
+ksh: ksh: could not start (error -98)
+```
+
+`spawn(path, len)` (syscall 9) loads a named boot module and runs it on a new
+kernel thread in ring 3, returning the task id. `wait(task, status)` (syscall 4,
+which used to be a TODO and `Err(NotSupported)`) blocks until that task exits and
+writes its exit code.
+
+Three things are worth spelling out.
+
+**It is `spawn`, not `fork`+`exec`.** `fork` duplicates an address space; there
+is one address space. Calling it `spawn` keeps the name honest. `sys_fork` itself
+now returns `NotSupported` — it used to add a row to the process table, log "Fork
+successful", and return a PID for a child that did not exist, which userspace read
+as success.
+
+**Blocking is real blocking.** `State::Blocked { on }` is skipped by
+`next_runnable`, and `exit_current` wakes anyone waiting on the exiting thread.
+The alternative — a `yield_now` loop — would mean a shell waiting for a child
+consumed half the CPU. Getting the wake-up wrong is worse than a spin, though:
+the waiter is simply never Ready again and the machine deadlocks with a live
+thread the scheduler refuses to pick.
+
+**The ELF is loaded in the caller's thread, not the new one.** A load failure is
+then a synchronous error the shell can report, instead of a thread that starts
+and dies with the reason only in the kernel log.
+
+### Programs have to be unmapped
+
+The second `spawn` of the same binary used to be impossible: `map_user_pages`
+returns `PageAlreadyMapped`, after having already allocated a frame for that
+page, so every attempt also leaked one. `paging::unmap_user_pages` is the
+counterpart that was missing, and `usermode::RESIDENT` tracks what each program
+mapped so `task::exit_current` can hand it back:
+
+```
+  released 'hello': 19 page(s) returned, 1560 used system-wide
+  released 'hello': 19 page(s) returned, 1560 used system-wide
+```
+
+Two runs, identical used-page count. That number is printed for exactly this
+reason — it is the only way to see from the log alone that running a program
+twice does not cost twice the memory.
+
+The same table is what makes the overlap check possible. Every userspace program
+is linked at a fixed address, so `ksh` spawning `ksh` would overwrite the `.text`
+it is currently executing. `elf::extent_of` answers "where would this go" without
+mapping anything, which is the only moment a conflict can be refused cheaply.
+
+### Loose ends this exposed
+
+`sys_exit` called `files::close_all()`, which closes the *system's* descriptor
+table — there is only one, because there is no per-process state to hang one off.
+With two programs resident, a short-lived one exiting would close the shell's
+open files behind its back. It now does that only when it is the last program
+running, and says so when it declines.
+
+`kosh_syscall_handler` used a hardcoded `ProcessId::new(1)`. It uses
+`task::current_id()` now, so `getpid`, the log lines, and the task id `spawn`
+returns all agree.
+
 ## What is deliberately still missing
 - **The filesystem is read-only.** Allocating clusters and keeping both FAT
   copies consistent is a separate problem, and a read-only filesystem that is
@@ -698,14 +869,17 @@ null check and two TODOs; they delegate to `syscall::uaccess`, and take a
 - **The VFS is still unwired.** `userspace/fs-service/src/vfs.rs` has a mount
   table; it has never had a real filesystem underneath it, and connecting the
   two is separate work from making FAT32 correct.
-- **No `fork`/`exec`.** `userspace/init` cannot do its job until those exist, so
-  the ELF payload is `userspace/hello` rather than init.
+- **No `fork`/`exec`.** `spawn` loads a *second* program rather than duplicating
+  the caller, so there is still no way for a program to replace its own image or
+  to inherit one. `userspace/init` cannot do its job until `fork` exists.
 - **One address space.** Loaded programs share the kernel's page tables; they
-  are protected by page permissions, not by separation. Per-process address
-  spaces come with `fork`.
-- **One ring-3 thread at a time.** The syscall path uses a single static kernel
-  stack, which is only safe because `SFMASK` masks IF and nothing else is in
-  user mode. Several user threads need `swapgs` and per-CPU data.
+  are protected by page permissions, not by separation. That is why every
+  userspace program is linked at a distinct fixed address
+  (`userspace/*/user.ld`) and why `spawn` has to refuse an image that overlaps
+  one already resident.
+- **No pipes or background jobs.** `ksh` parses them; running them needs two
+  programs connected by a shared descriptor, which needs per-process descriptor
+  tables. The table is currently global — see the note in `sys_exit`.
 - **Swap and power management are disabled** in `init_kernel`. Both were
   simulated, and swap tried to allocate 8 MiB from a 1 MiB heap.
 - **Only IRQ0 and IRQ1 are unmasked.** Everything else on the PIC has a

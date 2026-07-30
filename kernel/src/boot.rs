@@ -20,7 +20,12 @@ pub fn init_kernel(boot_info: BootInformation) {
     
     // Set up GDT and TSS (now including ring-3 descriptors and RSP0)
     crate::gdt::init();
-    
+
+    // GS.base has to point at the per-CPU block before the syscall stub can run,
+    // and `gdt::init` reloads GS — so this comes after it, and long before
+    // `syscall::init_syscall_interface`.
+    crate::percpu::init();
+
     // Install the IDT before anything else can fault. From here on a bad
     // pointer produces a legible dump instead of a silent triple fault.
     crate::interrupts::init();
@@ -766,7 +771,52 @@ fn init_usermode() {
         serial_println!("Ring 3: FAIL — only {} syscalls serviced", serviced);
     }
 
-    // Demo 3: an ELF the kernel was not compiled with, loaded from a GRUB
+    // Demo 3: two ring-3 threads at once, each yielding from inside a syscall.
+    //
+    // Everything above ran one ring-3 thread at a time, which is what let the
+    // syscall path get away with a single static kernel stack. This is the test
+    // that stack could not pass.
+    serial_println!();
+    serial_println!("Two ring-3 threads, each yielding from inside a syscall:");
+    let before_pp = crate::syscall::entry::syscall_count();
+    let switches_before = crate::task::switch_count();
+
+    for which in 0..2 {
+        if let Err(e) = crate::task::spawn("pingpong", crate::usermode::run_pingpong, which) {
+            serial_println!("Concurrent ring 3: FAIL — could not spawn: {}", e);
+            return;
+        }
+    }
+    serial_println!("--- interleaved ring 3 output ---");
+    while crate::task::live_threads() > 0 {
+        x86_64::instructions::hlt();
+    }
+    serial_println!();
+    crate::task::reap_finished();
+
+    let pp_syscalls = crate::syscall::entry::syscall_count() - before_pp;
+    let pp_switches = crate::task::switch_count() - switches_before;
+
+    // 2 threads x 12 iterations x (yield + write) + 2 final writes + 2 exits.
+    // Anything less means a thread died partway, which is exactly the failure a
+    // shared syscall stack produces.
+    let expected = 2 * 12 * 2 + 4;
+    if pp_syscalls >= expected as u64 && pp_switches >= 24 {
+        serial_println!(
+            "Concurrent ring 3: PASS — {} syscalls across {} context switches, per-thread kernel stacks held",
+            pp_syscalls,
+            pp_switches
+        );
+    } else {
+        serial_println!(
+            "Concurrent ring 3: FAIL — {} syscalls (expected >= {}), {} switches (expected >= 24)",
+            pp_syscalls,
+            expected,
+            pp_switches
+        );
+    }
+
+    // Demo 4: an ELF the kernel was not compiled with, loaded from a GRUB
     // module. Reported separately, because it exercises the loader rather than
     // the ring-3 mechanics above.
     serial_println!();

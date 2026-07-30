@@ -21,6 +21,8 @@ mod task;
 #[cfg(target_arch = "x86_64")]
 mod gdt;
 #[cfg(target_arch = "x86_64")]
+mod percpu;
+#[cfg(target_arch = "x86_64")]
 mod block;
 #[cfg(target_arch = "x86_64")]
 mod console;
@@ -316,14 +318,20 @@ fn supervisor(_arg: usize) {
         serial_println!("Kosh: starting the userspace shell");
 
         match task::spawn("ksh", usermode::run_shell, 0) {
-            Ok(_) => {
-                // Wait for it. `live_threads` counts everything except thread 0,
-                // and by this point the supervisor and ksh are the only two.
-                while task::live_threads() > 1 {
-                    x86_64::instructions::hlt();
-                }
+            Ok(shell) => {
+                // `wait_for` blocks in `State::Blocked` until ksh exits. This
+                // used to spin on `live_threads() > 1`, with a comment saying the
+                // supervisor and ksh were the only two threads — which stopped
+                // being true the moment ksh could spawn a program of its own.
+                let status = task::wait_for(shell);
                 serial_println!();
-                serial_println!("Kosh: ksh exited, falling back to the kernel console");
+                match status {
+                    Ok(code) => serial_println!(
+                        "Kosh: ksh exited with code {}, falling back to the kernel console",
+                        code
+                    ),
+                    Err(e) => serial_println!("Kosh: ksh wait failed ({}), taking the console", e),
+                }
                 task::reap_finished();
             }
             Err(e) => serial_println!("Kosh: could not start ksh: {}", e),

@@ -37,32 +37,6 @@ use x86_64::VirtAddr;
 use crate::process::ProcessId;
 use crate::serial_println;
 
-/// Kernel stack used while servicing a syscall.
-///
-/// One static stack is correct only because exactly one thread can be in ring 3
-/// in Phase 5, and `SFMASK` masks IF so a syscall cannot be interrupted into a
-/// second syscall. Multiple user threads need this to become per-thread, reached
-/// through `swapgs` and a per-CPU block — see the note on `SAVED_USER_RSP`.
-const SYSCALL_STACK_SIZE: usize = 32 * 1024;
-
-#[repr(align(16))]
-struct SyscallStack([u8; SYSCALL_STACK_SIZE]);
-
-static mut SYSCALL_STACK: SyscallStack = SyscallStack([0; SYSCALL_STACK_SIZE]);
-
-/// Top of the syscall stack, read by the assembly stub.
-#[no_mangle]
-static mut SYSCALL_KERNEL_RSP: u64 = 0;
-
-/// Where the stub parks the user's RSP for the duration of the call.
-///
-/// A plain static rather than `swapgs` + per-CPU data: single CPU, single
-/// ring-3 thread, and interrupts masked during the call, so nothing can
-/// re-enter. The moment any of those three stops being true this must become
-/// `swapgs`-based, or two concurrent syscalls will trample each other's stacks.
-#[no_mangle]
-static mut SAVED_USER_RSP: u64 = 0;
-
 /// Registers the stub pushes, in push order (so the first field is at the
 /// lowest address — the layout the stub builds by pushing RAX last).
 #[repr(C)]
@@ -78,6 +52,15 @@ pub struct SyscallFrame {
     pub rip: u64,
     /// User RFLAGS, delivered in R11. `sysretq` needs it back there.
     pub rflags: u64,
+    /// The caller's RSP, saved *on this thread's kernel stack* rather than in a
+    /// global. Pushed first, so it sits at the highest address in the frame.
+    ///
+    /// This is what makes a preempted syscall safe. It used to live in a static
+    /// `SAVED_USER_RSP`, which meant a second thread entering a syscall while
+    /// the first was blocked inside one would overwrite the first thread's user
+    /// stack pointer — and `sysretq` would then return it to ring 3 with
+    /// somebody else's RSP.
+    pub user_rsp: u64,
 }
 
 extern "C" {
@@ -93,14 +76,21 @@ core::arch::global_asm!(
 kosh_syscall_entry:
     /* On entry: RSP is still the *user* stack, RCX = user RIP,
        R11 = user RFLAGS, RAX = syscall number. Interrupts are already masked
-       by SFMASK. */
+       by SFMASK, which is what makes the scratch slot below safe.
 
-    movq    %rsp, SAVED_USER_RSP(%rip)
-    movq    SYSCALL_KERNEL_RSP(%rip), %rsp
+       No register is free — RCX and R11 carry the return state, everything
+       else is the caller's — so the hop from the user stack to the kernel one
+       has to go through memory. gs: addressing needs no register at all. */
 
-    /* Build SyscallFrame. Pushed high field first so RAX lands lowest. */
-    pushq   %r11                /* rflags */
-    pushq   %rcx                /* rip    */
+    movq    %rsp, %gs:8         /* park the user RSP in the per-CPU scratch */
+    movq    %gs:0, %rsp         /* this thread's own kernel stack           */
+
+    /* Build SyscallFrame. Pushed high field first so RAX lands lowest.
+       The scratch value moves onto the kernel stack immediately: from here on
+       it is per-thread, so a preemption cannot lose it. */
+    pushq   %gs:8               /* user_rsp */
+    pushq   %r11                /* rflags   */
+    pushq   %rcx                /* rip      */
     pushq   %r9
     pushq   %r8
     pushq   %r10
@@ -111,11 +101,10 @@ kosh_syscall_entry:
 
     movq    %rsp, %rdi          /* &mut SyscallFrame */
 
-    /* SysV wants RSP 16-byte aligned at the call. Nine pushes from a
-       16-aligned top leaves it 8 past, so nudge it. */
-    subq    $8, %rsp
+    /* SysV wants RSP 16-byte aligned at the call. Ten pushes from a 16-aligned
+       top land back on 16, so there is nothing to correct — unlike the nine
+       pushes this had before user_rsp joined the frame. */
     call    kosh_syscall_handler
-    addq    $8, %rsp
 
     movq    %rax, (%rsp)        /* return value into frame.rax */
 
@@ -129,7 +118,7 @@ kosh_syscall_entry:
     popq    %rcx                /* sysretq takes the target RIP here    */
     popq    %r11                /* ...and the target RFLAGS here        */
 
-    movq    SAVED_USER_RSP(%rip), %rsp
+    movq    (%rsp), %rsp        /* frame.user_rsp — the last word we own */
     sysretq
 "#,
     options(att_syntax)
@@ -143,9 +132,11 @@ pub extern "C" fn kosh_syscall_handler(frame: &mut SyscallFrame) -> u64 {
 
     SYSCALL_COUNT.fetch_add(1, Ordering::Relaxed);
 
-    // Phase 5 runs a single ring-3 thread; a real current-process lookup lands
-    // with the process table in Phase 6.
-    let pid = ProcessId::new(1);
+    // The calling thread's id, which is now a real answer rather than the
+    // hardcoded `1` this used while only one thread could be in ring 3. It is
+    // also what `spawn` returns and what `wait` takes, so a log line naming a
+    // process can be matched against one naming a task.
+    let pid = ProcessId::new(crate::task::current_id() as u32);
 
     match crate::syscall::dispatcher::dispatch_syscall(pid, number, args) {
         Ok(value) => value,
@@ -181,13 +172,6 @@ pub fn init() {
     let sel = crate::gdt::selectors();
 
     unsafe {
-        SYSCALL_KERNEL_RSP = {
-            let base = &raw const SYSCALL_STACK as u64;
-            (base + SYSCALL_STACK_SIZE as u64) & !0xF
-        };
-    }
-
-    unsafe {
         // Without SCE, `syscall` is an invalid opcode.
         Efer::update(|flags| flags.insert(EferFlags::SYSTEM_CALL_EXTENSIONS));
 
@@ -198,10 +182,11 @@ pub fn init() {
 
         LStar::write(VirtAddr::new(kosh_syscall_entry as usize as u64));
 
-        // Bits cleared in RFLAGS on entry. Masking IF means a syscall cannot be
-        // interrupted — which is what makes the single static kernel stack
-        // above safe. DF is masked so string instructions behave; TF so a
-        // single-stepping debugger in userspace does not trap in the kernel.
+        // Bits cleared in RFLAGS on entry. Masking IF means a syscall starts
+        // uninterruptible, which is what makes the per-CPU scratch slot in the
+        // stub safe; a handler that wants to block re-enables it deliberately.
+        // DF is masked so string instructions behave; TF so a single-stepping
+        // debugger in userspace does not trap into the kernel.
         SFMask::write(
             RFlags::INTERRUPT_FLAG | RFlags::DIRECTION_FLAG | RFlags::TRAP_FLAG,
         );
@@ -216,10 +201,15 @@ pub fn init() {
         sel.user_code.0 | 3,
         sel.user_data.0 | 3
     );
+    serial_println!("  LSTAR -> 0x{:x}", kosh_syscall_entry as usize as u64);
     serial_println!(
-        "  LSTAR -> 0x{:x}, kernel stack 0x{:x}",
-        kosh_syscall_entry as usize as u64,
-        unsafe { SYSCALL_KERNEL_RSP }
+        "  kernel stack from gs:0 = 0x{:x} (per-thread), gs addressing {}",
+        crate::percpu::syscall_stack(),
+        if crate::percpu::check_gs_addressing() {
+            "OK"
+        } else {
+            "BROKEN"
+        }
     );
     serial_println!("  SFMASK masks IF, DF, TF");
 }

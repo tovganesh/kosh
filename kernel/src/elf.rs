@@ -53,6 +53,10 @@ pub enum ElfError {
     NotExecutable,
     WrongArchitecture,
     NoLoadableSegments,
+    /// More `PT_LOAD` segments than [`MAX_SEGMENTS`], so the range table this
+    /// loader hands back could not describe the whole image — and an image that
+    /// cannot be described cannot be unmapped.
+    TooManySegments,
     SegmentOutOfRange,
     /// A segment wants to live where the kernel already is.
     SegmentInKernelSpace,
@@ -91,11 +95,46 @@ struct Elf64ProgramHeader {
     align: u64,
 }
 
+/// The most `PT_LOAD` segments this loader will map. A `no_std` Rust binary
+/// linked with the scripts in `userspace/` produces three or four.
+pub const MAX_SEGMENTS: usize = 8;
+
+/// A page range this loader mapped, so it can be handed back later.
+#[derive(Debug, Clone, Copy)]
+pub struct MappedRange {
+    pub start: u64,
+    pub pages: usize,
+}
+
 /// A program that has been loaded and is ready to enter.
 pub struct LoadedImage {
     pub entry: u64,
     pub segments: usize,
     pub bytes_mapped: usize,
+    /// Exactly what was mapped, in the order it was mapped.
+    ///
+    /// Returned rather than discarded because a program that cannot be unmapped
+    /// can only be run once: the second `spawn` hits `PageAlreadyMapped`. The
+    /// caller records these and frees them when the program exits.
+    pub ranges: [Option<MappedRange>; MAX_SEGMENTS],
+}
+
+impl LoadedImage {
+    /// Lowest and highest virtual addresses this image occupies, for overlap
+    /// checks against programs that are already resident.
+    pub fn extent(&self) -> (u64, u64) {
+        let mut lo = u64::MAX;
+        let mut hi = 0;
+        for range in self.ranges.iter().flatten() {
+            lo = lo.min(range.start);
+            hi = hi.max(range.start + (range.pages * PAGE_SIZE) as u64);
+        }
+        if lo == u64::MAX {
+            (0, 0)
+        } else {
+            (lo, hi)
+        }
+    }
 }
 
 /// Everything at or above this is kernel territory; a user segment claiming to
@@ -107,7 +146,9 @@ const USER_ADDRESS_LIMIT: u64 = 0x0000_8000_0000_0000;
 ///
 /// # Safety
 /// The caller must ensure no existing user mapping overlaps the segments this
-/// image declares. Phase 6 runs one program at a time, so that holds trivially.
+/// image declares. There is one address space, so that is a real obligation, not
+/// a formality — `usermode::spawn_program` checks it against the table of
+/// resident programs before calling here.
 pub unsafe fn load(image: &[u8]) -> Result<LoadedImage, ElfError> {
     let header = parse_header(image)?;
 
@@ -121,6 +162,7 @@ pub unsafe fn load(image: &[u8]) -> Result<LoadedImage, ElfError> {
 
     let mut segments = 0usize;
     let mut bytes_mapped = 0usize;
+    let mut ranges: [Option<MappedRange>; MAX_SEGMENTS] = [None; MAX_SEGMENTS];
 
     for i in 0..header.phnum as usize {
         let offset = header.phoff as usize + i * header.phentsize as usize;
@@ -134,6 +176,14 @@ pub unsafe fn load(image: &[u8]) -> Result<LoadedImage, ElfError> {
         if ph.p_type != PT_LOAD || ph.memsz == 0 {
             continue;
         }
+
+        if segments >= MAX_SEGMENTS {
+            return Err(ElfError::TooManySegments);
+        }
+
+        // Record the range *before* mapping it, so a failure halfway through
+        // still tells the caller what to tear down.
+        ranges[segments] = Some(segment_range(&ph));
 
         load_segment(image, &ph)?;
 
@@ -149,7 +199,53 @@ pub unsafe fn load(image: &[u8]) -> Result<LoadedImage, ElfError> {
         entry: header.entry,
         segments,
         bytes_mapped,
+        ranges,
     })
+}
+
+/// Lowest and highest virtual address this image *would* occupy, without
+/// mapping anything.
+///
+/// Needed because there is one address space: the only moment at which a
+/// conflicting load can be refused cheaply is before the first page of it has
+/// been mapped. Afterwards the choice is between a half-loaded program and an
+/// unwind path.
+pub fn extent_of(image: &[u8]) -> Result<(u64, u64), ElfError> {
+    let header = parse_header(image)?;
+
+    let mut lo = u64::MAX;
+    let mut hi = 0u64;
+
+    for i in 0..header.phnum as usize {
+        let offset = header.phoff as usize + i * header.phentsize as usize;
+        if offset + core::mem::size_of::<Elf64ProgramHeader>() > image.len() {
+            return Err(ElfError::TooSmall);
+        }
+        let ph: Elf64ProgramHeader =
+            unsafe { core::ptr::read_unaligned(image.as_ptr().add(offset) as *const _) };
+        if ph.p_type != PT_LOAD || ph.memsz == 0 {
+            continue;
+        }
+        let range = segment_range(&ph);
+        lo = lo.min(range.start);
+        hi = hi.max(range.start + (range.pages * PAGE_SIZE) as u64);
+    }
+
+    if lo == u64::MAX {
+        return Err(ElfError::NoLoadableSegments);
+    }
+
+    Ok((lo, hi))
+}
+
+/// Page range a segment occupies, rounded out to page boundaries.
+fn segment_range(ph: &Elf64ProgramHeader) -> MappedRange {
+    let start = ph.vaddr & !(PAGE_SIZE as u64 - 1);
+    let end = (ph.vaddr + ph.memsz + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
+    MappedRange {
+        start,
+        pages: ((end - start) / PAGE_SIZE as u64) as usize,
+    }
 }
 
 fn parse_header(image: &[u8]) -> Result<Elf64Header, ElfError> {
@@ -193,9 +289,7 @@ unsafe fn load_segment(image: &[u8], ph: &Elf64ProgramHeader) -> Result<(), ElfE
         return Err(ElfError::SegmentOutOfRange);
     }
 
-    let start = ph.vaddr & !(PAGE_SIZE as u64 - 1);
-    let end = (ph.vaddr + ph.memsz + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
-    let pages = ((end - start) / PAGE_SIZE as u64) as usize;
+    let MappedRange { start, pages } = segment_range(ph);
 
     let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
     if ph.flags & PF_W != 0 {

@@ -53,7 +53,7 @@ fn fs_error_to_syscall(e: FsError) -> SyscallError {
 }
 
 /// Read a path out of user memory and validate it.
-fn path_from_user(ptr: u64, len: u64) -> Result<String, SyscallError> {
+pub fn path_from_user(ptr: u64, len: u64) -> Result<String, SyscallError> {
     let len = len as usize;
     if len == 0 || len > MAX_PATH {
         return Err(SyscallError::InvalidArgument);

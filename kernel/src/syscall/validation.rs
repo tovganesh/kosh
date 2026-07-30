@@ -21,7 +21,8 @@ pub fn validate_syscall_args(
         SYS_FORK => validate_fork_args(args),
         SYS_EXEC => validate_exec_args(process_id, args),
         SYS_WAIT => validate_wait_args(args),
-        SYS_GETPID | SYS_GETPPID => validate_no_args(args),
+        SYS_SPAWN => validate_spawn_args(process_id, args),
+        SYS_GETPID | SYS_GETPPID | SYS_YIELD => validate_no_args(args),
         SYS_KILL => validate_kill_args(args),
         
         SYS_MMAP => validate_mmap_args(args),
@@ -144,9 +145,24 @@ fn validate_exec_args(process_id: ProcessId, args: &[u64; 6]) -> Result<(), Sysc
     Ok(())
 }
 
-fn validate_wait_args(args: &[u64; 6]) -> Result<(), SyscallError> {
-    // Wait can take a status pointer (optional)
+/// `wait(task_id, status_ptr)`.
+///
+/// The status pointer is optional and checked in the handler rather than here,
+/// because the handler has to check it *before* blocking — validating a
+/// destination after the child has been reaped leaves nowhere to put the answer.
+fn validate_wait_args(_args: &[u64; 6]) -> Result<(), SyscallError> {
     Ok(())
+}
+
+/// `spawn(path_ptr, path_len)`.
+fn validate_spawn_args(process_id: ProcessId, args: &[u64; 6]) -> Result<(), SyscallError> {
+    let path_ptr = args[0];
+    let path_len = args[1];
+
+    if path_len == 0 || path_len > 255 {
+        return Err(SyscallError::InvalidArgument);
+    }
+    validate_user_pointer(process_id, path_ptr, path_len as usize, false)
 }
 
 fn validate_no_args(args: &[u64; 6]) -> Result<(), SyscallError> {

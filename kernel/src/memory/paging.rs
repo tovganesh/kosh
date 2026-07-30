@@ -384,6 +384,46 @@ pub fn map_user_pages(
     Ok(())
 }
 
+/// Unmap `pages` user pages at `virt` and return their frames to the allocator.
+///
+/// The counterpart to [`map_user_pages`], and the reason a program can be run
+/// twice. Without it, the second `spawn` of the same binary failed in
+/// `map_to_with_table_flags` with `PageAlreadyMapped` — after the loader had
+/// already allocated a frame for that page, so each attempt also leaked one.
+///
+/// Returns how many pages were actually unmapped; a page that was not mapped is
+/// skipped rather than treated as an error, so tearing down a partially-loaded
+/// image is safe.
+///
+/// # Safety
+/// Nothing may still be using these addresses. In particular the caller must not
+/// be running *on* them — which is why teardown happens from the reaping thread,
+/// not from the exiting one.
+pub unsafe fn unmap_user_pages(virt: u64, pages: usize) -> usize {
+    let mut mapper = active_mapper();
+    let mut freed = 0;
+
+    for i in 0..pages {
+        let page: Page<Size4KiB> =
+            Page::containing_address(VirtAddr::new(virt + (i * PAGE_SIZE) as u64));
+
+        match mapper.unmap(page) {
+            Ok((frame, flush)) => {
+                flush.flush();
+                crate::memory::physical::deallocate_frame(PageFrame::from_address(
+                    frame.start_address().as_u64() as usize,
+                ));
+                freed += 1;
+            }
+            Err(_) => {
+                // Already absent. Nothing to free, nothing to complain about.
+            }
+        }
+    }
+
+    freed
+}
+
 /// Borrow the live page tables through the physmap.
 ///
 /// # Safety

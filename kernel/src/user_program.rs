@@ -6,14 +6,17 @@
 //! `-C code-model=kernel` would happily emit an absolute reference to a static
 //! and fault the moment it ran at the wrong address.
 //!
-//! It exercises three things:
+//! It exercises four things:
 //!
 //! 1. A syscall that works — `write(1, ...)`.
 //! 2. A syscall that returns a value — `getpid()`.
 //! 3. A syscall the kernel must *refuse* — `write(1, <kernel address>, 16)`.
-//!    That last one is the interesting case: it proves the user-pointer
-//!    validation in `syscall::uaccess` actually rejects a hostile pointer,
-//!    tested from the user side rather than by the kernel checking itself.
+//!    That one is the interesting case: it proves the user-pointer validation in
+//!    `syscall::uaccess` actually rejects a hostile pointer, tested from the user
+//!    side rather than by the kernel checking itself.
+//! 4. Two ring-3 threads yielding from inside a system call
+//!    (`kosh_user_pingpong_entry`), which is what per-thread kernel stacks are
+//!    for and what a single shared syscall stack cannot survive.
 
 core::arch::global_asm!(
     r#"
@@ -95,6 +98,87 @@ kosh_user_fault_entry:
     syscall
 .Lfault_hang:
     jmp     .Lfault_hang
+
+/* A third payload, run as two concurrent ring-3 threads.
+   It exists to make per-thread kernel stacks *observably* necessary: each
+   iteration calls SYS_YIELD, which context-switches while this thread's
+   SyscallFrame is still live on its kernel stack, and then writes one byte. If
+   both threads shared one syscall stack, the second thread's entry would take
+   that stack from the top and overwrite the first thread's parked frame,
+   including its return RIP and user RSP.
+
+   The tag byte arrives in RDI — the kernel sets it before iretq — and is copied
+   onto the user stack, because `write` needs an address it can read and this
+   payload has no writable data section of its own. */
+.global kosh_user_pingpong_entry
+.type kosh_user_pingpong_entry, @function
+kosh_user_pingpong_entry:
+    andq    $-16, %rsp
+    subq    $64, %rsp
+    movq    %rsp, %r13                  /* callee-saved: survives syscalls */
+    movb    %dil, (%r13)                /* tag byte, now in user memory */
+
+    /* Assemble "<tag>: survived ...\n" in one buffer, so the completion line
+       goes out as a single write. Two writes would let the other thread's byte
+       land between the tag and the message. */
+    leaq    1(%r13), %rdi
+    leaq    msg_pp_done(%rip), %rsi
+    movq    $msg_pp_done_len, %rcx
+    rep     movsb
+    movq    $msg_pp_done_len + 1, %r15
+
+    movq    $12, %r14                   /* iterations */
+
+.Lpp_loop:
+    movq    $8, %rax                    /* SYS_YIELD, from inside a syscall */
+    syscall
+    testq   %rax, %rax
+    js      .Lpp_fail
+
+    movq    $1, %rdi                    /* write(1, &tag, 1) */
+    movq    %r13, %rsi
+    movq    $1, %rdx
+    movq    $23, %rax
+    syscall
+    testq   %rax, %rax
+    js      .Lpp_fail
+
+    decq    %r14
+    jnz     .Lpp_loop
+
+    /* Reaching here at all is the result: 12 round trips through a syscall that
+       gave up the CPU with its frame still on this thread's kernel stack. */
+    movq    $1, %rdi
+    movq    %r13, %rsi
+    movq    %r15, %rdx
+    movq    $23, %rax
+    syscall
+
+    xorq    %rdi, %rdi
+    movq    $1, %rax                    /* SYS_EXIT */
+    syscall
+
+.Lpp_fail:
+    movq    $1, %rdi
+    leaq    msg_pp_fail(%rip), %rsi
+    movq    $msg_pp_fail_len, %rdx
+    movq    $23, %rax
+    syscall
+
+    movq    $1, %rdi
+    movq    $1, %rax                    /* exit(1) */
+    syscall
+
+.Lpp_hang:
+    jmp     .Lpp_hang
+
+msg_pp_done:
+    .ascii  ": survived 12 yields inside a syscall\n"
+    .set    msg_pp_done_len, . - msg_pp_done
+
+msg_pp_fail:
+    .ascii  "FAIL: a syscall failed across a yield\n"
+    .set    msg_pp_fail_len, . - msg_pp_fail
 
 msg_faulting:
     .ascii  "about to dereference a kernel address directly\n"
