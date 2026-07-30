@@ -18,6 +18,7 @@ PROFILE="${PROFILE:-release}"
 BUILD_DIR="$ROOT/build"
 ISO_DIR="$BUILD_DIR/iso"
 ISO="$BUILD_DIR/kosh.iso"
+DISK="$BUILD_DIR/disk.img"
 
 MODE="run"
 case "${1:-}" in
@@ -37,6 +38,8 @@ need cargo       "Install Rust: https://rustup.rs"
 need grub-mkrescue "Install GRUB tools (macOS: brew install i686-elf-grub xorriso)"
 need xorriso     "Install xorriso (macOS: brew install xorriso)"
 need qemu-system-x86_64 "Install QEMU (macOS: brew install qemu)"
+need mkfs.vfat  "Install dosfstools (macOS: brew install dosfstools)"
+need mcopy      "Install mtools (macOS: brew install mtools)"
 
 # --- build ------------------------------------------------------------------
 
@@ -105,10 +108,70 @@ EOF
 grub-mkrescue -o "$ISO" "$ISO_DIR" >/dev/null 2>&1
 echo "==> $ISO ($(du -h "$ISO" | cut -f1))"
 
+# --- test disk ---------------------------------------------------------------
+#
+# A FAT32 image with known contents, attached as a legacy IDE hard disk. FAT32
+# rather than ext4 on purpose: it is a few hundred lines to read, and the image
+# can be mounted on the host to check what the kernel says against what is
+# actually there.
+
+if [ ! -f "$DISK" ] || [ "${REBUILD_DISK:-0}" = "1" ]; then
+    echo "==> building FAT32 test disk"
+    STAGE="$(mktemp -d)"
+
+    cat > "$STAGE/README.TXT" <<'TXT'
+Kosh test disk.
+
+This file lives in a FAT32 filesystem on a virtual IDE disk. If you are reading
+it from the kosh> prompt, then the ATA driver, the block layer and the FAT32
+implementation all work.
+TXT
+
+    printf 'hello from the filesystem
+' > "$STAGE/HELLO.TXT"
+    printf 'line one
+line two
+line three
+' > "$STAGE/LINES.TXT"
+    # A file that spans more than one cluster, to exercise the FAT chain walk.
+    for i in $(seq 1 400); do
+        printf 'This is line %03d of a deliberately multi-cluster file.
+' "$i"
+    done > "$STAGE/BIG.TXT"
+
+    dd if=/dev/zero of="$DISK" bs=1M count=64 status=none
+    mkfs.vfat -F 32 -n KOSHDISK "$DISK" >/dev/null
+
+    mmd   -i "$DISK" ::/docs
+    mcopy -i "$DISK" "$STAGE/README.TXT" ::/README.TXT
+    mcopy -i "$DISK" "$STAGE/HELLO.TXT"  ::/HELLO.TXT
+    mcopy -i "$DISK" "$STAGE/LINES.TXT"  ::/LINES.TXT
+    mcopy -i "$DISK" "$STAGE/BIG.TXT"    ::/BIG.TXT
+    mcopy -i "$DISK" "$STAGE/HELLO.TXT"  ::/docs/NOTES.TXT
+    # A name that does not fit 8.3, so FAT has to store it as long-filename
+    # entries. Without this the LFN assembly code is never exercised — every
+    # other name here is a valid short name.
+    mcopy -i "$DISK" "$STAGE/HELLO.TXT"  "::/A Long File Name.txt"
+
+    rm -rf "$STAGE"
+    echo "==> $DISK ($(du -h "$DISK" | cut -f1)), label KOSHDISK"
+else
+    echo "==> reusing $DISK (REBUILD_DISK=1 to regenerate)"
+fi
+
 # --- run --------------------------------------------------------------------
 
 QEMU_ARGS=(
     -cdrom "$ISO"
+    # Primary IDE master, so it answers on the legacy ports at 0x1F0. The CD is
+    # on the secondary channel, which is why the driver finds the disk and not
+    # the ISO.
+    -drive "file=$DISK,format=raw,if=ide,index=0,media=disk"
+    # Boot the CD, not the disk. mkfs.vfat writes a 0xAA55 signature at offset
+    # 510, so SeaBIOS considers the test disk bootable and will happily try it
+    # first — which hangs, with no output, looking exactly like a kernel that
+    # failed to start.
+    -boot order=d
     -m 512M
     -no-reboot
     -no-shutdown
@@ -164,6 +227,8 @@ check)
         ".bss was zeroed correctly" \
         "stack is writable and readable" \
         "ELF loader: PASS" \
+        "Storage: PASS" \
+        "Filesystem: PASS" \
         "Kernel initialization complete" \
         "console started on its own thread"
     do
@@ -229,6 +294,15 @@ check-cli)
         type_line "echo kosh cli works"
         type_line "modules"
         type_line "ps"
+        type_line "lsblk"
+        type_line "df"
+        type_line "ls"
+        type_line "cat hello.txt"
+        type_line "cd docs"
+        type_line "pwd"
+        type_line "ls"
+        type_line "cd .."
+        type_line "cat nope.txt"
         type_line "history"
         type_line "nosuchcommand"
         type_line "fault bp"
@@ -244,7 +318,7 @@ check-cli)
     fail=0
     for marker in \
         "Kosh console" \
-        "kosh>" \
+        "kosh:/>" \
         "Kosh 0.1.0 x86_64" \
         "running in ring 0" \
         "physical memory:" \
@@ -252,6 +326,13 @@ check-cli)
         "kosh cli works" \
         "module 0:" \
         "context switches since boot" \
+        "QEMU HARDDISK" \
+        "FAT32 'KOSHDISK'" \
+        "README.TXT" \
+        "hello from the filesystem" \
+        "kosh:/docs>" \
+        "NOTES.TXT" \
+        "no such file or directory" \
         "unknown command: nosuchcommand" \
         "resumed"
     do
