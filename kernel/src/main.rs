@@ -250,8 +250,21 @@ pub extern "C" fn _start(multiboot_info_addr: usize) -> ! {
     serial_println!("Kosh Kernel Starting...");
     println!("Kosh Kernel Starting...");
 
-    // Parse multiboot2 information
-    let boot_info = unsafe { BootInformation::load(multiboot_info_addr as *const _) };
+    // GRUB passes a *physical* address, and this is one of the places where the
+    // difference started to matter: with the kernel in the higher half there is
+    // no identity map to make it dereferenceable. The low 1 GiB is reachable
+    // through the kernel window, which is where GRUB puts the structure.
+    //
+    // Everything that reads `boot_info` runs before `paging::init`; nothing may
+    // hold on to it past that point, because the tables it builds only keep the
+    // window up to the end of the frame bitmap.
+    let mb_virt = crate::memory::paging::kernel_virt(multiboot_info_addr as u64);
+    serial_println!(
+        "Multiboot2 info at phys 0x{:x} (mapped at 0x{:x})",
+        multiboot_info_addr,
+        mb_virt
+    );
+    let boot_info = unsafe { BootInformation::load(mb_virt as *const _) };
     
     match boot_info {
         Ok(boot_info) => {

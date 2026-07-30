@@ -683,13 +683,34 @@ fn test_virtual_memory() {
     // Print virtual memory layout
     memory::vmm::print_virtual_memory_stats();
     
-    // Test virtual address translation
-    let test_virt_addr = memory::vmm::VirtualAddress::new(0xFFFFFFFF80000000);
-    if let Some(phys_addr) = memory::vmm::translate_virtual_address(test_virt_addr) {
-        serial_println!("Virtual address 0x{:x} maps to physical address 0x{:x}", 
-                       test_virt_addr.as_usize(), phys_addr);
-    } else {
-        serial_println!("Virtual address 0x{:x} is not mapped", test_virt_addr.as_usize());
+    // KERNEL_VMA itself is the first page of the kernel window, and it maps
+    // physical page 0 — which `paging::init` deliberately leaves out, so the
+    // null guard survives the move to the higher half. Unmapped is the pass.
+    let guard_page =
+        memory::vmm::VirtualAddress::new(memory::paging::KERNEL_VMA as usize);
+    match memory::vmm::translate_virtual_address(guard_page) {
+        Some(phys) => serial_println!(
+            "  WARNING: the kernel window's guard page 0x{:x} maps to 0x{:x}",
+            guard_page.as_usize(),
+            phys
+        ),
+        None => serial_println!(
+            "  kernel window guard page 0x{:x}: unmapped, as it should be",
+            guard_page.as_usize()
+        ),
+    }
+
+    // And the kernel image itself, one page in, must resolve.
+    let image = memory::vmm::VirtualAddress::new(
+        (memory::paging::KERNEL_VMA + 0x10_0000) as usize,
+    );
+    match memory::vmm::translate_virtual_address(image) {
+        Some(phys) => serial_println!(
+            "  kernel image 0x{:x} -> physical 0x{:x}",
+            image.as_usize(),
+            phys
+        ),
+        None => serial_println!("  WARNING: the kernel image is not mapped"),
     }
     
     serial_println!("Virtual memory management test complete");

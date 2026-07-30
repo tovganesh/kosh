@@ -41,6 +41,39 @@ pub const PHYSMAP_BASE: u64 = 0xFFFF_8000_0000_0000;
 /// Virtual base of the kernel heap window. PML4 entry 288.
 pub const KERNEL_HEAP_BASE: u64 = 0xFFFF_9000_0000_0000;
 
+/// Where the kernel image is linked. PML4 entry 511, PDPT entry 510 — the last
+/// 2 GiB, which is the window `-C code-model=kernel` assumes.
+///
+/// The kernel is *loaded* at 1 MiB physical and *runs* at `KERNEL_VMA + 1 MiB`.
+/// Anything that turns a linker symbol into a physical address goes through
+/// [`kernel_phys`]; getting that wrong used to be impossible, because the two
+/// were the same number.
+pub const KERNEL_VMA: u64 = 0xFFFF_FFFF_8000_0000;
+
+/// How much physical memory is reachable through the `KERNEL_VMA` window.
+///
+/// The trampoline maps a full 1 GiB there and [`init`] keeps a smaller slice, so
+/// this is the bound during construction — before the physmap exists and while
+/// `KERNEL_VMA + phys` is the only way to reach a fresh page-table frame.
+pub const KERNEL_WINDOW_SIZE: u64 = 1024 * 1024 * 1024;
+
+/// Physical address of a kernel-image virtual address.
+///
+/// Only valid for addresses inside the kernel window — linker symbols, the frame
+/// bitmap, VGA. Use [`translate`] for anything else.
+pub const fn kernel_phys(virt: u64) -> u64 {
+    virt - KERNEL_VMA
+}
+
+/// Kernel-virtual address of a physical address in the low window.
+///
+/// The inverse of [`kernel_phys`], and usable *before* the physmap exists —
+/// which is what makes it the right tool for the frame bitmap and for the VGA
+/// buffer, both of which are touched before `paging::init` runs.
+pub const fn kernel_virt(phys: u64) -> u64 {
+    phys + KERNEL_VMA
+}
+
 extern "C" {
     static __kernel_start: u8;
     static __text_start: u8;
@@ -66,20 +99,31 @@ unsafe impl FrameAllocator<Size4KiB> for KoshFrameAllocator {
     }
 }
 
-/// Set once `init` has switched CR3. Before that, physical addresses must be
-/// reached through the bootstrap identity map instead.
+/// True once `init` has switched CR3 and the physmap covers all of RAM.
+///
+/// There used to be a `phys_to_virt` here that consulted this and returned
+/// either the physical address unchanged (identity map) or `PHYSMAP_BASE + phys`.
+/// It had no callers, and the higher-half migration is what made it a trap
+/// rather than a convenience: "the kernel-virtual address of this frame" now has
+/// two right answers depending on *when* you ask, and hiding that behind one
+/// function invites using the wrong one. Call [`kernel_virt`] before `init` and
+/// add [`PHYSMAP_BASE`] after it, deliberately.
 static PHYSMAP_ACTIVE: Mutex<bool> = Mutex::new(false);
 
-/// Translate a physical address to a kernel-virtual one.
+/// Whether the physmap covers all of physical memory yet.
+pub fn physmap_active() -> bool {
+    *PHYSMAP_ACTIVE.lock()
+}
+
+/// How much physical memory `init` actually mapped into the kernel window.
 ///
-/// Before [`init`] this is the identity map (offset 0); afterwards it is the
-/// physmap. Callers do not need to care which.
-pub fn phys_to_virt(phys: u64) -> u64 {
-    if *PHYSMAP_ACTIVE.lock() {
-        PHYSMAP_BASE + phys
-    } else {
-        phys
-    }
+/// The trampoline maps a full 1 GiB there; the real tables map only as far as
+/// the frame bitmap needs, so reporting `KERNEL_WINDOW_SIZE` as the window would
+/// overstate it by two orders of magnitude.
+static KERNEL_WINDOW_END: Mutex<u64> = Mutex::new(0);
+
+pub fn kernel_window_end() -> u64 {
+    *KERNEL_WINDOW_END.lock()
 }
 
 /// Build the kernel's own page tables and install them.
@@ -106,27 +150,36 @@ pub fn init(phys_mem_end: u64) -> Result<(), &'static str> {
     }
     serial_println!("  CR0.WP enabled (read-only pages enforced in ring 0)");
 
-    // We are still running on the bootstrap identity map, so a physical
-    // address is also a valid virtual address. That is what makes it possible
-    // to build a fresh table hierarchy at all.
+    // The physmap does not exist yet, so a freshly-allocated table frame has to
+    // be reached through the window the trampoline set up: `KERNEL_VMA + phys`,
+    // valid for the low 1 GiB. `BootstrapFrameAllocator` refuses anything above
+    // that rather than handing back a pointer that faults on first write.
     let pml4_frame = allocate_frame().ok_or("no frame for PML4")?;
     let pml4_phys = pml4_frame.address() as u64;
+    check_bootstrap_reachable(pml4_phys)?;
     let pml4: &mut PageTable = unsafe {
-        let ptr = pml4_phys as *mut PageTable;
+        let ptr = kernel_virt(pml4_phys) as *mut PageTable;
         ptr.write(PageTable::new());
         &mut *ptr
     };
 
-    // Offset 0: during construction, physical == virtual.
-    let mut mapper = unsafe { OffsetPageTable::new(pml4, VirtAddr::new(0)) };
-    let mut frames = KoshFrameAllocator;
+    // The offset the mapper uses to reach the tables it is editing. During
+    // construction that is the kernel window, not the physmap — the physmap is
+    // one of the things being built.
+    let mut mapper = unsafe { OffsetPageTable::new(pml4, VirtAddr::new(KERNEL_VMA)) };
+    let mut frames = BootstrapFrameAllocator;
 
     map_kernel_image(&mut mapper, &mut frames)?;
-    let identity_end = map_low_identity(&mut mapper, &mut frames)?;
+    let window_end = map_kernel_window(&mut mapper, &mut frames)?;
     map_physical_memory(&mut mapper, &mut frames, phys_mem_end)?;
 
     // Install. From the next instruction onwards the kernel is running on
     // tables it built, with W^X enforced and a real physmap.
+    //
+    // Nothing about this instruction is delicate any more: RIP, RSP and every
+    // static are higher-half addresses that the new tables map, so the switch is
+    // invisible. Before the migration it worked only because the new tables
+    // reproduced the bootstrap identity map exactly.
     unsafe {
         Cr3::write(
             PhysFrame::containing_address(PhysAddr::new(pml4_phys)),
@@ -135,12 +188,13 @@ pub fn init(phys_mem_end: u64) -> Result<(), &'static str> {
     }
 
     *PHYSMAP_ACTIVE.lock() = true;
+    *KERNEL_WINDOW_END.lock() = window_end;
 
     serial_println!("  CR3 -> 0x{:x} (kernel page tables active)", pml4_phys);
     serial_println!(
-        "  identity window : 0x{:x}..0x{:x} (4 KiB pages, W^X)",
-        PAGE_SIZE,
-        identity_end
+        "  kernel window   : 0x{:x} -> 0x0..0x{:x} (4 KiB pages, W^X)",
+        KERNEL_VMA,
+        window_end
     );
     serial_println!(
         "  physmap         : 0x{:x} -> 0x0..0x{:x} (2 MiB pages, RW+NX)",
@@ -148,18 +202,50 @@ pub fn init(phys_mem_end: u64) -> Result<(), &'static str> {
         phys_mem_end
     );
     serial_println!("  page 0          : unmapped (null guard)");
+    serial_println!("  PML4[0]         : empty — reserved for user address spaces");
 
     Ok(())
 }
 
-/// Map the kernel image with per-section permissions.
+/// Frame allocator for the window between "no page tables of our own" and "a
+/// physmap". Every frame it hands out is about to be written through
+/// `KERNEL_VMA + phys`, so a frame outside that window is not a subtle problem.
+struct BootstrapFrameAllocator;
+
+unsafe impl FrameAllocator<Size4KiB> for BootstrapFrameAllocator {
+    fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
+        let frame = allocate_frame()?;
+        let phys = frame.address() as u64;
+        if phys >= KERNEL_WINDOW_SIZE {
+            // Returning None would surface as a vague "failed to map" further
+            // up, so say what actually happened.
+            serial_println!(
+                "  FATAL: page-table frame at 0x{:x} is outside the 0x{:x} bootstrap window",
+                phys,
+                KERNEL_WINDOW_SIZE
+            );
+            return None;
+        }
+        Some(PhysFrame::containing_address(PhysAddr::new(phys)))
+    }
+}
+
+fn check_bootstrap_reachable(phys: u64) -> Result<(), &'static str> {
+    if phys >= KERNEL_WINDOW_SIZE {
+        return Err("PML4 frame is outside the bootstrap kernel window");
+    }
+    Ok(())
+}
+
+/// Map the kernel image at [`KERNEL_VMA`] with per-section permissions.
 ///
-/// The identity mapping is kept — the kernel is linked at 1 MiB and is
-/// executing there, so it cannot move without a jump trampoline. What changes
-/// is the permissions: `.text` loses write, everything else loses execute.
+/// `.text` loses write, `.rodata` loses execute and write, everything else
+/// loses execute. The addresses here are already higher-half — they are the
+/// linker symbols — and [`kernel_phys`] turns each one back into the frame GRUB
+/// actually loaded it into.
 fn map_kernel_image(
     mapper: &mut OffsetPageTable,
-    frames: &mut KoshFrameAllocator,
+    frames: &mut BootstrapFrameAllocator,
 ) -> Result<(), &'static str> {
     let text_start = align_down_page(sym(unsafe { &__text_start }));
     let text_end = align_up_page(sym(unsafe { &__text_end }));
@@ -182,7 +268,7 @@ fn map_kernel_image(
         } else {
             rw
         };
-        identity_map_4k(mapper, frames, addr, flags)?;
+        map_window_4k(mapper, frames, addr, flags)?;
         addr += PAGE_SIZE as u64;
     }
 
@@ -197,13 +283,20 @@ fn map_kernel_image(
     Ok(())
 }
 
-/// Identity-map the low region the kernel still touches by physical address:
-/// VGA at 0xB8000, and the physical frame bitmap.
+/// Map the low physical region the kernel reaches by `KERNEL_VMA + phys`:
+/// VGA at 0xB8000, the multiboot info GRUB left below 1 MiB, and the physical
+/// frame bitmap.
 ///
-/// Page 0 is skipped so a null dereference still faults.
-fn map_low_identity(
+/// This used to be `map_low_identity`, and it mapped the same frames at the same
+/// numeric addresses in PML4[0]. The frames are identical; the virtual addresses
+/// moved out of the half that belongs to userspace. That move is the whole
+/// point of the migration — everything else here is unchanged.
+///
+/// Physical page 0 is skipped so that `KERNEL_VMA` itself is unmapped, the same
+/// null guard the identity map had at address 0.
+fn map_kernel_window(
     mapper: &mut OffsetPageTable,
-    frames: &mut KoshFrameAllocator,
+    frames: &mut BootstrapFrameAllocator,
 ) -> Result<u64, &'static str> {
     let (_bitmap_start, bitmap_end) = bitmap_extent();
     let kernel_start = align_down_page(sym(unsafe { &__kernel_start }));
@@ -212,18 +305,22 @@ fn map_low_identity(
     // One 2 MiB of slack past the bitmap covers early page-table frames, which
     // the allocator hands out from just above it.
     let end = align_up_2mib(bitmap_end as u64 + 2 * 1024 * 1024);
+    if end > KERNEL_WINDOW_SIZE {
+        return Err("kernel window is not big enough for the frame bitmap");
+    }
 
     let rw = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
 
-    let mut addr = PAGE_SIZE as u64; // skip page 0: null guard
-    while addr < end {
+    let mut phys = PAGE_SIZE as u64; // skip physical page 0: null guard
+    while phys < end {
+        let virt = kernel_virt(phys);
         // The kernel image was already mapped with tighter permissions.
-        if addr >= kernel_start && addr < kernel_end {
-            addr += PAGE_SIZE as u64;
+        if virt >= kernel_start && virt < kernel_end {
+            phys += PAGE_SIZE as u64;
             continue;
         }
-        identity_map_4k(mapper, frames, addr, rw)?;
-        addr += PAGE_SIZE as u64;
+        map_window_4k(mapper, frames, virt, rw)?;
+        phys += PAGE_SIZE as u64;
     }
 
     Ok(end)
@@ -232,7 +329,7 @@ fn map_low_identity(
 /// Map all of physical memory at [`PHYSMAP_BASE`] using 2 MiB pages.
 fn map_physical_memory(
     mapper: &mut OffsetPageTable,
-    frames: &mut KoshFrameAllocator,
+    frames: &mut BootstrapFrameAllocator,
     phys_mem_end: u64,
 ) -> Result<(), &'static str> {
     const HUGE: u64 = 2 * 1024 * 1024;
@@ -260,19 +357,25 @@ fn map_physical_memory(
     Ok(())
 }
 
-fn identity_map_4k(
+/// Map one page of the `KERNEL_VMA` window to the frame it corresponds to.
+///
+/// `virt` is a higher-half address; the frame is `virt - KERNEL_VMA`. Before the
+/// migration this function was `identity_map_4k` and the frame was `virt`
+/// itself, which is the single line that made the kernel unmovable.
+fn map_window_4k(
     mapper: &mut OffsetPageTable,
-    frames: &mut KoshFrameAllocator,
-    addr: u64,
+    frames: &mut BootstrapFrameAllocator,
+    virt: u64,
     flags: PageTableFlags,
 ) -> Result<(), &'static str> {
-    let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(addr));
-    let frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(PhysAddr::new(addr));
+    let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(virt));
+    let frame: PhysFrame<Size4KiB> =
+        PhysFrame::containing_address(PhysAddr::new(kernel_phys(virt)));
 
     unsafe {
         mapper
             .map_to(page, frame, flags, frames)
-            .map_err(|_| "failed to identity-map page")?
+            .map_err(|_| "failed to map a kernel window page")?
             .ignore();
     }
     Ok(())
@@ -460,28 +563,36 @@ fn align_up_2mib(addr: u64) -> u64 {
 pub fn self_test() {
     serial_println!("Verifying kernel page tables...");
 
-    // The physmap must alias the identity region. Reading the kernel's first
-    // bytes through both windows must give the same value.
+    // The physmap must alias the kernel window. Reading the kernel's first bytes
+    // through both must give the same value.
     let kernel_start = align_down_page(sym(unsafe { &__kernel_start }));
-    let via_identity = unsafe { core::ptr::read_volatile(kernel_start as *const u64) };
-    let via_physmap =
-        unsafe { core::ptr::read_volatile((PHYSMAP_BASE + kernel_start) as *const u64) };
+    let kernel_phys_start = kernel_phys(kernel_start);
 
-    if via_identity == via_physmap {
-        serial_println!("  physmap aliases identity map: OK (0x{:016x})", via_identity);
+    let via_window = unsafe { core::ptr::read_volatile(kernel_start as *const u64) };
+    let via_physmap =
+        unsafe { core::ptr::read_volatile((PHYSMAP_BASE + kernel_phys_start) as *const u64) };
+
+    if via_window == via_physmap {
+        serial_println!("  physmap aliases identity map: OK (0x{:016x})", via_window);
     } else {
         serial_println!(
-            "  physmap MISMATCH: identity 0x{:x} vs physmap 0x{:x}",
-            via_identity,
+            "  physmap MISMATCH: window 0x{:x} vs physmap 0x{:x}",
+            via_window,
             via_physmap
         );
     }
 
     match translate(kernel_start) {
-        Some(phys) if phys == kernel_start => {
-            serial_println!("  translate(0x{:x}) -> 0x{:x}: OK", kernel_start, phys)
-        }
-        Some(phys) => serial_println!("  translate mismatch: 0x{:x}", phys),
+        Some(phys) if phys == kernel_phys_start => serial_println!(
+            "  translate(0x{:x}) -> 0x{:x}: OK",
+            kernel_start,
+            phys
+        ),
+        Some(phys) => serial_println!(
+            "  translate mismatch: 0x{:x}, expected 0x{:x}",
+            phys,
+            kernel_phys_start
+        ),
         None => serial_println!("  translate FAILED: kernel not mapped?"),
     }
 
@@ -489,5 +600,25 @@ pub fn self_test() {
         serial_println!("  page 0 unmapped: OK (null dereferences will fault)");
     } else {
         serial_println!("  WARNING: page 0 is mapped, null dereferences will NOT fault");
+    }
+
+    // The point of the whole migration: the kernel is no longer anywhere in the
+    // half of the address space a user process needs.
+    //
+    // Checking the *image* address specifically, rather than PML4[0] being
+    // empty, because PML4[0] is exactly where user mappings live — it is
+    // populated, just not by us.
+    let low_kernel = translate(kernel_phys_start);
+    if low_kernel.is_none() {
+        serial_println!(
+            "  kernel out of PML4[0]: OK (0x{:x} is unmapped, was the kernel image)",
+            kernel_phys_start
+        );
+    } else {
+        serial_println!(
+            "  WARNING: 0x{:x} still maps to 0x{:x} — the low identity map survived",
+            kernel_phys_start,
+            low_kernel.unwrap()
+        );
     }
 }

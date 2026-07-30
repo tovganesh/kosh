@@ -13,11 +13,19 @@ extern "C" {
 /// Physical extent of the kernel image as actually loaded by the bootloader.
 /// These frames must never be handed out by the allocator — the boot page
 /// tables and the boot stack live in .bss, inside this range.
+///
+/// The linker symbols are higher-half addresses (the kernel is linked at
+/// `KERNEL_VMA + 1 MiB` and loaded at 1 MiB), so each one is converted. Before
+/// the migration this function returned the symbols unchanged and was correct
+/// only because the two numbers were the same. Getting it wrong now means the
+/// comparison at the bottom of `mark_available_frames` never matches and the
+/// allocator hands out the running kernel's own frames.
 fn kernel_image_range() -> (usize, usize) {
+    use crate::memory::paging::kernel_phys;
     unsafe {
         (
-            &__kernel_start as *const u8 as usize,
-            &__kernel_end as *const u8 as usize,
+            kernel_phys(&__kernel_start as *const u8 as u64) as usize,
+            kernel_phys(&__kernel_end as *const u8 as u64) as usize,
         )
     }
 }
@@ -140,9 +148,17 @@ impl PhysicalMemoryManager {
             }
         }
         
-        // Initialize bitmap memory
+        // The bitmap lives at a physical address, but it has to be *written*
+        // through a virtual one — and this runs before `paging::init`, so the
+        // physmap does not exist yet. `KERNEL_VMA + phys` is the window the boot
+        // trampoline set up, and `paging::init` deliberately keeps it, so this
+        // pointer stays valid for the life of the kernel and needs no rebasing
+        // when the low identity map goes away.
         let bitmap = unsafe {
-            core::slice::from_raw_parts_mut(bitmap_start as *mut u8, bitmap_size)
+            core::slice::from_raw_parts_mut(
+                crate::memory::paging::kernel_virt(bitmap_start as u64) as *mut u8,
+                bitmap_size,
+            )
         };
         
         // Clear the bitmap (all pages initially marked as used)

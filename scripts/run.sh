@@ -105,6 +105,15 @@ cp "$HELLO" "$ISO_DIR/boot/hello"
 cp "$KSH"   "$ISO_DIR/boot/ksh"
 
 cat > "$ISO_DIR/boot/grub/grub.cfg" <<'EOF'
+# Put GRUB's own output on COM1 as well as the screen. A kernel that GRUB
+# refuses to load produces no serial output at all, which looks exactly like a
+# kernel that hung on its first instruction — and the message that tells the two
+# apart ("error: entry point isn't in a segment") only ever went to the VGA
+# console, which --check does not capture.
+serial --unit=0 --speed=38400 --word=8 --parity=no --stop=1
+terminal_output serial console
+terminal_input serial console
+
 set timeout=0
 set default=0
 
@@ -227,6 +236,7 @@ check)
         "kernel page tables active" \
         "physmap aliases identity map: OK" \
         "page 0 unmapped: OK" \
+        "kernel out of PML4[0]: OK" \
         "PASS: heap fully reclaimed" \
         "Scheduler: PASS" \
         "hello from ring 3" \

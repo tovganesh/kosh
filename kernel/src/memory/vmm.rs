@@ -282,27 +282,36 @@ impl VirtualAddressSpace {
     }
 }
 
-/// Kernel virtual memory layout constants
+/// Kernel virtual memory layout constants.
+///
+/// These used to be three invented numbers — code at `KERNEL_VMA`, data 16 MiB
+/// above it, heap 16 MiB above that — describing a layout nothing had ever
+/// built. They were printed in the boot log next to the real one, which is
+/// worse than not printing them at all.
+///
+/// They are derived from `memory::paging` now, so the layout this module reports
+/// is the layout the page tables actually have. `KERNEL_CODE_START` finally
+/// being correct is not a coincidence: the higher-half migration moved the
+/// kernel to the address this constant had been claiming all along.
 pub mod kernel_layout {
     use super::VirtualAddress;
-    
-    /// Kernel code start address (higher half)
-    pub const KERNEL_CODE_START: VirtualAddress = VirtualAddress(0xFFFFFFFF80000000);
-    
-    /// Kernel code size (16MB)
-    pub const KERNEL_CODE_SIZE: usize = 16 * 1024 * 1024;
-    
-    /// Kernel data start address
-    pub const KERNEL_DATA_START: VirtualAddress = VirtualAddress(0xFFFFFFFF81000000);
-    
-    /// Kernel data size (16MB)
-    pub const KERNEL_DATA_SIZE: usize = 16 * 1024 * 1024;
-    
-    /// Kernel heap start address
-    pub const KERNEL_HEAP_START: VirtualAddress = VirtualAddress(0xFFFFFFFF82000000);
-    
-    /// Kernel heap size (64MB)
-    pub const KERNEL_HEAP_SIZE: usize = 64 * 1024 * 1024;
+
+    /// Base of the kernel image window. The image itself starts 1 MiB in;
+    /// the first page is left unmapped as the null guard.
+    pub const KERNEL_CODE_START: VirtualAddress =
+        VirtualAddress(crate::memory::paging::KERNEL_VMA as usize);
+
+    /// Upper bound on the kernel window. The amount `paging::init` actually
+    /// maps is smaller and only known at run time — see
+    /// `paging::kernel_window_end`, which is what the layout dump reports.
+    pub const KERNEL_CODE_SIZE: usize = crate::memory::paging::KERNEL_WINDOW_SIZE as usize;
+
+    /// Kernel heap start address — the window `memory::heap` actually maps.
+    pub const KERNEL_HEAP_START: VirtualAddress =
+        VirtualAddress(crate::memory::paging::KERNEL_HEAP_BASE as usize);
+
+    /// Kernel heap size. Matches `boot::HEAP_SIZE_PAGES` worth of 4 KiB pages.
+    pub const KERNEL_HEAP_SIZE: usize = 1024 * 4096;
     
     /// Physical memory mapping start (for higher half kernel)
     /// Offset at which all of physical memory is visible in the virtual
@@ -357,24 +366,27 @@ unsafe fn get_level_4_page_table() -> &'static mut PageTable {
 fn setup_kernel_memory_layout(vas: &mut VirtualAddressSpace) -> Result<(), &'static str> {
     serial_println!("Setting up kernel virtual memory layout...");
     
-    // Add kernel code region
+    // The kernel image window. One region rather than separate code and data
+    // ones: the image is a single contiguous span whose per-section permissions
+    // live in the page tables, not in a table of constants.
     let kernel_code_region = VirtualMemoryRegion::new(
         kernel_layout::KERNEL_CODE_START,
-        kernel_layout::KERNEL_CODE_SIZE,
+        crate::memory::paging::kernel_window_end() as usize,
         MemoryProtection::read_execute(),
-        "Kernel Code"
+        "Kernel Window"
     );
     vas.add_region(kernel_code_region);
-    
-    // Add kernel data region
-    let kernel_data_region = VirtualMemoryRegion::new(
-        kernel_layout::KERNEL_DATA_START,
-        kernel_layout::KERNEL_DATA_SIZE,
+
+    // The physmap, which was missing from this table entirely even though it is
+    // the largest mapping the kernel has.
+    let physmap_region = VirtualMemoryRegion::new(
+        kernel_layout::PHYSICAL_MEMORY_OFFSET,
+        crate::memory::physical::physical_memory_end() as usize,
         MemoryProtection::read_write(),
-        "Kernel Data"
+        "Physmap"
     );
-    vas.add_region(kernel_data_region);
-    
+    vas.add_region(physmap_region);
+
     // Add kernel heap region
     let kernel_heap_region = VirtualMemoryRegion::new(
         kernel_layout::KERNEL_HEAP_START,
@@ -548,13 +560,23 @@ mod tests {
     
     #[test_case]
     fn test_kernel_layout_constants() {
-        // Verify kernel layout constants are properly defined
-        assert_eq!(kernel_layout::KERNEL_CODE_START.as_usize(), 0xFFFFFFFF80000000);
-        assert_eq!(kernel_layout::KERNEL_CODE_SIZE, 16 * 1024 * 1024);
-        assert_eq!(kernel_layout::KERNEL_DATA_START.as_usize(), 0xFFFFFFFF81000000);
-        assert_eq!(kernel_layout::KERNEL_DATA_SIZE, 16 * 1024 * 1024);
-        assert_eq!(kernel_layout::KERNEL_HEAP_START.as_usize(), 0xFFFFFFFF82000000);
-        assert_eq!(kernel_layout::KERNEL_HEAP_SIZE, 64 * 1024 * 1024);
-        assert_eq!(kernel_layout::PHYSICAL_MEMORY_OFFSET.as_usize(), 0xFFFF800000000000);
+        // These now assert against `memory::paging`, so the test fails if the two
+        // modules ever disagree about where the kernel lives — which is the only
+        // thing worth asserting about a constant.
+        assert_eq!(
+            kernel_layout::KERNEL_CODE_START.as_usize(),
+            crate::memory::paging::KERNEL_VMA as usize
+        );
+        assert_eq!(
+            kernel_layout::KERNEL_HEAP_START.as_usize(),
+            crate::memory::paging::KERNEL_HEAP_BASE as usize
+        );
+        assert_eq!(
+            kernel_layout::PHYSICAL_MEMORY_OFFSET.as_usize(),
+            crate::memory::paging::PHYSMAP_BASE as usize
+        );
+        // The kernel window has to start below the heap window, or the two
+        // descriptions overlap and the layout dump is nonsense.
+        assert!(kernel_layout::KERNEL_HEAP_START.as_usize() < kernel_layout::KERNEL_CODE_START.as_usize());
     }
 }

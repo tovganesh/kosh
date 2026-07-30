@@ -121,8 +121,11 @@ pub fn boot_module_named(name: &str) -> Option<BootModule> {
         .copied()
 }
 
-/// Where the user blob is mapped. 1 GiB — clear of the kernel's low identity
-/// window and nowhere near the higher half.
+/// Where the user blob is mapped. 1 GiB into the lower half.
+///
+/// It used to have to dodge the kernel's low identity window; there isn't one
+/// any more, so the whole lower half belongs to userspace and this is just a
+/// round number that keeps the payload clear of the loaded ELFs at 4 and 8 MiB.
 pub const USER_CODE_BASE: u64 = 0x0000_0000_4000_0000;
 
 /// Top of the user stack, growing down.
@@ -155,6 +158,17 @@ fn sym(s: &u8) -> u64 {
     s as *const u8 as u64
 }
 
+/// Physical frame the `.user` section starts at.
+///
+/// The section is part of the kernel image, so its link-time address is
+/// higher-half; `map_user_range` needs the frame GRUB actually loaded it into.
+/// Passing the virtual address here used to work because they were the same
+/// number — now it would hand `PhysAddr::new` a value with bits above 52 set,
+/// which panics rather than silently mapping the wrong thing.
+fn user_blob_phys() -> u64 {
+    crate::memory::paging::kernel_phys(sym(unsafe { &__user_start }))
+}
+
 /// Map the user blob and its stack, then drop to ring 3.
 ///
 /// Runs as a kernel thread, so `sys_exit` can retire it through
@@ -184,12 +198,15 @@ pub fn run_user_demo(which: usize) {
     let code_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
     if !CODE_MAPPED.swap(true, Ordering::SeqCst) {
         serial_println!(
-            "  .user section  : 0x{:x}..0x{:x} ({} page(s))",
+            "  .user section  : 0x{:x}..0x{:x} ({} page(s), phys 0x{:x})",
             blob_start,
             blob_end,
-            blob_pages
+            blob_pages,
+            user_blob_phys()
         );
-        if let Err(e) = paging::map_user_range(USER_CODE_BASE, blob_start, blob_pages, code_flags) {
+        if let Err(e) =
+            paging::map_user_range(USER_CODE_BASE, user_blob_phys(), blob_pages, code_flags)
+        {
             serial_println!("  failed to map user code: {}", e);
             return;
         }
@@ -522,7 +539,9 @@ pub fn run_pingpong(which: usize) {
 
     let code_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
     if !CODE_MAPPED.swap(true, Ordering::SeqCst) {
-        if let Err(e) = paging::map_user_range(USER_CODE_BASE, blob_start, blob_pages, code_flags) {
+        if let Err(e) =
+            paging::map_user_range(USER_CODE_BASE, user_blob_phys(), blob_pages, code_flags)
+        {
             serial_println!("  failed to map user code: {}", e);
             return;
         }
