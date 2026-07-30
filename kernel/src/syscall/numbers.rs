@@ -9,6 +9,15 @@ pub const SYS_WAIT: u64 = 4;
 pub const SYS_GETPID: u64 = 5;
 pub const SYS_GETPPID: u64 = 6;
 pub const SYS_KILL: u64 = 7;
+/// Give up the rest of this thread's time slice.
+///
+/// Cheap to implement and unusually useful as a test: it is the only way for
+/// userspace to force a context switch *from inside a system call*, which is
+/// exactly the situation per-thread kernel stacks exist for.
+pub const SYS_YIELD: u64 = 8;
+/// Load a named program and run it. Not `fork`+`exec`: there is one address
+/// space, so there is nothing to duplicate. `spawn(path, len) -> task id`.
+pub const SYS_SPAWN: u64 = 9;
 
 /// Memory management system calls
 pub const SYS_MMAP: u64 = 10;
@@ -92,7 +101,9 @@ pub fn syscall_name(syscall_number: u64) -> &'static str {
         SYS_GETPID => "getpid",
         SYS_GETPPID => "getppid",
         SYS_KILL => "kill",
-        
+        SYS_YIELD => "yield",
+        SYS_SPAWN => "spawn",
+
         SYS_MMAP => "mmap",
         SYS_MUNMAP => "munmap",
         SYS_MPROTECT => "mprotect",

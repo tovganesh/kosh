@@ -71,6 +71,15 @@ fn print_u64(mut value: u64) {
 }
 
 /// Right-align a number in `width` columns.
+fn print_i64(value: i64) {
+    if value < 0 {
+        print("-");
+        print_u64(value.unsigned_abs());
+    } else {
+        print_u64(value as u64);
+    }
+}
+
 fn print_u64_padded(value: u64, width: usize) {
     let mut digits = 1;
     let mut v = value;
@@ -251,8 +260,13 @@ fn cmd_help() {
     println("  getpid                this process's id");
     println("  exit                  leave the shell");
     println("");
+    println("Anything else is treated as a program name: the kernel loads it,");
+    println("runs it on its own task, and this shell blocks until it exits.");
+    println("Try 'hello'.");
+    println("");
     println("Pipes, redirection and background jobs parse but do not run:");
-    println("they need fork and exec, which the kernel does not have yet.");
+    println("they need per-process address spaces, which the kernel does not");
+    println("have yet — spawn puts a second program in the same one.");
 }
 
 fn cmd_ls(cwd: &str, args: &[String]) {
@@ -462,6 +476,52 @@ fn report_unsupported(parsed: &ParsedCommand) -> bool {
     false
 }
 
+/// Run an external program: spawn it, wait for it, report a non-zero exit.
+///
+/// The shell blocks in the kernel's `wait` — `State::Blocked`, not a yield loop —
+/// so while the child runs, the shell costs nothing.
+///
+/// Only `ENOENT` becomes "command not found". Any other failure is a real error
+/// and gets said out loud, because "command not found" for what is actually
+/// "out of memory" or "that program's address range is already occupied" sends
+/// you looking in the wrong place.
+fn cmd_run(name: &str) {
+    let task = sys::spawn(name);
+
+    if task == sys::ENOENT {
+        print("ksh: ");
+        print(name);
+        println(": command not found");
+        return;
+    }
+
+    if task < 0 {
+        print("ksh: ");
+        print(name);
+        print(": could not start (error ");
+        print_i64(task);
+        println(")");
+        return;
+    }
+
+    let mut status: i32 = 0;
+    let waited = sys::wait(task, &mut status);
+    if waited < 0 {
+        print("ksh: ");
+        print(name);
+        println(": wait failed");
+        return;
+    }
+
+    if status != 0 {
+        print("ksh: ");
+        print(name);
+        print(": exited ");
+        print_i64(status as i64);
+        println("");
+    }
+}
+
 // --- entry -----------------------------------------------------------------
 
 // System V says RSP is 16-byte aligned at process entry, but a Rust
@@ -545,11 +605,10 @@ pub extern "C" fn ksh_main() -> ! {
                 println("ksh: exiting");
                 sys::exit(0);
             }
-            other => {
-                print("ksh: ");
-                print(other);
-                println(": command not found");
-            }
+            // Not a builtin: ask the kernel to run a program by that name. This
+            // is the one thing a shell exists for, and until `spawn` landed it
+            // was the one thing this shell could not do.
+            other => cmd_run(other),
         }
     }
 }

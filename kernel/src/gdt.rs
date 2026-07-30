@@ -1,9 +1,6 @@
 //! GDT and TSS.
 //!
-//! Split out of `boot.rs` in Phase 5, because the descriptor *order* stops
-//! being arbitrary the moment `syscall`/`sysret` exist.
-//!
-//! ## Why the order is forced
+//! ## Why the descriptor order is forced
 //!
 //! `syscall` loads CS from `STAR[47:32]` and SS from `STAR[47:32] + 8`.
 //! `sysretq` loads CS from `STAR[63:48] + 16` and SS from `STAR[63:48] + 8`.
@@ -23,11 +20,17 @@
 //! write out the `sysret` arithmetic; getting it the intuitive way round is a
 //! classic way to land in a #GP the first time a process returns to ring 3.
 //!
-//! Before Phase 5 this table had three entries — kernel code, kernel data,
-//! TSS — so the `cs: 0x1B / ss: 0x23` values in `process/context.rs` pointed at
-//! descriptors that did not exist.
+//! ## Why this is not a `lazy_static`
+//!
+//! `TSS.RSP0` — the stack the CPU switches to when an interrupt arrives in
+//! ring 3 — has to change on every context switch, because it has to name the
+//! *incoming* thread's kernel stack. A `lazy_static` gives out `&TSS` and no way
+//! to mutate it, which is why [`set_kernel_stack`] used to be
+//! `unimplemented!()`. The table and the TSS are now plain statics initialised
+//! imperatively, in a defined order.
 
-use lazy_static::lazy_static;
+use core::ptr::{addr_of, addr_of_mut};
+
 use x86_64::instructions::segmentation::{Segment, CS, DS, ES, FS, GS, SS};
 use x86_64::instructions::tables::load_tss;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
@@ -43,35 +46,18 @@ use crate::serial_println;
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
 const DOUBLE_FAULT_STACK_SIZE: usize = 4096 * 5;
-const KERNEL_INTERRUPT_STACK_SIZE: usize = 4096 * 5;
+const BOOT_KERNEL_STACK_SIZE: usize = 4096 * 5;
 
 static mut DOUBLE_FAULT_STACK: [u8; DOUBLE_FAULT_STACK_SIZE] = [0; DOUBLE_FAULT_STACK_SIZE];
 
-/// The stack the CPU switches to when an interrupt arrives while running in
-/// ring 3. Without a valid RSP0, the first timer tick after entering user mode
-/// is a triple fault.
-static mut KERNEL_INTERRUPT_STACK: [u8; KERNEL_INTERRUPT_STACK_SIZE] =
-    [0; KERNEL_INTERRUPT_STACK_SIZE];
+/// RSP0 before any thread has claimed it. Only used between `gdt::init` and the
+/// first context switch, during which nothing runs in ring 3.
+static mut BOOT_KERNEL_STACK: [u8; BOOT_KERNEL_STACK_SIZE] = [0; BOOT_KERNEL_STACK_SIZE];
 
-lazy_static! {
-    static ref TSS: TaskStateSegment = {
-        let mut tss = TaskStateSegment::new();
+static mut TSS: TaskStateSegment = TaskStateSegment::new();
+static mut GDT: GlobalDescriptorTable = GlobalDescriptorTable::new();
 
-        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
-            let start = VirtAddr::from_ptr(&raw const DOUBLE_FAULT_STACK);
-            start + DOUBLE_FAULT_STACK_SIZE
-        };
-
-        // RSP0: ring 3 -> ring 0 stack switch on interrupt.
-        tss.privilege_stack_table[0] = {
-            let start = VirtAddr::from_ptr(&raw const KERNEL_INTERRUPT_STACK);
-            start + KERNEL_INTERRUPT_STACK_SIZE
-        };
-
-        tss
-    };
-}
-
+#[derive(Debug, Clone, Copy)]
 pub struct Selectors {
     pub kernel_code: SegmentSelector,
     pub kernel_data: SegmentSelector,
@@ -80,77 +66,99 @@ pub struct Selectors {
     pub tss: SegmentSelector,
 }
 
-lazy_static! {
-    static ref GDT: (GlobalDescriptorTable, Selectors) = {
-        let mut gdt = GlobalDescriptorTable::new();
+static mut SELECTORS: Option<Selectors> = None;
+
+pub fn selectors() -> Selectors {
+    unsafe { (*addr_of!(SELECTORS)).expect("gdt::init has not run") }
+}
+
+/// Build the TSS and GDT, load them, and reload every segment register.
+pub fn init() {
+    serial_println!("Setting up GDT and TSS...");
+
+    unsafe {
+        let tss = &mut *addr_of_mut!(TSS);
+
+        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
+            let start = VirtAddr::from_ptr(addr_of!(DOUBLE_FAULT_STACK));
+            start + DOUBLE_FAULT_STACK_SIZE
+        };
+
+        tss.privilege_stack_table[0] = {
+            let start = VirtAddr::from_ptr(addr_of!(BOOT_KERNEL_STACK));
+            start + BOOT_KERNEL_STACK_SIZE
+        };
+
+        let gdt = &mut *addr_of_mut!(GDT);
 
         // Order is load-bearing — see the module docs.
         let kernel_code = gdt.add_entry(Descriptor::kernel_code_segment());
         let kernel_data = gdt.add_entry(Descriptor::kernel_data_segment());
         let user_data = gdt.add_entry(Descriptor::user_data_segment());
         let user_code = gdt.add_entry(Descriptor::user_code_segment());
-        let tss = gdt.add_entry(Descriptor::tss_segment(&TSS));
+        let tss_sel = gdt.add_entry(Descriptor::tss_segment(&*addr_of!(TSS)));
 
-        (
-            gdt,
-            Selectors {
-                kernel_code,
-                kernel_data,
-                user_data,
-                user_code,
-                tss,
-            },
-        )
-    };
-}
+        let selectors = Selectors {
+            kernel_code,
+            kernel_data,
+            user_data,
+            user_code,
+            tss: tss_sel,
+        };
+        *addr_of_mut!(SELECTORS) = Some(selectors);
 
-pub fn selectors() -> &'static Selectors {
-    &GDT.1
-}
+        gdt.load();
 
-/// Load the GDT, reload every segment register, and install the TSS.
-pub fn init() {
-    serial_println!("Setting up GDT and TSS...");
+        CS::set_reg(kernel_code);
+        DS::set_reg(kernel_data);
+        ES::set_reg(kernel_data);
+        FS::set_reg(kernel_data);
+        GS::set_reg(kernel_data);
+        SS::set_reg(kernel_data);
 
-    GDT.0.load();
+        load_tss(tss_sel);
 
-    let sel = selectors();
-
-    unsafe {
-        CS::set_reg(sel.kernel_code);
-        DS::set_reg(sel.kernel_data);
-        ES::set_reg(sel.kernel_data);
-        FS::set_reg(sel.kernel_data);
-        GS::set_reg(sel.kernel_data);
-        SS::set_reg(sel.kernel_data);
-
-        load_tss(sel.tss);
+        serial_println!(
+            "  selectors: kcode 0x{:x}, kdata 0x{:x}, udata 0x{:x}, ucode 0x{:x}, tss 0x{:x}",
+            kernel_code.0,
+            kernel_data.0,
+            user_data.0,
+            user_code.0,
+            tss_sel.0
+        );
+        serial_println!(
+            "  TSS.RSP0 = 0x{:x} (boot stack; per-thread from the first switch)",
+            tss.privilege_stack_table[0].as_u64()
+        );
     }
-
-    serial_println!(
-        "  selectors: kcode 0x{:x}, kdata 0x{:x}, udata 0x{:x}, ucode 0x{:x}, tss 0x{:x}",
-        sel.kernel_code.0,
-        sel.kernel_data.0,
-        sel.user_data.0,
-        sel.user_code.0,
-        sel.tss.0
-    );
-    serial_println!(
-        "  TSS.RSP0 = 0x{:x} (ring 3 -> ring 0 interrupt stack)",
-        TSS.privilege_stack_table[0].as_u64()
-    );
 }
 
-/// Point RSP0 at a specific kernel stack.
+/// Point RSP0 at `top`.
 ///
-/// Phase 5 runs exactly one ring-3 thread, so the static stack above is enough.
-/// Once several threads can be in user mode, this must be called on every
-/// context switch with the incoming thread's kernel stack — otherwise two
-/// threads share one interrupt stack and corrupt each other's frames.
-#[allow(dead_code)]
-pub fn set_kernel_stack(_top: VirtAddr) {
-    // Deliberately not implemented yet rather than silently doing nothing:
-    // the TSS is behind a `lazy_static` and needs interior mutability to
-    // update. Phase 6 turns the TSS into a `static mut` per CPU.
-    unimplemented!("per-thread RSP0 arrives with multiple user threads");
+/// Called on every context switch with the incoming thread's kernel stack.
+/// Without this, two threads in ring 3 would share one interrupt stack and
+/// corrupt each other's exception frames the moment both were interrupted.
+///
+/// Note that the same stack serves a thread's syscalls and its ring-3
+/// interrupts. That is safe because RSP0 is only consumed when the CPU switches
+/// *from* ring 3: if the thread is already in the kernel, an interrupt stays on
+/// the stack it is already using, and the syscall frame is not at risk.
+pub fn set_kernel_stack(top: VirtAddr) {
+    unsafe {
+        (*addr_of_mut!(TSS)).privilege_stack_table[0] = top;
+    }
+}
+
+/// Current RSP0, for diagnostics.
+pub fn kernel_stack() -> VirtAddr {
+    unsafe { (*addr_of!(TSS)).privilege_stack_table[0] }
+}
+
+/// Top of the stack `init` installed as RSP0.
+///
+/// `task::init` adopts this as thread 0's kernel stack, so that the bootstrap
+/// context has a real answer for `gs:0` rather than a zero.
+pub fn boot_kernel_stack_top() -> VirtAddr {
+    let start = VirtAddr::from_ptr(unsafe { addr_of!(BOOT_KERNEL_STACK) });
+    (start + BOOT_KERNEL_STACK_SIZE).align_down(16u64)
 }

@@ -234,6 +234,9 @@ check)
         "ring 3 fault — terminating the process" \
         "Ring 3: PASS" \
         "kernel survived a ring 3 fault" \
+        "A: survived 12 yields inside a syscall" \
+        "B: survived 12 yields inside a syscall" \
+        "Concurrent ring 3: PASS" \
         "hello from a loaded ELF binary" \
         ".bss was zeroed correctly" \
         "stack is writable and readable" \
@@ -326,7 +329,19 @@ check-cli)
         type_line "echo hello from ring 3 shell"
         type_line "stat big.txt"
         type_line "cat nope.txt"
+        # An unknown command is now a spawn attempt, so this also proves ENOENT
+        # from spawn still reads as "command not found" and nothing else does.
         type_line "nosuchcommand"
+        # The real thing: the shell launches a separate program, blocks in the
+        # kernel's wait, and gets its prompt back when the child exits. Twice,
+        # because running a program a second time is what exercises the teardown
+        # of the first one's mappings.
+        type_line "hello"
+        type_line "hello"
+        # One address space, so a program cannot be loaded on top of one that is
+        # already resident. Spawning ksh from ksh has to be refused, not
+        # attempted — it would overwrite the .text currently executing.
+        type_line "ksh"
         # The shell must refuse redirection rather than silently dropping it.
         type_line "echo a > out.txt"
         # QEMU's sendkey cannot produce a '|' through this keyboard layout, so
@@ -368,12 +383,17 @@ check-cli)
         "type  file" \
         "cat: /nope.txt: no such file" \
         "nosuchcommand: command not found" \
+        "spawn 'hello': thread" \
+        "hello from a loaded ELF binary" \
+        "released 'hello'" \
+        "overlaps resident 'ksh'" \
+        "ksh: could not start (error -98)" \
         "redirection needs a writable filesystem" \
         "pipe yes" \
         "redirect out" \
         "background" \
         "ksh: exiting" \
-        "falling back to the kernel console" \
+        "ksh exited with code 0, falling back to the kernel console" \
         "Kosh console" \
         "Kosh 0.1.0 x86_64" \
         "physical memory:" \

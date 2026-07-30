@@ -62,6 +62,8 @@ pub fn dispatch_syscall(
         SYS_GETPID => sys_getpid(process_id, args),
         SYS_GETPPID => sys_getppid(process_id, args),
         SYS_KILL => sys_kill(process_id, args),
+        SYS_YIELD => sys_yield(process_id, args),
+        SYS_SPAWN => sys_spawn(process_id, args),
         
         // Memory management
         SYS_MMAP => sys_mmap(process_id, args),
@@ -157,13 +159,34 @@ fn sys_exit(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
         exit_code
     );
 
-    // Nothing else will do it: there is no process teardown path yet.
-    crate::syscall::files::close_all();
+    // The descriptor table is global — one table for the whole system, because
+    // there is no per-process state to hang one off. So closing everything is
+    // only safe when this is the last program running; otherwise a short-lived
+    // program exiting would close the shell's open files behind its back.
+    #[cfg(target_arch = "x86_64")]
+    let last_program = crate::usermode::resident_count() <= 1;
+    #[cfg(not(target_arch = "x86_64"))]
+    let last_program = true;
+
+    if last_program {
+        crate::syscall::files::close_all();
+    } else {
+        serial_println!(
+            "  (leaving {} open file(s) alone: another program is still resident)",
+            crate::syscall::files::open_count()
+        );
+    }
 
     // Actually terminate. The ring-3 program runs on a kernel thread, so
     // retiring that thread is the exit: `exit_current` marks it finished and
     // schedules away, and never returns. Previously this logged and returned
     // Ok(0), leaving the caller running as if nothing had happened.
+    //
+    // The code is recorded first, because `exit_current` does not return and
+    // whoever is in `wait` needs something to collect.
+    #[cfg(target_arch = "x86_64")]
+    crate::task::set_exit_code(exit_code);
+
     #[cfg(target_arch = "x86_64")]
     crate::task::exit_current();
 
@@ -171,24 +194,37 @@ fn sys_exit(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
     Ok(0)
 }
 
+/// Not implemented, and now says so.
+///
+/// This used to add a row to the process table, log "Fork successful", and
+/// return the new PID — without duplicating an address space, copying a stack,
+/// or creating anything that could run. Userspace saw a positive return value,
+/// concluded it was the parent, and carried on; the "child" never existed. A
+/// syscall that reports success for work it did not do is worse than one that
+/// refuses, because the caller has no way to find out.
+///
+/// Honest `fork` needs per-process page tables, which needs the kernel out of
+/// the low identity mapping first. Until then, `Err`.
 fn sys_fork(process_id: ProcessId, _args: [u64; 6]) -> SyscallResult {
-    serial_println!("Process {} attempting to fork", process_id.0);
-    
-    // Create a new child process
-    match crate::process::create_process(
-        Some(process_id),
-        format!("child_of_{}", process_id.0),
-        crate::process::ProcessPriority::Normal,
-    ) {
-        Ok(child_pid) => {
-            serial_println!("Fork successful: parent={}, child={}", process_id.0, child_pid.0);
-            // Return child PID to parent process
-            // Note: In a real implementation, the child would receive 0
-            // This requires more complex context switching implementation
-            Ok(child_pid.0 as u64)
-        }
-        Err(_) => Err(SyscallError::OutOfMemory)
-    }
+    serial_println!(
+        "Process {} called fork, which needs per-process address spaces (not implemented)",
+        process_id.0
+    );
+    Err(SyscallError::NotSupported)
+}
+
+/// Give up the rest of the current time slice.
+///
+/// The interesting part is where this runs: inside a system call, on the calling
+/// thread's own kernel stack, with a live `SyscallFrame` on it. `yield_now` ends
+/// in `kosh_switch_context`, so another thread can enter a syscall of its own
+/// while this frame is parked — which is precisely what a single shared syscall
+/// stack could not survive.
+fn sys_yield(_process_id: ProcessId, _args: [u64; 6]) -> SyscallResult {
+    #[cfg(target_arch = "x86_64")]
+    crate::task::yield_now();
+
+    Ok(0)
 }
 
 fn sys_exec(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
@@ -208,16 +244,87 @@ fn sys_exec(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
     Err(SyscallError::NotSupported)
 }
 
+/// `spawn(path, path_len)` -> task id
+///
+/// Deliberately not called `exec`: `exec` replaces the calling image, and
+/// `fork`+`exec` needs two address spaces. This loads a *second* program into
+/// the one address space that exists and runs it on its own thread — which is
+/// enough for a shell to launch a program, and honest about what it is.
+///
+/// `path` names a boot module (`module2 /boot/hello hello` in grub.cfg), not a
+/// file on the FAT32 volume. Loading from disk needs the loader to read through
+/// the VFS, which is a separate job from this one.
+#[cfg(target_arch = "x86_64")]
+fn sys_spawn(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
+    use crate::usermode::SpawnError;
+
+    let name = crate::syscall::files::path_from_user(args[0], args[1])?;
+    let name = name.trim_start_matches('/');
+
+    serial_println!("Process {} spawning '{}'", process_id.0, name);
+
+    match crate::usermode::spawn_program(name) {
+        Ok(thread) => Ok(thread as u64),
+        // A shell turns this one into "command not found", so it must not be
+        // lumped in with the others.
+        Err(SpawnError::NotFound) => Err(SyscallError::NotFound),
+        Err(SpawnError::AddressConflict) => Err(SyscallError::AddressInUse),
+        Err(SpawnError::TooManyPrograms) | Err(SpawnError::NoThread(_)) => {
+            Err(SyscallError::ResourceExhausted)
+        }
+        Err(SpawnError::Map(e)) => {
+            serial_println!("  spawn mapping failed: {}", e);
+            Err(SyscallError::OutOfMemory)
+        }
+        Err(SpawnError::Load(e)) => {
+            serial_println!("  spawn load failed: {:?}", e);
+            Err(SyscallError::InvalidArgument)
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn sys_spawn(_process_id: ProcessId, _args: [u64; 6]) -> SyscallResult {
+    Err(SyscallError::NotSupported)
+}
+
+/// `wait(task_id, status_ptr)` -> task id
+///
+/// Blocks — really blocks, in `State::Blocked`, not in a yield loop — until that
+/// task finishes, then writes its exit code to `status_ptr` if that is non-null.
+///
+/// This used to be a `serial_println!` and `Err(NotSupported)` under a three-line
+/// TODO. It takes a task id rather than "any child" because there is no process
+/// hierarchy to define a child with; `spawn` returns the id it expects back.
+#[cfg(target_arch = "x86_64")]
 fn sys_wait(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
-    let status_ptr = args[0];
-    
-    serial_println!("Process {} waiting for child process", process_id.0);
-    
-    // TODO: Implement process waiting
-    // This would involve:
-    // 1. Blocking until a child process exits
-    // 2. Returning the child's PID and exit status
-    
+    let task_id = args[0] as usize;
+    let status_ptr = args[1];
+
+    // Validate the destination *before* blocking. Failing afterwards would mean
+    // the child has already been reaped and its exit code thrown away, with
+    // nothing to return it to.
+    if status_ptr != 0 {
+        crate::syscall::uaccess::validate_user_range(status_ptr, 4, true)
+            .map_err(|_| SyscallError::InvalidArgument)?;
+    }
+
+    let code = crate::task::wait_for(task_id).map_err(|e| {
+        serial_println!("Process {} wait({}) failed: {}", process_id.0, task_id, e);
+        SyscallError::InvalidArgument
+    })?;
+
+    if status_ptr != 0 {
+        let bytes = code.to_le_bytes();
+        crate::syscall::uaccess::copy_to_user(status_ptr, &bytes)
+            .map_err(|_| SyscallError::InvalidArgument)?;
+    }
+
+    Ok(task_id as u64)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn sys_wait(_process_id: ProcessId, _args: [u64; 6]) -> SyscallResult {
     Err(SyscallError::NotSupported)
 }
 

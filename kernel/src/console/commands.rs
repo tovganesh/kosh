@@ -126,15 +126,27 @@ fn threads() {
     out!("  {:>3}  {:<12} {:<9} {:>8}", "id", "name", "state", "ticks");
 
     for slot in buf.iter().flatten() {
+        // `Blocked` carries the id it is waiting for, which is the only
+        // interesting thing about a thread that is not running.
+        let mut blocked = [0u8; 12];
+        let state = match slot.state {
+            crate::task::State::Running => "running",
+            crate::task::State::Ready => "ready",
+            crate::task::State::Finished => "finished",
+            crate::task::State::Blocked { on } => {
+                let text = alloc::format!("wait({})", on);
+                let bytes = text.as_bytes();
+                let take = core::cmp::min(bytes.len(), blocked.len());
+                blocked[..take].copy_from_slice(&bytes[..take]);
+                core::str::from_utf8(&blocked[..take]).unwrap_or("blocked")
+            }
+        };
+
         out!(
             "  {:>3}  {:<12} {:<9} {:>8}",
             slot.id,
             slot.name,
-            match slot.state {
-                crate::task::State::Running => "running",
-                crate::task::State::Ready => "ready",
-                crate::task::State::Finished => "finished",
-            },
+            state,
             slot.ticks
         );
     }
