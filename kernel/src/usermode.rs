@@ -61,7 +61,7 @@ impl BootModule {
     }
 }
 
-const MAX_BOOT_MODULES: usize = 4;
+const MAX_BOOT_MODULES: usize = 6;
 static BOOT_MODULES: Mutex<[Option<BootModule>; MAX_BOOT_MODULES]> =
     Mutex::new([None; MAX_BOOT_MODULES]);
 
@@ -491,12 +491,55 @@ pub fn register_process(thread: usize, parent: Option<usize>, name: &str) {
             serial_println!("  could not open an IPC channel {}<->{}: {:?}", thread, parent_pid.0, e);
         }
     }
+
+    grant_driver_capabilities(pid, name);
+}
+
+/// Boot modules the kernel is willing to treat as device drivers, and what each
+/// may drive.
+///
+/// This is the weakest link in the chain and it is worth being plain about it.
+/// A capability system wants a *delegation* story: `init` holds the hardware,
+/// grants each driver exactly its device, and the kernel makes no policy
+/// decisions about which program is trusted. What is here instead is the kernel
+/// recognising a boot module by the name on its `module2` line — which is to say
+/// the trust root is "GRUB loaded it from the ISO", the same root that already
+/// decides what code the kernel will run at all.
+///
+/// That is defensible for a boot-time driver and useless for anything loaded
+/// later, which is exactly why it is a table with two entries rather than a rule.
+/// `userspace/init` taking this over is what makes it a real chain.
+const DRIVER_IMAGES: &[(&str, &str)] = &[("ata-driver", "ata0")];
+
+fn grant_driver_capabilities(pid: crate::process::ProcessId, name: &str) {
+    use crate::ipc::capability::{create_capability, CapabilityType, ResourceId};
+
+    for (image, device) in DRIVER_IMAGES {
+        if *image != name {
+            continue;
+        }
+        match create_capability(
+            pid,
+            CapabilityType::DeviceAccess,
+            ResourceId::Device(alloc::string::String::from(*device)),
+            None,
+        ) {
+            Ok(_) => serial_println!("  granted {} DeviceAccess for '{}'", pid.0, device),
+            Err(e) => serial_println!("  could not grant DeviceAccess for '{}': {:?}", device, e),
+        }
+    }
 }
 
 /// Retire a process when its thread exits.
 fn deregister_process(thread: usize) {
     use crate::process::ProcessId;
     let pid = ProcessId::new(thread as u32);
+
+    // Hardware first. A driver that faults still holds its disk otherwise, and
+    // nothing — not the kernel's own block layer, not a replacement driver —
+    // could touch it again until reboot. Surviving a driver crash is most of the
+    // argument for running drivers in ring 3 at all.
+    crate::platform::devports::release_all(thread);
 
     let _ = crate::ipc::queue::remove_message_queue(pid);
     let _ = crate::process::remove_process(pid);

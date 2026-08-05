@@ -31,6 +31,7 @@ const SYS_MUNMAP: u64 = 11;
 const SYS_WRITE: u64 = 23;
 const SYS_CLOCK_GETTIME: u64 = 53;
 const SYS_DEBUG_PRINT: u64 = 100;
+const SYS_SPAWN: u64 = 9;
 
 /// mmap protection bits, as the kernel reads them.
 const PROT_READ: u64 = 0x1;
@@ -161,6 +162,10 @@ fn receive_message(buf: &mut [u8], blocking: bool) -> i64 {
 
 fn exec(name: &str) -> i64 {
     unsafe { syscall3(SYS_EXEC, name.as_ptr() as u64, name.len() as u64, 0) }
+}
+
+fn spawn(name: &str) -> i64 {
+    unsafe { syscall3(SYS_SPAWN, name.as_ptr() as u64, name.len() as u64, 0) }
 }
 
 fn exit(code: u64) -> ! {
@@ -389,6 +394,12 @@ pub extern "C" fn kosh_main() -> ! {
         print("  debug_print echoed my message\n");
     }
 
+    // A driver in ring 3, driving a real disk.
+    drive_a_disk();
+
+    // ...and a process that has no business touching that disk.
+    port_permission_negative_control();
+
     // fork, and the copy-on-write behaviour underneath it.
     //
     // The sequencing is deliberate and not racy: `fork` returns *in the parent*
@@ -529,6 +540,195 @@ pub extern "C" fn kosh_main() -> ! {
 
     print("  exiting cleanly\n");
     exit(0)
+}
+
+// ---------------------------------------------------------------------------
+// A disk driver that is not in the kernel
+// ---------------------------------------------------------------------------
+
+const REQ_MAGIC: u32 = 0x4B42_4C4B; // "KBLK"
+const REP_MAGIC: u32 = 0x4B52_504C; // "KRPL"
+const OP_READ: u32 = 0;
+const OP_INFO: u32 = 1;
+const OP_SHUTDOWN: u32 = 2;
+const REP_HEADER: usize = 16;
+
+static mut BLOCK_REQUEST: [u8; 24] = [0; 24];
+static mut BLOCK_REPLY: [u8; 1024] = [0; 1024];
+
+fn put_u32(buf: &mut [u8], at: usize, v: u32) {
+    buf[at..at + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+fn put_u64(buf: &mut [u8], at: usize, v: u64) {
+    buf[at..at + 8].copy_from_slice(&v.to_le_bytes());
+}
+
+fn get_u32(buf: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]])
+}
+
+/// Send one request to `driver` and block for its reply.
+///
+/// Returns `(status, payload_len)`, with the payload left in `BLOCK_REPLY`
+/// starting at `REP_HEADER`.
+fn block_request(driver: i64, op: u32, lba: u64, count: u32) -> (i32, usize) {
+    unsafe {
+        let request = &mut *core::ptr::addr_of_mut!(BLOCK_REQUEST);
+        put_u32(request, 0, REQ_MAGIC);
+        put_u32(request, 4, op);
+        put_u64(request, 8, lba);
+        put_u32(request, 16, count);
+        put_u32(request, 20, 0);
+
+        if send_message(driver, request) < 0 {
+            return (-100, 0);
+        }
+
+        let reply = &mut *core::ptr::addr_of_mut!(BLOCK_REPLY);
+        let got = receive_message(reply, true);
+        if got < 0 {
+            return (-101, 0);
+        }
+
+        let len = (got & 0xFFFF_FFFF) as usize;
+        if len < REP_HEADER || get_u32(reply, 0) != REP_MAGIC {
+            return (-102, 0);
+        }
+
+        (get_u32(reply, 4) as i32, get_u32(reply, 8) as usize)
+    }
+}
+
+/// Spawn the ring-3 ATA driver, read the disk through it, and shut it down.
+///
+/// The evidence that this is real and not a stub is the content: the driver
+/// returns the FAT32 boot sector `mkfs.vfat` wrote into `build/disk.img`, and
+/// the checks below are on bytes nobody in this program chose — the 0xEB jump
+/// opcode, the "mkfs.fat" OEM name at offset 3, the "FAT32" type string at 82
+/// and the 0x55AA signature at 510. A driver that could not talk to the disk
+/// could not produce any of them.
+fn drive_a_disk() {
+    let driver = spawn("ata-driver");
+    if driver < 0 {
+        print("  WARNING: could not spawn the ata-driver\\n");
+        return;
+    }
+
+    let (status, len) = block_request(driver, OP_INFO, 0, 0);
+    if status != 0 || len < 8 {
+        print("  WARNING: the driver could not identify the disk\\n");
+    } else {
+        let blocks = unsafe {
+            let reply = &*core::ptr::addr_of!(BLOCK_REPLY);
+            let mut v = [0u8; 8];
+            v.copy_from_slice(&reply[REP_HEADER..REP_HEADER + 8]);
+            u64::from_le_bytes(v)
+        };
+        print("  the ring-3 driver identified a disk of ");
+        print_i64(blocks as i64);
+        print(" sectors\\n");
+    }
+
+    let (status, len) = block_request(driver, OP_READ, 0, 1);
+    if status != 0 || len != 512 {
+        print("  WARNING: reading LBA 0 through the driver failed, status ");
+        print_i64(status as i64);
+        print("\\n");
+    } else {
+        let sector = unsafe {
+            let reply = &*core::ptr::addr_of!(BLOCK_REPLY);
+            &reply[REP_HEADER..REP_HEADER + 512]
+        };
+
+        let signature = sector[510] == 0x55 && sector[511] == 0xAA;
+        let jump = sector[0] == 0xEB || sector[0] == 0xE9;
+        let oem = &sector[3..11] == b"mkfs.fat";
+        let fat32 = &sector[82..87] == b"FAT32";
+
+        if signature && jump && oem && fat32 {
+            print("  read LBA 0 in ring 3: a FAT32 boot sector, signature and all\\n");
+        } else {
+            print("  WARNING: LBA 0 does not look like the test disk\\n");
+        }
+    }
+
+    // A sector that is not the boot sector, so "the driver returns one canned
+    // buffer" is not an explanation that survives.
+    let (status, len) = block_request(driver, OP_READ, 32, 1);
+    if status == 0 && len == 512 {
+        let differs = unsafe {
+            let reply = &*core::ptr::addr_of!(BLOCK_REPLY);
+            reply[REP_HEADER + 510] != 0x55 || reply[REP_HEADER + 511] != 0xAA
+        };
+        if differs {
+            print("  a second sector read back different bytes\\n");
+        } else {
+            print("  WARNING: LBA 32 looks identical to LBA 0\\n");
+        }
+    }
+
+    // Out of range: the driver has to refuse rather than wedge on a status
+    // register that never becomes ready.
+    let (status, _) = block_request(driver, OP_READ, 1 << 40, 1);
+    if status != 0 {
+        print("  the driver refused a read past the end of the disk\\n");
+    } else {
+        print("  WARNING: the driver accepted an impossible LBA\\n");
+    }
+
+    block_request(driver, OP_SHUTDOWN, 0, 0);
+
+    let mut status: i32 = 0;
+    wait(driver, &mut status);
+    if status == 0 {
+        print("  the driver exited and gave ata0 back\\n");
+    } else {
+        print("  WARNING: the driver exited with ");
+        print_i64(status as i64);
+        print("\\n");
+    }
+}
+
+/// Exit code the kernel gives a process it terminates for a fault.
+const EXIT_KILLED: i32 = -9;
+
+/// Prove that the ports the driver used are not simply open to everyone.
+///
+/// Done in a forked child because the expected outcome is death: this process
+/// has no `ata0` grant, so the `in` below raises #GP, and the kernel's job is to
+/// kill the process and leave the rest of the system running. The parent
+/// surviving to print the result *is* the second half of the test — before this
+/// phase every exception except a page fault halted the machine.
+fn port_permission_negative_control() {
+    let child = fork();
+    if child < 0 {
+        print("  WARNING: could not fork for the port-permission test\\n");
+        return;
+    }
+
+    if child == 0 {
+        // 0x1F7 is the ATA status register: the exact port the driver just read
+        // hundreds of times, from a process that was granted it.
+        let value: u8;
+        unsafe {
+            core::arch::asm!("in al, dx", out("al") value, in("dx") 0x1F7u16, options(nomem, nostack));
+        }
+        print("  WARNING: read an ATA port without a capability, value ");
+        print_i64(value as i64);
+        print("\\n");
+        exit(0);
+    }
+
+    let mut status: i32 = 0;
+    wait(child, &mut status);
+    if status == EXIT_KILLED {
+        print("  a process without the ata0 grant was killed for touching its ports\\n");
+    } else {
+        print("  WARNING: the unprivileged port read was not stopped, status ");
+        print_i64(status as i64);
+        print("\\n");
+    }
 }
 
 fn print_hex(mut value: u64) {

@@ -30,6 +30,9 @@ pub enum BlockError {
     BadBufferSize,
     /// The device is read-only.
     ReadOnly,
+    /// A ring-3 driver holds this device. The kernel's own driver stands aside
+    /// rather than interleaving register writes with it.
+    ClaimedByUserspace,
 }
 
 pub trait BlockDevice: Send + Sync {

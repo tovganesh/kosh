@@ -1,0 +1,21 @@
+[package]
+name = "kosh-ata-driver"
+version = "0.1.0"
+edition = "2021"
+
+# The ATA PIO driver, in ring 3.
+#
+# The kernel has one of these too, at kernel/src/block/ata.rs, and this is
+# deliberately close to a transcription of it: the point of the exercise is that
+# the *same* driver logic runs unprivileged, so any difference between the two is
+# a difference the privilege boundary forced, not one the rewrite introduced.
+#
+# It talks to the disk with `in` and `out` directly — no syscall per port — which
+# the TSS I/O permission bitmap makes possible, and answers block-read requests
+# over IPC.
+
+[dependencies]
+
+[[bin]]
+name = "kosh-ata-driver"
+path = "src/main.rs"

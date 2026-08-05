@@ -1728,6 +1728,192 @@ genuine "no parent", which is what 0 means — then `NotSupported` once that was
 noticed. There is a hierarchy now, and it is the same relation the capability
 policy uses.
 
+## A driver outside the kernel (Phase 18)
+
+`kernel/src/block/ata.rs` is 334 lines that drive an IDE disk. Nothing in it
+needs to be in the kernel — it reads and writes eight I/O ports and polls a
+status register — and every phase up to here has said the point of a microkernel
+is that such things run in ring 3. This is the phase that moves one.
+
+`userspace/ata-driver` is the same driver as an ordinary unprivileged process. It
+IDENTIFYs the primary master, serves block reads over IPC, and exits. It is
+linked at 8 MiB like `hello` and `ksh`, has its own address space, and is loaded
+by the same ELF loader. The only thing it has that they do not is nine bits.
+
+### Why the I/O permission bitmap and not the other two options
+
+A ring-3 driver has to execute `in` and `out`. There are three ways to allow it:
+
+* **A port-I/O system call.** Safe and unusable: a 512-byte sector is 256 16-bit
+  port reads, so one sector becomes 256 round trips through the syscall stub.
+* **`IOPL = 3` in the thread's RFLAGS.** One bit, and it grants *every* port. A
+  disk driver that can reprogram the PIC at 0x20, stop the PIT at 0x40 or reset
+  the machine through the keyboard controller at 0x64 is not isolated from the
+  kernel in any sense that matters.
+* **The TSS I/O permission bitmap.** With `IOPL = 0`, the CPU consults one bit
+  per port on every `in`/`out`. A granted port costs nothing at run time; a
+  denied one raises #GP.
+
+The third is the only one that is both fast and narrow, so that is what `gdt.rs`
+now carries: a 128-byte bitmap covering ports 0..1023, all ones — deny — by
+default.
+
+Two things had to change to get one. `TaskStateSegment` from the `x86_64` crate
+has an `iomap_base` field and no room after it, and `Descriptor::tss_segment`
+hard-codes the segment limit to `size_of::<TaskStateSegment>() - 1`. A bitmap
+that starts past the limit reads as all ones, which is a perfectly good default
+and not a bitmap. So the TSS is wrapped in a `#[repr(C, packed(4))]` struct with
+the bitmap and its mandatory 0xFF terminator after it, and the descriptor is
+built by hand with a limit that covers the whole thing.
+
+The bitmap is per-*task* in the hardware's sense, and since Kosh does not use
+hardware task switching there is one of it. So it is rewritten on context switch
+from the incoming thread's grant, in `publish_kernel_stack`'s neighbourhood and
+for the same reason `RSP0` is: forget `set_kernel_stack` and a thread lands on
+another's kernel stack; forget `set_io_grant` and a thread inherits another's
+hardware. The installed grant is cached, so the common switch — between threads
+that hold no ports, which is all of them but the driver — writes nothing.
+
+### A name, not a port range
+
+`SYS_REQUEST_DEVICE` takes a device *name*. `platform/devports.rs` decides what
+the name means:
+
+```rust
+Device { name: "ata0", ranges: [Some((0x1F0, 8)), Some((0x3F6, 1))], .. }
+```
+
+Two entries in the table, `ata0` and `ata1`. Deliberately absent: the PIC, the
+PIT, the keyboard controller, the CMOS/NMI gate and COM1. A driver cannot ask
+for them because there is no name for them, and there is no name for them because
+handing any of them to an unprivileged process is not survivable.
+
+The capability check is the existing one — `DeviceAccess` scoped to
+`ResourceId::Device("ata0")`, refused with `PermissionDenied` when absent.
+
+### The part that is a placeholder, and why it is written as a table
+
+Something has to grant that capability first. What does it today is
+`DRIVER_IMAGES` in `usermode.rs`: the kernel recognises a boot module by the name
+on its `module2` line and grants it its device. The trust root is "GRUB loaded it
+from the ISO", which is the same root that already decides what code the kernel
+runs at all — defensible for a boot-time driver and useless for anything loaded
+later.
+
+A capability system wants a delegation story: `init` holds the hardware, grants
+each driver exactly its device, and the kernel makes no policy decision about
+which program is trusted. That is why this is a two-entry table rather than a
+rule. `userspace/init` taking it over is what makes it a chain.
+
+### One driver at a time
+
+The kernel still contains an ATA driver, and `fs/fat32.rs` reads through it. Two
+drivers polling one set of registers do not race loudly: one writes the LBA
+registers, the other writes its own, and the command that follows reads whichever
+sector the last writer named. It returns the wrong bytes, intermittently.
+
+So `devports` keeps a claim per device. While a ring-3 process holds `ata0`,
+`AtaDisk::probe`, `read_blocks` and `write_blocks` all return
+`BlockError::ClaimedByUserspace` — checked on every entry point, not once at
+probe time, because a driver can start and exit while `fat32` holds an `AtaDisk`
+across all of it. `SYS_REQUEST_DEVICE` verifies this at the moment it takes the
+claim rather than trusting it:
+
+```
+  process 2 now drives 'ata0' (primary IDE channel) — ports in ring 3
+  the kernel's own ATA driver now refuses ata0
+```
+
+The claim is released when the driver exits — from `deregister_process`, before
+the message queue and the process table entry, because a driver that *crashes*
+must not take its disk with it. Surviving a driver crash is most of the argument
+for running drivers in ring 3 at all.
+
+### What the test actually proves
+
+`hello` spawns the driver, and checks bytes nobody in this program chose: the
+0xEB jump opcode at 0, the `mkfs.fat` OEM name at 3, `FAT32` at 82 and the 0x55AA
+signature at 510 — the boot sector `mkfs.vfat` wrote into `build/disk.img`. Then
+a second sector, so "the driver returns one canned buffer" is not an explanation
+that survives, and a read past the end of the disk, which has to be refused
+rather than spin on a status register that never becomes ready.
+
+Then the negative control, in a forked child because the expected outcome is
+death: a process with no `ata0` grant executes `in` on 0x1F7, the exact port the
+driver just read hundreds of times.
+
+```
+  the ring-3 driver identified a disk of 131072 sectors
+  read LBA 0 in ring 3: a FAT32 boot sector, signature and all
+  a second sector read back different bytes
+  the driver refused a read past the end of the disk
+  the driver exited and gave ata0 back
+  a process without the ata0 grant was killed for touching its ports
+```
+
+Removing `task::grant_io_device` from `sys_request_device` — keeping the
+capability and the claim, dropping only the bitmap bits — turns the driver's very
+first `in` into a #GP at `rip 0x800073`, kills it, and releases `ata0`. So the
+ports come from the bitmap and not from ambient permission, and the crash-recovery
+path is exercised by the control that proves it.
+
+### Ring-3 faults stop being fatal to the machine
+
+The page-fault handler has killed ring-3 threads rather than halting since Phase
+5. Every other handler halted, which meant the argument — a userspace bug must
+not take down the system — applied only to the one exception a program was
+expected to cause. A `ud2`, a division by zero, or an `in` on an ungranted port
+stopped the machine.
+
+`fault()` now decides from the saved CS's RPL, for every vector. Faults in ring 0
+still halt: a kernel that cannot trust its own state has nothing useful to do
+next. #DF and #MC halt regardless of ring — a double fault means the CPU could
+not deliver the first exception, so the machinery that would kill the process is
+the machinery that has already failed once.
+
+### The bug that was waiting underneath
+
+Killing a *registered* process from an exception handler double-faulted the
+system. The second fault was a #GP inside `BTreeMap::remove`, on a `movaps` in
+code that is entirely correct.
+
+An exception that pushes an error code pushes six quadwords onto a stack the CPU
+has already aligned to 16, so the handler starts with `RSP % 16 == 0`. The System
+V ABI says a function starts with `RSP % 16 == 8` — the state a `call` leaves.
+LLVM's `x86-interrupt` convention does not reconcile the two: every frame below
+the handler is eight bytes off, and the first `movaps` to a 16-aligned stack slot
+anywhere in that subtree faults.
+
+This had been true of every error-code handler since Phase 5. It never fired
+because the only handler that did real work was the page-fault handler, and the
+only process it ever killed was a demo with no message queue to tear down. Adding
+a second way to kill a process — one that kills a *real* one — is what reached
+`BTreeMap::remove`, which spills SSE registers to aligned slots.
+
+The measurement is worth recording because the first two attempts at a diagnosis
+were wrong. Instrumenting the handlers showed both #PF and #GP at the same
+alignment, which proves nothing without a baseline. Instrumenting
+`on_thread_exit` — one function, reached on both the normal exit path and the
+kill path — showed `rsp mod 16 = 0` from a normal exit and `8` from a kill.
+
+The fix is `kosh_call_aligned`: the handlers keep only frame decoding and hand
+the work to a body function called with the stack put back the way the ABI
+expects. Two things about it are load-bearing:
+
+* It is `global_asm!`, not inline `asm!`. An inline block containing a `call`
+  must declare `clobber_abi("C")`, and in an `x86-interrupt` function that is a
+  statement that the handler clobbers xmm0-15. LLVM then preserves them — with
+  `movaps` into aligned slots, in the handler's *own prologue*, before any of the
+  realigning code runs. The handler re-faults on entry, forever, and it surfaces
+  as a double fault from stack exhaustion in a prologue.
+* The old `rsp` is parked in a stack slot, not a callee-saved register. The
+  register version compiles: `clobber_abi("C")` covers only the caller-saved set,
+  so the allocator is free to hand the arguments `r15`, and `mov r15, rsp` then
+  passes the stack pointer as the context argument.
+
+Reverting the shim and calling the body directly reproduces the original double
+#GP inside `BTreeMap::remove`, which is the control for all of it.
+
 ## What is deliberately still missing
 - **The filesystem is read-only.** Allocating clusters and keeping both FAT
   copies consistent is a separate problem, and a read-only filesystem that is
@@ -1737,24 +1923,24 @@ policy uses.
 - **The VFS is still unwired.** `userspace/fs-service/src/vfs.rs` has a mount
   table; it has never had a real filesystem underneath it, and connecting the
   two is separate work from making FAT32 correct.
-- **No `fork`/`exec`.** `spawn` loads a *second* program rather than duplicating
-  the caller, so there is still no way for a program to replace its own image or
-  to inherit one. `userspace/init` cannot do its job until `fork` exists.
-- **No `fork`.** Every process starts from an ELF. Duplicating a *running*
-  address space needs the page tables copied and every writable page marked
-  copy-on-write, plus a `#PF` handler that does the copying — none of which
-  exists. The address space is now the right shape for it.
-- **No demand paging.** Every page of a program is allocated and populated at
-  load time, so a 256 KiB `.bss` costs 65 frames whether or not it is touched.
+- **The filesystem is still in the kernel.** The disk driver is out; `fat32` is
+  not, and until it is, "microkernel" describes the disk and nothing above it.
+  That is the next phase, and it is what lets `kernel/src/block/ata.rs` be
+  deleted rather than merely stood aside from.
+- **`exec` takes no `argv`.** A driver cannot be told which device to serve, which
+  is part of why `DRIVER_IMAGES` maps an image name to a device rather than the
+  program deciding.
+- **Drivers are trusted by boot-module name.** See Phase 18: the delegation chain
+  from `init` is what would make the capability grant mean something.
+- **Interrupts are not delivered to ring 3.** The ring-3 driver polls, exactly as
+  the in-kernel one does. A driver that wants IRQ14 needs the kernel to turn an
+  interrupt into a message, which nothing does yet.
 - **The descriptor table is still global.** One table for the system, because
   `Program` has nowhere to hang a per-process one yet. `sys_exit` works around
   it by only closing everything when it is the last program running.
-- **No IPC or capabilities from ring 3.** Both subsystems are implemented
-  in-kernel and unreachable, waiting on a single process-id namespace — see
-  Phase 13 above.
-- **No pipes or background jobs.** `ksh` parses them; running them needs two
-  programs connected by a shared descriptor, which needs per-process descriptor
-  tables. The table is currently global — see the note in `sys_exit`.
+- **No pipes.** `ksh` parses them; running them needs two programs connected by a
+  shared descriptor, which needs per-process descriptor tables. The table is
+  currently global — see the note in `sys_exit`.
 - **Swap and power management are disabled** in `init_kernel`. Both were
   simulated, and swap tried to allocate 8 MiB from a 1 MiB heap.
 - **Only IRQ0 and IRQ1 are unmasked.** Everything else on the PIC has a

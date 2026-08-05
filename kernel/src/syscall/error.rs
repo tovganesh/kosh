@@ -38,6 +38,10 @@ pub enum SyscallError {
     ResourceExhausted,
     /// Internal kernel error
     InternalError,
+    /// The resource is in use by someone else. Distinct from `AlreadyExists`,
+    /// which is about a name: a device that is claimed exists and is fine, it
+    /// just already has a driver.
+    Busy,
 }
 
 impl SyscallError {
@@ -61,6 +65,7 @@ impl SyscallError {
             SyscallError::TimedOut => -110,          // ETIMEDOUT
             SyscallError::ResourceExhausted => -105, // ENOBUFS
             SyscallError::InternalError => -5,       // EIO
+            SyscallError::Busy => -16,               // EBUSY
         }
     }
     
@@ -84,6 +89,7 @@ impl SyscallError {
             SyscallError::TimedOut => "Operation timed out",
             SyscallError::ResourceExhausted => "System resource exhausted",
             SyscallError::InternalError => "Internal kernel error",
+            SyscallError::Busy => "Resource busy",
         }
     }
 }
