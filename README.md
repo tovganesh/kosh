@@ -64,7 +64,7 @@ test disk, then boots the lot:
 
 ```bash
 ./scripts/run.sh              # boot it, serial on stdio (ctrl-a x to quit)
-./scripts/run.sh --check      # boot headless, assert 47 serial markers (CI)
+./scripts/run.sh --check      # boot headless, assert 49 serial markers (CI)
 ./scripts/run.sh --check-cli  # drive the shell through QEMU's monitor, assert 31
 ./scripts/run.sh --debug      # same as plain run, plus a gdb stub on :1234
 ```
@@ -112,6 +112,10 @@ interaction in `--check-cli`.
 - **Copy-on-write**: a `fork` copies no page data at all. Both sides go
   read-only, the frame reference count goes up, and the first write from either
   side faults into a private copy
+- **Demand paging**: `.bss`, user stacks and anonymous `mmap` are *reserved*
+  rather than allocated — a page table entry with no frame behind it until the
+  program touches it. A boot that runs five programs reserves 322 pages and
+  touches 38
 - **Per-thread kernel stacks**, so more than one thread can be inside a syscall
 - Real blocking: `wait` parks a thread in `State::Blocked` rather than spinning
 
@@ -164,11 +168,11 @@ all 5 IPC calls · all 4 driver calls · all 4 capability calls · `uname`
 Being explicit about this, because the earlier version of this file claimed most
 of it.
 
-- **No demand paging.** Every page of a program is allocated and populated at
-  load time, so `ksh`'s 256 KiB `.bss` costs 65 frames whether it is touched or
-  not. Copy-on-write means a `fork` no longer *copies* those 65, but the program
-  still pays for them at load. `mmap` has the same problem: it allocates the
-  whole span up front.
+- **Demand paging is anonymous-only.** A reserved page is always filled with
+  zeros. File-backed mappings would need the fault handler to read through the
+  VFS, so `mmap` still refuses anything but `MAP_ANONYMOUS`. There is also no
+  reclaim: nothing ever takes a page *back*, so the only pressure valve is a
+  process exiting.
 - **No `argv`.** `exec` takes a program name and nothing else; passing arguments
   needs somewhere to put the strings in the new address space.
 - **The filesystem is read-only.** `ksh` refuses redirection rather than
@@ -248,7 +252,7 @@ Roughly in order, each unblocking the next:
 - [x] Per-process address spaces
 - [x] `fork` and `exec`
 - [x] Copy-on-write, so a `fork` costs a page table rather than a program
-- [ ] Demand paging, so an untouched `.bss` costs nothing at all
+- [x] Demand paging, so an untouched `.bss` costs nothing at all
 - [ ] One process-id namespace, so the IPC and capability machinery becomes
       reachable from ring 3
 - [ ] Move the disk and filesystem out of the kernel — the point of the whole

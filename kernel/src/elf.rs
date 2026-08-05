@@ -231,25 +231,55 @@ unsafe fn load_segment(
         flags |= PageTableFlags::NO_EXECUTE;
     }
 
+    // Only the pages that actually hold file bytes are allocated. The tail —
+    // the part of `p_memsz` past `p_filesz`, which is `.bss` — is *reserved*:
+    // recorded in the page tables as a promise, with no frame behind it until
+    // the program touches the page.
+    //
+    // For `ksh` that is most of what it declares, because its 256 KiB heap lives
+    // in `.bss` and most of it is never used. Before this, every page was
+    // allocated and zeroed at load time.
+    let file_end = if ph.filesz == 0 {
+        start
+    } else {
+        (ph.vaddr + ph.filesz + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1)
+    };
+    let eager_pages = (((file_end.max(start) - start) / PAGE_SIZE as u64) as usize).min(pages);
+    let reserved_pages = pages - eager_pages;
+
+    if eager_pages > 0 {
+        paging::map_user_pages_in(paging::mapper_for(pml4_phys), start, eager_pages, flags)
+            .map_err(ElfError::MappingFailed)?;
+    }
+    if reserved_pages > 0 {
+        paging::reserve_user_pages_in(
+            pml4_phys,
+            start + (eager_pages * PAGE_SIZE) as u64,
+            reserved_pages,
+            flags,
+        )
+        .map_err(ElfError::MappingFailed)?;
+        paging::note_reserved(reserved_pages);
+    }
+
     serial_println!(
-        "  segment: vaddr 0x{:x} filesz {} memsz {} [{}{}{}] -> {} page(s)",
+        "  segment: vaddr 0x{:x} filesz {} memsz {} [{}{}{}] -> {} page(s), {} reserved",
         ph.vaddr,
         ph.filesz,
         ph.memsz,
         if ph.flags & PF_R != 0 { "r" } else { "-" },
         if ph.flags & PF_W != 0 { "w" } else { "-" },
         if ph.flags & PF_X != 0 { "x" } else { "-" },
-        pages
+        eager_pages,
+        reserved_pages
     );
 
-    // Allocate and map the whole span with its final permissions, in the target
-    // address space rather than the one this code happens to be running in.
-    paging::map_user_pages_in(paging::mapper_for(pml4_phys), start, pages, flags)
-        .map_err(ElfError::MappingFailed)?;
-
-    // Fill it in through the physmap. `map_user_pages` already zeroed every
-    // frame, which is what makes the .bss tail correct without extra work: we
-    // only have to write the `p_filesz` bytes that come from the file.
+    // Fill in the file bytes through the physmap.
+    //
+    // The `.bss` tail is still zero without extra work here, for two reasons
+    // now: the pages that hold file bytes were zeroed by `map_user_pages_in`
+    // before anything was written to them, and the reserved pages beyond them
+    // are zeroed when the fault handler materialises each one.
     for i in 0..ph.filesz as usize {
         let vaddr = ph.vaddr + i as u64;
         let phys = paging::translate_in(pml4_phys, vaddr)

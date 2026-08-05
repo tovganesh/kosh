@@ -856,6 +856,14 @@ fn init_usermode() {
     serial_println!("--- back in ring 0 ---");
     crate::task::reap_finished();
 
+    let (demand_faults, reserved) = crate::memory::paging::demand_stats();
+    serial_println!(
+        "Demand paging: {} page(s) reserved, {} touched ({} never allocated)",
+        reserved,
+        demand_faults,
+        reserved.saturating_sub(demand_faults)
+    );
+
     let (cow_resolved, cow_copied) = crate::memory::paging::cow_stats();
     serial_println!(
         "Copy-on-write: {} fault(s) resolved, {} needed a copy, {} frame(s) still shared",

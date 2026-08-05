@@ -186,28 +186,43 @@ fn validate_kill_args(args: &[u64; 6]) -> Result<(), SyscallError> {
 }
 
 // Memory management syscall validations
+/// `mmap(addr, length, prot, flags, fd, offset)`.
+///
+/// **`fd` is only read when `MAP_ANONYMOUS` is absent**, and that is not a
+/// nicety. `fd` arrives in R8, and a caller using a four-argument syscall
+/// wrapper — which is every caller here, because anonymous mappings need no more
+/// — never sets R8. Reading it means reading a stale register.
+///
+/// This bug was found once already, in `sys_mmap` itself, and fixed there. The
+/// validator kept it, and the symptom was worth the reminder: the *first*
+/// `mmap` in a program worked and a later one failed with `EBADF`, because by
+/// then R8 happened to hold something above 1024. The lesson from last time was
+/// written down and the second instance still shipped, which is an argument for
+/// grepping rather than remembering.
+///
+/// The mask is also corrected: `MAP_ANONYMOUS` is `0x20`, not `0x01`.
 fn validate_mmap_args(args: &[u64; 6]) -> Result<(), SyscallError> {
-    let addr = args[0];
+    const MAP_ANONYMOUS: u64 = 0x20;
+
     let length = args[1];
     let prot = args[2];
     let flags = args[3];
-    let fd = args[4];
-    let offset = args[5];
-    
+
     if length == 0 {
         return Err(SyscallError::InvalidArgument);
     }
-    
-    // Validate protection flags
-    if prot > 7 {  // PROT_READ | PROT_WRITE | PROT_EXEC
+
+    // PROT_READ | PROT_WRITE | PROT_EXEC
+    if prot > 7 {
         return Err(SyscallError::InvalidArgument);
     }
-    
-    // If mapping a file, validate file descriptor
-    if (flags & 0x01) == 0 && fd != u64::MAX {  // Not MAP_ANONYMOUS
-        validate_file_descriptor(fd)?;
+
+    if flags & MAP_ANONYMOUS == 0 {
+        // A file mapping, which the handler refuses anyway — but the caller has
+        // told us it set `fd`, so checking it is meaningful.
+        validate_file_descriptor(args[4])?;
     }
-    
+
     Ok(())
 }
 

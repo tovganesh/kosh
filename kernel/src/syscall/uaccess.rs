@@ -71,6 +71,15 @@ pub fn validate_user_range(ptr: u64, len: usize, writable: bool) -> Result<(), U
     let mut page = first_page;
 
     while page < end {
+        // A reserved page is not mapped *yet*. The kernel is about to read or
+        // write it at the user address, which would fault from ring 0 in the
+        // middle of a syscall — the same hazard copy-on-write has — so
+        // materialise it before the check rather than after.
+        //
+        // Unconditional and idempotent: `resolve_demand` returns `Ok(false)`
+        // immediately for anything that is not a reservation.
+        let _ = crate::memory::paging::resolve_demand(page);
+
         match mapper.translate(VirtAddr::new(page)) {
             TranslateResult::Mapped { flags, .. } => {
                 if !flags.contains(PageTableFlags::USER_ACCESSIBLE) {
