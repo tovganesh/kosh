@@ -119,7 +119,7 @@ impl LineReader {
 
         let mut chunk = [0u8; 64];
         loop {
-            let n = sys::read(sys::STDIN, &mut chunk);
+            let n = sys::read_stdin(&mut chunk);
             if n <= 0 {
                 continue;
             }
@@ -654,6 +654,13 @@ pub extern "C" fn ksh_main() -> ! {
     let mut history = CommandHistory::new();
     let mut reader = LineReader::new();
     let mut cwd = String::from("/");
+
+    // Find the filesystem before the first prompt. `ls` and `cat` are messages
+    // to another ring-3 process now, so a shell that could not find `fs` should
+    // say so once here rather than once per command.
+    if sys::connect_fs() < 0 {
+        println("ksh: no 'fs' service — file commands will not work");
+    }
 
     println("");
     println("ksh: the Kosh shell, in ring 3. Type 'help'.");

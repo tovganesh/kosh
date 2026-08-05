@@ -1914,6 +1914,169 @@ expects. Two things about it are load-bearing:
 Reverting the shim and calling the body directly reproduces the original double
 #GP inside `BTreeMap::remove`, which is the control for all of it.
 
+## The filesystem out of the kernel (Phase 19)
+
+Phase 18 moved the disk driver to ring 3 and left the filesystem behind, which
+made "microkernel" a claim about the disk and nothing above it. This moves
+FAT32 out, gives services a way to find each other, and makes `userspace/init`
+the only program the kernel starts.
+
+### The seam is six functions
+
+`ksh` reached the filesystem through exactly six functions in
+`userspace/shell/src/syscall.rs`: `open`, `close`, `read`, `lseek`, `getdents`
+and `stat`. Those are now IPC round trips to the `fs` service instead of system
+calls, with the same signatures and the same semantics — and `cmd_ls`,
+`cmd_cat`, `cmd_cd` and `cmd_stat` above them are byte-for-byte unchanged.
+
+That is the argument for putting the seam where it is. A filesystem that moved
+out of the kernel and forced a rewrite of every caller would be a filesystem
+whose interface was *the kernel*, not the operation.
+
+One function did not move: `read_stdin`. Standard input is the kernel's keyboard
+ring, not a file, and routing fd 0 to the filesystem would ask it about a
+descriptor it never handed out. The two shared a syscall number only because the
+kernel used to own both.
+
+### Sibling processes cannot talk, so something has to introduce them
+
+Capabilities here are scoped to a specific process: `create_secure_ipc_channel`
+grants each side `SendMessage` for the *other specifically*. That policy has one
+shape — a tree — and every process that matters is a sibling. `init` starts the
+driver, the filesystem and the shell; the shell needs the filesystem and the
+filesystem needs the driver, and neither pair is parent and child.
+
+`kernel/src/ipc/services.rs` is the introduction service. `register_service`
+claims a name; `lookup_service` finds it **and grants a capability for it**. The
+grant is the point — a pid without one is a phone number with no line attached,
+and `send_message` would refuse it with no way to tell that from the service
+being absent.
+
+This is not "grant everything". A registered name is a service saying *anyone may
+talk to me*; nothing else becomes reachable, and `hello`'s grandparent test — a
+message to a process that exists, is unrelated, and has not registered a name —
+still comes back `PermissionDenied`. That distinction is the difference between
+a capability system and a namespace.
+
+It lives in the kernel because the kernel owns the capability manager, and it
+should eventually live in `init`. That needs `delegate_capability` reachable from
+ring 3, which is four syscalls that still return `NotSupported`.
+
+### init, finally
+
+`userspace/init` held 788 lines across four files that had never run: a
+`ServiceManager` with a restart policy for services it could not start, a
+`ProcessSpawner` with a priority field nothing read, and a `syscalls.rs` whose
+`sys_spawn` returned a fabricated pid rather than making a system call. There was
+no linker script and the crate was not on the ISO.
+
+What replaces it is ~200 lines that the kernel starts, and the ordering is not a
+sleep: after spawning each service, init polls `lookup_service` until the name
+appears, so "the service is up" means the service said so. It does not restart
+anything, and the reason is worth stating rather than leaving as a gap: `ksh`
+holds a pid it looked up once, and a restarted `fs` has a different one. Restart
+without client-side re-lookup hands the shell a dead pid and presents as a hang.
+
+Shutdown runs in the opposite order — `fs` first, because stopping the driver
+with a read in flight leaves `fs` blocked in a receive that never completes, and
+a hang is harder to read out of a serial log than an error.
+
+### Two ABI bugs the move exposed
+
+Both were found the same way: `hello` asked the driver to identify the disk, and
+got a reply whose *payload* was perfect and whose 16-byte header was zeros.
+
+A header that is exactly one 16-byte quantity is a hint, and the disassembly
+confirmed it — the compiler had fused the four `write_u32` calls into a single
+`movaps %xmm0, REPLY`.
+
+**The kernel clobbered xmm across `syscall`.** The `syscall` instruction
+preserves nothing but what it stashes in RCX and R11; everything else is the
+kernel's promise. Kosh's entry stub saves and restores the general registers and
+had nothing to say about xmm, and the kernel was compiled with SSE — so any
+kernel code between entry and `sysretq` could and did use the register file the
+caller was holding a value in. The first symptom was the driver's header
+arriving as `0 0 0 0 0 0 0 0 0 0 0 6 0 0 0 3`, where 6 and 3 are the two process
+ids involved: kernel scratch, verbatim.
+
+The fix is that the kernel does not use SSE at all. The kernel now builds for the
+**built-in `x86_64-unknown-none` target**, whose spec differs from the JSON one
+userspace uses in one line:
+
+```
+"features": "-mmx,-sse,+soft-float"
+```
+
+It is a built-in target rather than a second `.json` beside the first because
+rustc rejects the feature in a custom spec — *target feature `soft-float` is
+incompatible with the ABI but gets enabled in target spec*. The built-in target
+defaults to a position-independent relocation model, which a kernel linked at one
+fixed address does not want and which fails at link time with `R_X86_64_32 cannot
+be used against local symbol`; `.cargo/config.toml` sets
+`-C relocation-model=static` for it.
+
+The alternative — `fxsave`/`fxrstor` around the syscall handler — was rejected
+because a forked child returns through `kosh_syscall_return` without ever having
+entered the stub, so it would need the save area threaded through
+`spawn_forked`'s hand-laid stack as well.
+
+**The scheduler never saved the FPU state.** With the kernel out of the picture,
+the same test still failed, and this time the culprit was another *thread*.
+`kosh_switch_context` saves the callee-saved general registers and RFLAGS and
+nothing else, which was correct for as long as one ring-3 program ran at a time.
+Four of them running together — driver, filesystem, shell, test program — all
+using xmm registers as the natural way to move 16 bytes, and a thread preempted
+between a load and a store gets somebody else's register back.
+
+`Thread` now carries a 16-byte-aligned 512-byte `FXSAVE` area, and `schedule()`
+brackets the switch:
+
+```rust
+core::arch::asm!("fxsave64 [{}]", in(reg) prev_fpu, ...);
+kosh_switch_context(prev_rsp, next_rsp);
+core::arch::asm!("fxrstor64 [{}]", in(reg) prev_fpu, ...);
+```
+
+Both instructions name the *same* pointer, and that is the whole trick. The frame
+belongs to the outgoing thread, so when it is eventually resumed it comes back to
+the line after the switch — in its own frame, with its own `prev_fpu` — and
+restores what it saved. A thread that has never been here (one just spawned, or a
+forked child resuming at `kosh_syscall_return`) never executes the restore, which
+is why the area needs no valid initial contents.
+
+Both fixes are load-bearing and both have controls. Removing the `fxsave64` pair
+reproduces the failure; building the kernel with the SSE-enabled target
+reproduces it too. Neither alone is enough, because they are different bugs that
+happened to have the same symptom: one corrupts a register across a system call,
+the other across a time slice.
+
+### What the port cost
+
+`userspace/fs-service/src/fat32.rs` is `kernel/src/fs/fat32.rs` with three call
+sites changed — the ones that read blocks. Everything else, the BPB validation,
+the cluster chain walk, the long-filename reassembly, the path lookup, ports
+verbatim. That is the useful measurement: moving a filesystem out of a kernel is
+not a rewrite if the filesystem was not entangled with the kernel to begin with.
+
+What it gains is a sector cache, because each read is now an IPC round trip
+rather than a function call, and every directory walk re-reads the same FAT
+sector.
+
+What it loses is the ability to sit still while a client asks it something.
+`receive_message` has no notion of a reply port, so a request can arrive while
+the service is waiting for a sector. `fs` keeps a one-slot stash for that; a
+*third* concurrent client's request is dropped with a warning and that client
+hangs. Named here because it is a real limit, and the fix is a reply port or a
+request queue rather than a bigger stash.
+
+### What is still in the kernel
+
+`kernel/src/block/ata.rs` and `kernel/src/fs/fat32.rs` are both still there, and
+the six file system calls still exist. Nothing that ships calls them: `ksh` goes
+through `fs`, and the kernel's own copies serve the boot-time probe and the
+console's `df` and `lsblk`. Deleting them means teaching the in-kernel console to
+be an IPC client too, which is the next piece of work rather than this one.
+
 ## What is deliberately still missing
 - **The filesystem is read-only.** Allocating clusters and keeping both FAT
   copies consistent is a separate problem, and a read-only filesystem that is
@@ -1923,10 +2086,13 @@ Reverting the shim and calling the body directly reproduces the original double
 - **The VFS is still unwired.** `userspace/fs-service/src/vfs.rs` has a mount
   table; it has never had a real filesystem underneath it, and connecting the
   two is separate work from making FAT32 correct.
-- **The filesystem is still in the kernel.** The disk driver is out; `fat32` is
-  not, and until it is, "microkernel" describes the disk and nothing above it.
-  That is the next phase, and it is what lets `kernel/src/block/ata.rs` be
-  deleted rather than merely stood aside from.
+- **The kernel still contains a filesystem and a disk driver.** Nothing that
+  ships calls them — `ksh` reads through the `fs` service — but the console's
+  `df` and `lsblk` do, so they cannot be deleted until the console is a client
+  too.
+- **IPC has no reply port.** A service waiting for its own downstream reply can
+  be interrupted by a client request, and `fs` handles exactly one of those at a
+  time. A third concurrent client hangs.
 - **`exec` takes no `argv`.** A driver cannot be told which device to serve, which
   is part of why `DRIVER_IMAGES` maps an image name to a device rather than the
   program deciding.

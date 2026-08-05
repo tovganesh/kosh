@@ -3,7 +3,15 @@ name = "kosh-init"
 version = "0.1.0"
 edition = "2021"
 
+# Process 1.
+#
+# For thirteen phases this directory held 788 lines that never ran: a
+# ServiceManager with a restart policy, a ProcessSpawner with a priority field,
+# and a syscalls.rs whose sys_spawn returned a fabricated pid. None of it was on
+# the ISO and none of it had a linker script.
+#
+# What is here now is ~200 lines that the kernel actually starts, and its job is
+# the one job init has in a microkernel: bring the services up in dependency
+# order, hand the console to the shell, and shut everything down afterwards.
+
 [dependencies]
-kosh-types = { path = "../../shared/kosh-types" }
-kosh-ipc = { path = "../../shared/kosh-ipc" }
-linked_list_allocator = "0.10"

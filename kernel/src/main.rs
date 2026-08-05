@@ -313,13 +313,18 @@ fn idle_loop() -> ! {
     }
 }
 
-/// Run the userspace shell, and fall back to the in-kernel console.
+/// Start userspace, and fall back to the in-kernel console when it stops.
 ///
-/// Only ever one of them at a time. Both read the same keyboard ring, so
-/// starting them together would mean two line editors racing for every
-/// keystroke. `ksh` gets the console; when it exits, the kernel's own console
-/// takes over, which is also how you get a debug prompt on a system whose
-/// userspace has died.
+/// The kernel starts exactly one program: `init`. It brings up the block driver
+/// and the filesystem, then hands the console to `ksh` — see
+/// `userspace/init/src/main.rs`. Until this phase the kernel spawned `ksh`
+/// itself and `userspace/init` was 788 lines that never ran.
+///
+/// Only ever one console reader at a time. `ksh` and the kernel console both
+/// read the same keyboard ring, so starting them together would mean two line
+/// editors racing for every keystroke. When userspace exits, the kernel's own
+/// console takes over — which is also how you get a debug prompt on a system
+/// whose userspace has died.
 #[cfg(target_arch = "x86_64")]
 fn supervisor(_arg: usize) {
     // The boot heartbeat has done its job. It used to be turned off by the
@@ -327,30 +332,31 @@ fn supervisor(_arg: usize) {
     // the middle of whatever was being typed at the ksh prompt.
     interrupts::timer::set_heartbeat(false);
 
-    if usermode::boot_module_named("ksh").is_some() {
-        serial_println!("Kosh: starting the userspace shell");
+    if usermode::boot_module_named("init").is_some() {
+        serial_println!("Kosh: starting userspace at init");
 
-        match task::spawn("ksh", usermode::run_shell, 0) {
+        match task::spawn("init", usermode::run_init, 0) {
             Ok(shell) => {
-                // `wait_for` blocks in `State::Blocked` until ksh exits. This
+                // `wait_for` blocks in `State::Blocked` until init exits. This
                 // used to spin on `live_threads() > 1`, with a comment saying the
                 // supervisor and ksh were the only two threads — which stopped
-                // being true the moment ksh could spawn a program of its own.
+                // being true the moment ksh could spawn a program of its own,
+                // and is now wrong by four.
                 let status = task::wait_for(shell);
                 serial_println!();
                 match status {
                     Ok(code) => serial_println!(
-                        "Kosh: ksh exited with code {}, falling back to the kernel console",
+                        "Kosh: init exited with code {}, falling back to the kernel console",
                         code
                     ),
-                    Err(e) => serial_println!("Kosh: ksh wait failed ({}), taking the console", e),
+                    Err(e) => serial_println!("Kosh: init wait failed ({}), taking the console", e),
                 }
                 task::reap_finished();
             }
-            Err(e) => serial_println!("Kosh: could not start ksh: {}", e),
+            Err(e) => serial_println!("Kosh: could not start init: {}", e),
         }
     } else {
-        serial_println!("Kosh: no ksh module, using the kernel console");
+        serial_println!("Kosh: no init module, using the kernel console");
     }
 
     // Never returns.

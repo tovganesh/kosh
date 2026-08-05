@@ -2,6 +2,7 @@ pub mod message;
 pub mod queue;
 pub mod capability;
 pub mod security;
+pub mod services;
 
 #[cfg(test)]
 pub mod capability_test;

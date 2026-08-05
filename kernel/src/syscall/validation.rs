@@ -50,6 +50,7 @@ pub fn validate_syscall_args(
         SYS_DRIVER_REQUEST => validate_driver_request_args(process_id, args),
         SYS_DRIVER_RESPONSE => validate_driver_response_args(process_id, args),
         SYS_REQUEST_DEVICE | SYS_RELEASE_DEVICE => validate_device_args(process_id, args),
+        SYS_REGISTER_SERVICE | SYS_LOOKUP_SERVICE => validate_service_args(process_id, args),
         
         SYS_UNAME | SYS_SYSINFO | SYS_TIME => validate_info_args(args),
         SYS_CLOCK_GETTIME => validate_clock_gettime_args(args),
@@ -562,6 +563,15 @@ fn validate_list_capabilities_args(args: &[u64; 6]) -> Result<(), SyscallError> 
 }
 
 // Debug syscall validations (only in debug builds)
+/// `register_service` / `lookup_service` take a service name.
+fn validate_service_args(process_id: ProcessId, args: &[u64; 6]) -> Result<(), SyscallError> {
+    let len = args[1] as usize;
+    if len == 0 || len > 16 {
+        return Err(SyscallError::InvalidArgument);
+    }
+    validate_user_pointer(process_id, args[0], len, false)
+}
+
 /// `request_device` / `release_device` take a device name.
 ///
 /// A validator is not optional here. The default arm of `validate_syscall_args`

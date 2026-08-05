@@ -3,17 +3,26 @@ name = "kosh-fs-service"
 version = "0.1.0"
 edition = "2021"
 
+# The FAT32 filesystem server, in ring 3.
+#
+# `kernel/src/fs/fat32.rs` does the same job inside the kernel, and this is close
+# to a transcription of it on purpose — the same argument the ATA driver makes
+# about drivers, made about filesystems. The only thing the privilege boundary
+# forced is where the sectors come from: `block::read_block` used to be a
+# function call into the kernel's block layer and is now an IPC round trip to
+# `userspace/ata-driver`.
+#
+# There is no lib target any more. The previous one existed to hold `vfs.rs` and
+# `ext4.rs`, neither of which was ever connected to a disk, and nothing linked
+# it.
+
 [[bin]]
 name = "kosh-fs-service"
 path = "src/main.rs"
 
-[lib]
-name = "kosh_fs_service"
-path = "src/lib.rs"
-
 [dependencies]
-kosh-types = { path = "../../shared/kosh-types" }
-kosh-ipc = { path = "../../shared/kosh-ipc" }
-kosh-service = { path = "../../shared/kosh-service" }
-spin = { workspace = true }
-linked_list_allocator = "0.10"
+# Only the allocator. kosh-types, kosh-ipc and kosh-service were dependencies of
+# the deleted stubs; this program speaks the two wire protocols directly, because
+# both ends of both live in this repository and an intermediate serialisation
+# crate is one more thing that can disagree with itself.
+linked_list_allocator = { version = "0.10", default-features = false, features = ["use_spin"] }

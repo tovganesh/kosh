@@ -31,7 +31,7 @@ const SYS_MUNMAP: u64 = 11;
 const SYS_WRITE: u64 = 23;
 const SYS_CLOCK_GETTIME: u64 = 53;
 const SYS_DEBUG_PRINT: u64 = 100;
-const SYS_SPAWN: u64 = 9;
+const SYS_LOOKUP_SERVICE: u64 = 47;
 
 /// mmap protection bits, as the kernel reads them.
 const PROT_READ: u64 = 0x1;
@@ -164,8 +164,8 @@ fn exec(name: &str) -> i64 {
     unsafe { syscall3(SYS_EXEC, name.as_ptr() as u64, name.len() as u64, 0) }
 }
 
-fn spawn(name: &str) -> i64 {
-    unsafe { syscall3(SYS_SPAWN, name.as_ptr() as u64, name.len() as u64, 0) }
+fn lookup_service(name: &str) -> i64 {
+    unsafe { syscall3(SYS_LOOKUP_SERVICE, name.as_ptr() as u64, name.len() as u64, 0) }
 }
 
 fn exit(code: u64) -> ! {
@@ -550,7 +550,6 @@ const REQ_MAGIC: u32 = 0x4B42_4C4B; // "KBLK"
 const REP_MAGIC: u32 = 0x4B52_504C; // "KRPL"
 const OP_READ: u32 = 0;
 const OP_INFO: u32 = 1;
-const OP_SHUTDOWN: u32 = 2;
 const REP_HEADER: usize = 16;
 
 static mut BLOCK_REQUEST: [u8; 24] = [0; 24];
@@ -600,24 +599,38 @@ fn block_request(driver: i64, op: u32, lba: u64, count: u32) -> (i32, usize) {
     }
 }
 
-/// Spawn the ring-3 ATA driver, read the disk through it, and shut it down.
+/// Read the disk through the resident ring-3 driver, found by name.
 ///
-/// The evidence that this is real and not a stub is the content: the driver
-/// returns the FAT32 boot sector `mkfs.vfat` wrote into `build/disk.img`, and
-/// the checks below are on bytes nobody in this program chose — the 0xEB jump
-/// opcode, the "mkfs.fat" OEM name at offset 3, the "FAT32" type string at 82
-/// and the 0x55AA signature at 510. A driver that could not talk to the disk
-/// could not produce any of them.
+/// This used to spawn its own copy of `ata-driver` and shut it down afterwards,
+/// which worked because the driver was this process's child and children may
+/// message their parents. There is one driver now, started by `init`, and it is
+/// nobody's parent and nobody's child — so this looks it up in the service
+/// registry, which is what hands out the capability to talk to it.
+///
+/// That is the property being tested as much as the disk read: two processes
+/// with no relationship exchanging messages, which the capability policy
+/// forbids unless one of them has registered a name.
+///
+/// The evidence that the read is real is the content: the driver returns the
+/// FAT32 boot sector `mkfs.vfat` wrote into `build/disk.img`, and the checks
+/// below are on bytes nobody in this program chose — the 0xEB jump opcode, the
+/// "mkfs.fat" OEM name at offset 3, the "FAT32" type string at 82 and the 0x55AA
+/// signature at 510.
 fn drive_a_disk() {
-    let driver = spawn("ata-driver");
+    let driver = lookup_service("block");
     if driver < 0 {
-        print("  WARNING: could not spawn the ata-driver\\n");
+        // The boot self-test runs this program before `init` exists, so there is
+        // no block service yet. Say so rather than reporting a pass that did not
+        // happen.
+        print("  no block service here, disk test not exercised\n");
         return;
     }
 
+    print("  found the 'block' service, which is not my parent or my child\n");
+
     let (status, len) = block_request(driver, OP_INFO, 0, 0);
     if status != 0 || len < 8 {
-        print("  WARNING: the driver could not identify the disk\\n");
+        print("  WARNING: the driver could not identify the disk\n");
     } else {
         let blocks = unsafe {
             let reply = &*core::ptr::addr_of!(BLOCK_REPLY);
@@ -627,14 +640,14 @@ fn drive_a_disk() {
         };
         print("  the ring-3 driver identified a disk of ");
         print_i64(blocks as i64);
-        print(" sectors\\n");
+        print(" sectors\n");
     }
 
     let (status, len) = block_request(driver, OP_READ, 0, 1);
     if status != 0 || len != 512 {
         print("  WARNING: reading LBA 0 through the driver failed, status ");
         print_i64(status as i64);
-        print("\\n");
+        print("\n");
     } else {
         let sector = unsafe {
             let reply = &*core::ptr::addr_of!(BLOCK_REPLY);
@@ -647,9 +660,9 @@ fn drive_a_disk() {
         let fat32 = &sector[82..87] == b"FAT32";
 
         if signature && jump && oem && fat32 {
-            print("  read LBA 0 in ring 3: a FAT32 boot sector, signature and all\\n");
+            print("  read LBA 0 in ring 3: a FAT32 boot sector, signature and all\n");
         } else {
-            print("  WARNING: LBA 0 does not look like the test disk\\n");
+            print("  WARNING: LBA 0 does not look like the test disk\n");
         }
     }
 
@@ -662,9 +675,9 @@ fn drive_a_disk() {
             reply[REP_HEADER + 510] != 0x55 || reply[REP_HEADER + 511] != 0xAA
         };
         if differs {
-            print("  a second sector read back different bytes\\n");
+            print("  a second sector read back different bytes\n");
         } else {
-            print("  WARNING: LBA 32 looks identical to LBA 0\\n");
+            print("  WARNING: LBA 32 looks identical to LBA 0\n");
         }
     }
 
@@ -672,22 +685,15 @@ fn drive_a_disk() {
     // register that never becomes ready.
     let (status, _) = block_request(driver, OP_READ, 1 << 40, 1);
     if status != 0 {
-        print("  the driver refused a read past the end of the disk\\n");
+        print("  the driver refused a read past the end of the disk\n");
     } else {
-        print("  WARNING: the driver accepted an impossible LBA\\n");
+        print("  WARNING: the driver accepted an impossible LBA\n");
     }
 
-    block_request(driver, OP_SHUTDOWN, 0, 0);
-
-    let mut status: i32 = 0;
-    wait(driver, &mut status);
-    if status == 0 {
-        print("  the driver exited and gave ata0 back\\n");
-    } else {
-        print("  WARNING: the driver exited with ");
-        print_i64(status as i64);
-        print("\\n");
-    }
+    // Deliberately no shutdown. The driver is shared: `fs` is reading through it
+    // and `ksh` is waiting on `fs`. Stopping a service because a client happens
+    // to be finished with it is what the reference count in a real system is for.
+    print("  leaving the shared driver running\n");
 }
 
 /// Exit code the kernel gives a process it terminates for a fault.

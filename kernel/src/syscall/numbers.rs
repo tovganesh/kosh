@@ -61,6 +61,17 @@ pub const SYS_REQUEST_DEVICE: u64 = 44;
 /// Give the ports back. Implicit on exit, so this is only for a driver that
 /// wants to hand a disk over while it keeps running.
 pub const SYS_RELEASE_DEVICE: u64 = 45;
+/// `register_service(name_ptr, name_len)` -> 0
+///
+/// Claim a name. A service saying "anyone may talk to me" — which is the only
+/// way two processes that are not parent and child can reach each other, since
+/// every other capability here is scoped to a specific process.
+pub const SYS_REGISTER_SERVICE: u64 = 46;
+/// `lookup_service(name_ptr, name_len)` -> pid
+///
+/// Find a service *and* get a capability for it. The grant is the point: a pid
+/// without one is a phone number with no line attached.
+pub const SYS_LOOKUP_SERVICE: u64 = 47;
 
 /// System information system calls
 pub const SYS_UNAME: u64 = 50;
@@ -150,6 +161,8 @@ pub fn syscall_name(syscall_number: u64) -> &'static str {
         SYS_DRIVER_RESPONSE => "driver_response",
         SYS_REQUEST_DEVICE => "request_device",
         SYS_RELEASE_DEVICE => "release_device",
+        SYS_REGISTER_SERVICE => "register_service",
+        SYS_LOOKUP_SERVICE => "lookup_service",
         
         SYS_GETDENTS => "getdents",
         SYS_UNAME => "uname",
