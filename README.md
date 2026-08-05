@@ -64,8 +64,8 @@ test disk, then boots the lot:
 
 ```bash
 ./scripts/run.sh              # boot it, serial on stdio (ctrl-a x to quit)
-./scripts/run.sh --check      # boot headless, assert 49 serial markers (CI)
-./scripts/run.sh --check-cli  # drive the shell through QEMU's monitor, assert 31
+./scripts/run.sh --check      # boot headless, assert 52 serial markers (CI)
+./scripts/run.sh --check-cli  # drive the shell through QEMU's monitor, assert 32
 ./scripts/run.sh --debug      # same as plain run, plus a gdb stub on :1234
 ```
 
@@ -141,27 +141,36 @@ interaction in `--check-cli`.
 - `ksh` can launch programs: unknown commands become `spawn` + `wait`, and
   `cmd &` starts one in the background
 
+**Processes and IPC**
+- A process *is* a ring-3 thread with an address space, registered in the
+  process table at the same id — one namespace, not two
+- `send_message`/`receive_message` carry real bytes, with a blocking receive
+  that parks the thread rather than spinning
+- **Capabilities that can refuse**: `fork` and `spawn` open a channel between a
+  process and its parent, and nothing else. A message to any other process is
+  `PermissionDenied`, and the test checks it
+
 **In-kernel console**
 - A fallback shell on the same keyboard, which takes over when `ksh` exits — so
   there is a prompt on a system whose userspace has died
 
 ## The syscall surface
 
-44 numbers are defined; **20 do the work** and the other 24 return an error
+44 numbers are defined; **23 do the work** and the other 21 return an error
 saying so. Nothing returns success for work it did not do.
 
-**Working** (all 20 exercised from ring 3, not just by the kernel checking
+**Working** (all 23 exercised from ring 3, not just by the kernel checking
 itself):
 
-`exit` `fork` `exec` `wait` `getpid` `yield` `spawn` · `mmap` `munmap` · `open`
-`close` `read` `write` `lseek` `stat` `getdents` · `time` `clock_gettime` ·
-`debug_print` `debug_dump`
+`exit` `fork` `exec` `wait` `getpid` `getppid` `yield` `spawn` · `mmap`
+`munmap` · `open` `close` `read` `write` `lseek` `stat` `getdents` · `time`
+`clock_gettime` · `send_message` `receive_message` · `debug_print` `debug_dump`
 
 **Refuses with `NotSupported`, honestly:**
 
-`kill` `getppid` · `mprotect` `brk` `sbrk` · `fstat` `mkdir` `rmdir` `unlink` ·
-all 5 IPC calls · all 4 driver calls · all 4 capability calls · `uname`
-`sysinfo`
+`kill` · `mprotect` `brk` `sbrk` · `fstat` `mkdir` `rmdir` `unlink` ·
+`reply_message` `create_channel` `destroy_channel` · all 4 driver calls · all 4
+capability calls · `uname` `sysinfo`
 
 ## What does not work
 
@@ -177,13 +186,13 @@ of it.
   needs somewhere to put the strings in the new address space.
 - **The filesystem is read-only.** `ksh` refuses redirection rather than
   pretending; there is no `mkdir`, `unlink` or write path.
-- **No IPC from userspace.** `kernel/src/ipc/` is ~85 KB of real queueing and
-  capability machinery, and it is unreachable: `syscall/entry.rs` passes a
-  *thread* id where the IPC layer expects a `ProcessTable` entry, and those two
-  namespaces are unrelated. Reconciling them is the next IPC job.
-- **Capability-based security is not enforced.** Same story: the machinery exists
-  in-kernel, all four capability syscalls return `NotSupported`, and no code path
-  checks a capability on behalf of a user process.
+- **IPC is send/receive only.** `reply_message`, `create_channel` and
+  `destroy_channel` still refuse, and there is no timeout on a blocking receive:
+  a process waiting for a message that never comes waits forever.
+- **Capabilities are not exposed to userspace.** They are enforced on the IPC
+  path — a process may message its parent and its children, and nothing else —
+  but the four capability syscalls still return `NotSupported`, so a program
+  cannot inspect or delegate what it holds.
 - **Not actually a microkernel yet.** The ATA driver, the filesystem and the
   keyboard driver are all *in* the kernel. That is the opposite of the intended
   design and is where the IPC work above leads.
@@ -253,8 +262,7 @@ Roughly in order, each unblocking the next:
 - [x] `fork` and `exec`
 - [x] Copy-on-write, so a `fork` costs a page table rather than a program
 - [x] Demand paging, so an untouched `.bss` costs nothing at all
-- [ ] One process-id namespace, so the IPC and capability machinery becomes
-      reachable from ring 3
+- [x] One process-id namespace, so IPC and capabilities became reachable
 - [ ] Move the disk and filesystem out of the kernel — the point of the whole
       exercise
 - [ ] FAT32 writes

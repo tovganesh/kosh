@@ -1604,6 +1604,130 @@ then as *"a syscall must not read an argument the ABI does not require the calle
 to set"* — and the validator, ten lines away, kept it. Writing the lesson down
 did not find the second instance. Grepping for `args[4]` would have.
 
+## One process-id namespace, and IPC that carries bytes (Phase 17)
+
+`kernel/src/ipc/` has been ~85 KB of implemented message queues, capability sets
+and security policy since long before anything could reach it. What kept it
+unreachable was not missing code but a **name collision**.
+
+`syscall/entry.rs` passed the calling *thread's* id as a `ProcessId`.
+`ipc::message::send_message` looked that id up in `process::ProcessTable`, whose
+only entries were three processes a boot self-test created — `init`, `shell` and
+`background_task`, at pids 1, 2 and 3, because the table's allocator is a
+monotonic counter starting at 1.
+
+Thread ids run 0..15. So the behaviour depended on which slot a program happened
+to land in:
+
+| thread | what `send_message` did |
+|---|---|
+| 0 | `SenderNotFound` — pid 0 can never exist, the counter starts at 1 |
+| 1, 2, 3 | **passed**, attributed to `init`/`shell`/`background_task` |
+| 4..15 | `SenderNotFound` |
+
+Worse, the self-test granted pid 1 `(SendMessage, ResourceId::Any)`, so a ring-3
+thread that landed in slot 1 also passed the capability check — as "init". A bug
+that depends on a scheduler slot is a bug that looks intermittent.
+
+### A process is a thread with an address space
+
+There is no second abstraction, and pretending there was is what left the table
+holding synthetic rows while every real program ran outside it. So the pid *is*
+the thread id, and `usermode::register_process` is the one place a process comes
+into existence.
+
+`ProcessTable` needed `create_process_with_pid`, because its own allocator is a
+counter and a caller-chosen id was impossible. Two allocators would have been two
+namespaces again.
+
+Registration sets up three things together, because a process missing any of them
+fails somewhere unhelpful:
+
+- the **table entry**, without which `send_message` reports `SenderNotFound`;
+- a **message queue**, without which a `receive` before the first `send` reports
+  `ReceiverNotFound` rather than "no message" — `enqueue_message` creates a queue
+  on demand but `dequeue_message` does not, an asymmetry worth knowing about;
+- a **capability** to exchange messages with its parent.
+
+### Capabilities that can refuse
+
+`security::grant_system_process_capabilities` hands out `(SendMessage,
+ResourceId::Any)`, which makes the check unable to say no to anything. It is not
+used. `create_secure_ipc_channel(child, parent)` grants each side `SendMessage`
+scoped to the *other specifically*, and that is the whole policy: **a process may
+message its parent and its children.**
+
+That is narrow, and it is narrow on purpose — a capability system that grants
+everything is decoration. The test reaches it:
+
+```
+  child: messaging my grandparent was refused
+```
+
+The grandparent is the shell that started this program. It exists, so the
+receiver-existence check passes and the *capability* check is what refuses.
+Swapping the scoped grant for `SendMessage/Any` turns that line into
+`WARNING: messaged a process I have no capability for`.
+
+Worth separating from a weaker check in the same test: sending to pid 999 is also
+refused, but by the existence check, which runs first. That one proves nothing
+about capabilities, and the test says so.
+
+### The payload
+
+```
+  parent: got the child's message, bytes and all
+```
+
+`send_message` copies the caller's buffer with `copy_from_user` and enqueues
+`MessageData::Bytes`. What it replaces substituted
+`MessageData::Text(format!("Message from process {} (len={})", pid, len))` — a
+*description* of the message, delivered instead of the message, with `Ok(0)`
+returned to the sender. `receive_message` used to dequeue for real and return
+only the message id, dropping the payload.
+
+Copying was never the hard part; `copy_from_user` had existed for phases. The
+namespace was.
+
+`receive_message` returns `(sender << 32) | length`, because a syscall has one
+return value and the receiver needs both.
+
+### Blocking, and lock order
+
+`State::Blocked { on: usize }` became `State::Blocked(BlockedOn)` with two
+reasons — a thread finishing, or a message arriving. They need different wake
+paths: collapsing them would mean waking every blocked thread on either event and
+letting each work out whether it was meant.
+
+The wake happens **after** every IPC lock is dropped. `wake_for_message` takes
+the scheduler lock; the send path takes the process table, the capability manager
+and the queue manager. Taking the scheduler lock while holding a queue lock on
+one path and the reverse on another is how a kernel stops.
+
+The receive loop re-checks the queue after waking rather than trusting the
+wake-up. A spurious wake is harmless; a missed re-check is a hang.
+
+### What was deleted
+
+`test_process_management`, `test_ipc_system` and `test_scheduler` — 234 lines of
+boot-time output — are gone.
+
+They created the three synthetic processes that caused the aliasing above. The
+IPC test then sent a message between pids 1 and 2 that failed with
+`PermissionDenied`, because capabilities were granted sixty lines *after* the
+send. And `test_scheduler` drove `process::scheduler`, which schedules nothing:
+it picks a pid and writes it into a field. The real scheduler is `task`.
+
+What replaces all three is two ring-3 processes exchanging a message, which
+exercises the same queueing and capability code with real senders and real bytes.
+
+### `getppid` finally means something
+
+It returned `Ok(0)` under a TODO for a long time — indistinguishable from a
+genuine "no parent", which is what 0 means — then `NotSupported` once that was
+noticed. There is a hierarchy now, and it is the same relation the capability
+policy uses.
+
 ## What is deliberately still missing
 - **The filesystem is read-only.** Allocating clusters and keeping both FAT
   copies consistent is a separate problem, and a read-only filesystem that is

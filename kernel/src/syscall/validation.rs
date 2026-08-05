@@ -40,7 +40,7 @@ pub fn validate_syscall_args(
         SYS_RMDIR | SYS_UNLINK => validate_unlink_args(process_id, args),
         
         SYS_SEND_MESSAGE => validate_send_message_args(process_id, args),
-        SYS_RECEIVE_MESSAGE => validate_receive_message_args(args),
+        SYS_RECEIVE_MESSAGE => validate_receive_message_args(process_id, args),
         SYS_REPLY_MESSAGE => validate_reply_message_args(process_id, args),
         SYS_CREATE_CHANNEL => validate_create_channel_args(args),
         SYS_DESTROY_CHANNEL => validate_destroy_channel_args(args),
@@ -378,25 +378,41 @@ fn validate_unlink_args(process_id: ProcessId, args: &[u64; 6]) -> Result<(), Sy
 }
 
 // IPC syscall validations
-fn validate_send_message_args(process_id: ProcessId, args: &[u64; 6]) -> Result<(), SyscallError> {
-    let receiver_pid = args[0];
-    let message_ptr = args[1];
-    let message_len = args[2];
-    
-    if receiver_pid == 0 {
+/// `send_message(receiver_pid, ptr, len)`.
+fn validate_send_message_args(
+    process_id: ProcessId,
+    args: &[u64; 6],
+) -> Result<(), SyscallError> {
+    let receiver = args[0];
+    let ptr = args[1];
+    let len = args[2];
+
+    // Pid 0 is the kernel's own thread, which has no queue and nothing to say.
+    if receiver == 0 {
         return Err(SyscallError::InvalidArgument);
     }
-    
-    if message_len > 0 {
-        validate_user_pointer(process_id, message_ptr, message_len as usize, false)?;
+    if len == 0 || len > 4096 {
+        return Err(SyscallError::InvalidArgument);
     }
-    
-    Ok(())
+    validate_user_pointer(process_id, ptr, len as usize, false)
 }
 
-fn validate_receive_message_args(args: &[u64; 6]) -> Result<(), SyscallError> {
-    // Receive message takes optional timeout
-    Ok(())
+/// `receive_message(buf_ptr, buf_len, blocking)`.
+///
+/// The destination is checked here rather than in the handler because a receive
+/// that blocks and *then* discovers it has nowhere to put the answer has already
+/// consumed the message.
+fn validate_receive_message_args(
+    process_id: ProcessId,
+    args: &[u64; 6],
+) -> Result<(), SyscallError> {
+    let buf = args[0];
+    let len = args[1];
+
+    if len == 0 || len > 4096 {
+        return Err(SyscallError::InvalidArgument);
+    }
+    validate_user_pointer(process_id, buf, len as usize, true)
 }
 
 fn validate_reply_message_args(process_id: ProcessId, args: &[u64; 6]) -> Result<(), SyscallError> {

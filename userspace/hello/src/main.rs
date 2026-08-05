@@ -22,6 +22,9 @@ const SYS_EXIT: u64 = 1;
 const SYS_FORK: u64 = 2;
 const SYS_EXEC: u64 = 3;
 const SYS_WAIT: u64 = 4;
+const SYS_GETPPID: u64 = 6;
+const SYS_SEND_MESSAGE: u64 = 30;
+const SYS_RECEIVE_MESSAGE: u64 = 31;
 const SYS_GETPID: u64 = 5;
 const SYS_MMAP: u64 = 10;
 const SYS_MUNMAP: u64 = 11;
@@ -45,6 +48,10 @@ const CLOCK_MONOTONIC: u64 = 1;
 /// variable because it lives in `.bss` — the part of the address space the
 /// eager copy has to duplicate.
 static mut FORK_WITNESS: u64 = 0;
+
+/// The process that started this one, recorded before forking so the child
+/// inherits it.
+static mut GRANDPARENT: u64 = 0;
 
 /// Zero-initialised, so it occupies no space in the file. If the loader forgets
 /// to zero the gap between `p_filesz` and `p_memsz`, this reads as garbage.
@@ -123,6 +130,33 @@ fn fork() -> i64 {
 
 fn wait(task: i64, status: &mut i32) -> i64 {
     unsafe { syscall3(SYS_WAIT, task as u64, status as *mut i32 as u64, 0) }
+}
+
+fn getppid() -> i64 {
+    unsafe { syscall3(SYS_GETPPID, 0, 0, 0) }
+}
+
+fn send_message(to: i64, bytes: &[u8]) -> i64 {
+    unsafe {
+        syscall3(
+            SYS_SEND_MESSAGE,
+            to as u64,
+            bytes.as_ptr() as u64,
+            bytes.len() as u64,
+        )
+    }
+}
+
+/// Returns `(sender << 32) | length`, or negative on failure.
+fn receive_message(buf: &mut [u8], blocking: bool) -> i64 {
+    unsafe {
+        syscall3(
+            SYS_RECEIVE_MESSAGE,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            if blocking { 1 } else { 0 },
+        )
+    }
 }
 
 fn exec(name: &str) -> i64 {
@@ -367,6 +401,14 @@ pub extern "C" fn kosh_main() -> ! {
     // next write lands in the page the child is about to read.
     unsafe { core::ptr::write_volatile(&raw mut FORK_WITNESS, 0x1111_1111) };
 
+    // Recorded before the fork so the child inherits it: the process that
+    // started *this* one. When `ksh` runs this program that is the shell; when
+    // the kernel runs it at boot there is nobody, and it is 0.
+    //
+    // The child uses it to try something it must not be allowed to do.
+    let grandparent = getppid();
+    unsafe { core::ptr::write_volatile(&raw mut GRANDPARENT, grandparent as u64) };
+
     let child = fork();
     if child < 0 {
         print("  WARNING: fork failed\n");
@@ -389,6 +431,33 @@ pub extern "C" fn kosh_main() -> ! {
             print("  WARNING: child could not write its own memory\n");
         }
 
+        // Message the parent, which is blocked in a receive waiting for it.
+        //
+        // The capability that permits this was granted by `fork`: a process may
+        // message its parent and its children, and nothing else. The parent
+        // checks below that a send to an unrelated pid is refused.
+        let parent = getppid();
+        let sent = send_message(parent, b"child reporting for duty");
+        if sent < 0 {
+            print("  WARNING: child could not message its parent\n");
+        }
+
+        // ...and one it must not be allowed to send. The grandparent exists —
+        // it is the shell that started this program — but it is neither this
+        // process's parent nor its child, so there is no capability for it.
+        //
+        // Refusing a pid that does not exist proves nothing about capabilities;
+        // `send_message` checks the receiver exists first. This is the test that
+        // reaches the capability check.
+        let gp = unsafe { core::ptr::read_volatile(&raw const GRANDPARENT) } as i64;
+        if gp == 0 {
+            print("  child: no grandparent here, capability check not exercised\n");
+        } else if send_message(gp, b"you should not see this") < 0 {
+            print("  child: messaging my grandparent was refused\n");
+        } else {
+            print("  WARNING: messaged a process I have no capability for\n");
+        }
+
         // exec never returns. If it does, it failed.
         let err = exec("hello2");
         print("  WARNING: exec returned ");
@@ -400,6 +469,32 @@ pub extern "C" fn kosh_main() -> ! {
         // kernel has to give the parent a private copy — not hand it the shared
         // one.
         unsafe { core::ptr::write_volatile(&raw mut FORK_WITNESS, 0x3333_3333) };
+
+        // Block until the child sends. Not a yield loop — the kernel parks this
+        // thread and the send wakes it.
+        let mut inbox = [0u8; 64];
+        let got = receive_message(&mut inbox, true);
+        if got < 0 {
+            print("  WARNING: parent's receive failed\n");
+        } else {
+            let sender = (got >> 32) as i64;
+            let len = (got & 0xFFFF_FFFF) as usize;
+            if sender == child && &inbox[..len] == b"child reporting for duty" {
+                print("  parent: got the child's message, bytes and all\n");
+            } else {
+                print("  WARNING: parent got the wrong message\n");
+            }
+        }
+
+        // A pid that does not exist. Cheap to check and worth checking, but note
+        // what it does *not* prove: `send_message` tests that the receiver
+        // exists before it tests capabilities, so this never reaches the
+        // capability code. The child's attempt above is the one that does.
+        if send_message(999, b"nobody is listening") < 0 {
+            print("  parent: sending to a pid that does not exist was refused\n");
+        } else {
+            print("  WARNING: sent a message to a process that does not exist\n");
+        }
 
         let mut status: i32 = 0;
         wait(child, &mut status);

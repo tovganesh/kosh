@@ -9,7 +9,7 @@ pub use process::{
     Process, ProcessId, ProcessState, ProcessTable, ProcessError, ProcessPriority, ProcessInfo,
     create_process, get_process, remove_process, set_current_process, get_current_process,
     get_runnable_processes, get_process_statistics, print_process_table, cleanup_zombie_processes,
-    init_process_table
+    init_process_table, create_process_with_pid, process_exists, parent_of
 };
 pub use scheduler::{
     Scheduler, SchedulerError, SchedulingAlgorithm,
