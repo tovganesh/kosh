@@ -44,9 +44,10 @@ use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame, Size4KiB}
 use x86_64::PhysAddr;
 
 use crate::memory::paging::{
-    kernel_pml4_phys, mapper_for, KERNEL_PML4_FIRST, OWNED_BY_ADDRESS_SPACE, PHYSMAP_BASE,
+    kernel_pml4_phys, mapper_for, COPY_ON_WRITE, KERNEL_PML4_FIRST, OWNED_BY_ADDRESS_SPACE,
+    PHYSMAP_BASE,
 };
-use crate::memory::physical::{allocate_frame, deallocate_frame, PageFrame};
+use crate::memory::physical::{allocate_frame, deallocate_frame, share_frame, PageFrame};
 use crate::serial_println;
 
 /// A process's page tables.
@@ -88,23 +89,23 @@ impl AddressSpace {
     /// A copy of this address space: same contents at the same addresses, in
     /// different frames.
     ///
-    /// ## Eager, not copy-on-write
+    /// ## Copy-on-write
     ///
-    /// Every owned page is duplicated immediately. The textbook implementation
-    /// marks both copies read-only, shares the frames, and copies one page at a
-    /// time in the page-fault handler — which is faster, and is what makes
-    /// `fork` cheap enough to be followed immediately by `exec`.
+    /// No page data is copied. Every owned leaf is shared: the frame's
+    /// reference count goes up, and *both* the parent's entry and the child's
+    /// lose `WRITABLE` and gain [`COPY_ON_WRITE`]. The first write from either
+    /// side faults, and `paging::resolve_cow` gives that side a private copy.
     ///
-    /// It is not done here, deliberately. Copy-on-write needs a per-frame
-    /// reference count, and getting that wrong produces double frees and
-    /// use-after-free of page tables: memory corruption that shows up somewhere
-    /// unrelated, much later. An eager copy is *correct* `fork` semantics — a
-    /// child that sees the parent's memory as it was and diverges from there —
-    /// at a cost of one memcpy per page. Forking `ksh` copies about 400 KiB.
+    /// Both sides, not just the child — that is the part that is easy to get
+    /// wrong. Leaving the parent writable means the parent's next write lands
+    /// in a page the child is still reading.
     ///
-    /// The cost is real and worth stating: without `exec` following, a fork is
-    /// pure waste, and with demand paging a program's untouched `.bss` would not
-    /// need copying at all. Both are the next piece of work.
+    /// The previous implementation copied every page eagerly. It was correct,
+    /// and it cost about 400 KiB per `fork` of `ksh` — most of it a `.bss` the
+    /// child would `exec` away microseconds later.
+    ///
+    /// Page *tables* are still duplicated, because the child needs its own
+    /// entries to modify. That is a handful of frames rather than a program.
     ///
     /// ## Shared versus copied
     ///
@@ -224,6 +225,18 @@ pub fn fork_from(parent_pml4: u64) -> Result<(AddressSpace, usize), &'static str
         }
     }
 
+    // The parent's own entries just lost WRITABLE, and the CPU has cached the
+    // old ones. Reloading CR3 flushes every non-global entry, which is the
+    // blunt-but-correct option; the alternative is an `invlpg` per page, and
+    // there are as many pages as we just shared.
+    //
+    // Only correct because the parent is the *current* address space, which it
+    // is: `fork` runs in the caller.
+    unsafe {
+        let (frame, flags) = Cr3::read();
+        Cr3::write(frame, flags);
+    }
+
     Ok((child, copied))
 }
 
@@ -238,11 +251,14 @@ unsafe fn clone_level(
     let new_frame = allocate_frame().ok_or("out of memory forking page tables")?;
     let new_phys = new_frame.address() as u64;
 
+    // The source is taken mutably: sharing a page copy-on-write has to clear
+    // WRITABLE in the *parent's* entry as well as the child's.
     let source = &*((PHYSMAP_BASE + table_phys) as *const PageTable);
+    let source_mut = &mut *((PHYSMAP_BASE + table_phys) as *mut PageTable);
     let target = &mut *((PHYSMAP_BASE + new_phys) as *mut PageTable);
     target.zero();
 
-    let mut copied = 0;
+    let mut shared_pages = 0;
 
     for i in 0..512 {
         if source[i].is_unused() {
@@ -254,31 +270,42 @@ unsafe fn clone_level(
 
         if level == 1 || flags.contains(PageTableFlags::HUGE_PAGE) {
             if flags.contains(OWNED_BY_ADDRESS_SPACE) {
-                // A page this process owns: give the child its own copy.
-                let copy = match allocate_frame() {
-                    Some(f) => f.address() as u64,
-                    None => return Err("out of memory forking a page"),
+                // A page this process owns: share the frame, and make both sides
+                // fault on their next write.
+                if share_frame(PageFrame::from_address(addr as usize)).is_none() {
+                    return Err("frame reference count overflowed during fork");
+                }
+
+                let shared = if flags.contains(PageTableFlags::WRITABLE) {
+                    (flags | OWNED_BY_ADDRESS_SPACE | COPY_ON_WRITE)
+                        - PageTableFlags::WRITABLE
+                } else {
+                    // Already read-only — `.text`, `.rodata`. Nothing can write
+                    // it, so there is nothing to copy on; it just needs the
+                    // reference count, which it now has.
+                    flags
                 };
-                core::ptr::copy_nonoverlapping(
-                    (PHYSMAP_BASE + addr) as *const u8,
-                    (PHYSMAP_BASE + copy) as *mut u8,
-                    crate::memory::PAGE_SIZE,
-                );
-                target[i].set_addr(PhysAddr::new(copy), flags);
-                copied += 1;
+
+                target[i].set_addr(PhysAddr::new(addr), shared);
+                // The parent loses write access too. Doing only the child is the
+                // classic copy-on-write bug: the parent's next write goes into
+                // the page the child is reading.
+                source_mut[i].set_flags(shared);
+                shared_pages += 1;
             } else {
-                // Borrowed. Share it, and leave it untagged in the child too, so
-                // neither teardown tries to free it.
+                // Borrowed — the built-in payload lives in the kernel image.
+                // Share it, and leave it untagged in the child too, so neither
+                // teardown tries to free it.
                 target[i].set_addr(PhysAddr::new(addr), flags);
             }
         } else {
             let (child_table, n) = clone_level(addr, flags, level - 1)?;
             target[i].set_addr(PhysAddr::new(child_table), flags);
-            copied += n;
+            shared_pages += n;
         }
     }
 
-    Ok((new_phys, copied))
+    Ok((new_phys, shared_pages))
 }
 
 /// Check that every address space still agrees with the kernel about the upper

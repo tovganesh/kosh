@@ -258,7 +258,10 @@ check)
         "munmap returned the pages" \
         "CLOCK_MONOTONIC moves forwards" \
         "debug_print echoed my message" \
+        "child: I inherited the value my parent set before forking" \
         "child: my copy of the witness is mine" \
+        "parent: still writable after the child exited" \
+        "Copy-on-write: " \
         "hello2 here: exec replaced the whole image" \
         "hello2: my .bss is mine and it is zero" \
         "parent: the child did not touch my memory" \

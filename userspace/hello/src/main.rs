@@ -293,22 +293,35 @@ pub extern "C" fn kosh_main() -> ! {
         print("  debug_print echoed my message\n");
     }
 
-    // fork. The parent writes a witness value, forks, and then both sides write
-    // a different one — if the address spaces were shared, the second write would
-    // be visible to the first process and the values would agree.
+    // fork, and the copy-on-write behaviour underneath it.
     //
-    // `hello` is spawned by `ksh` and also run at boot, so this must not recurse:
-    // the child execs `hello2`, a different program, and does not fork again.
+    // The sequencing is deliberate and not racy: `fork` returns *in the parent*
+    // with the child merely Ready, so the parent's write below is guaranteed to
+    // happen before the child runs. The child then reads the same address and
+    // must still see the pre-fork value.
+    //
+    // That is what catches the classic copy-on-write bug — marking only the
+    // child's page read-only and leaving the parent writable, so the parent's
+    // next write lands in the page the child is about to read.
     unsafe { core::ptr::write_volatile(&raw mut FORK_WITNESS, 0x1111_1111) };
 
     let child = fork();
     if child < 0 {
         print("  WARNING: fork failed\n");
     } else if child == 0 {
-        // Child. Prove the copy diverged, then become a different program.
+        // Child. Its copy must still hold the pre-fork value.
+        let inherited = unsafe { core::ptr::read_volatile(&raw const FORK_WITNESS) };
+        if inherited == 0x1111_1111 {
+            print("  child: I inherited the value my parent set before forking\n");
+        } else {
+            print("  WARNING: child saw ");
+            print_hex(inherited);
+            print(" — the parent wrote through a shared page\n");
+        }
+
         unsafe { core::ptr::write_volatile(&raw mut FORK_WITNESS, 0x2222_2222) };
-        let seen = unsafe { core::ptr::read_volatile(&raw const FORK_WITNESS) };
-        if seen == 0x2222_2222 {
+        let mine = unsafe { core::ptr::read_volatile(&raw const FORK_WITNESS) };
+        if mine == 0x2222_2222 {
             print("  child: my copy of the witness is mine\n");
         } else {
             print("  WARNING: child could not write its own memory\n");
@@ -321,18 +334,31 @@ pub extern "C" fn kosh_main() -> ! {
         print("\n");
         exit(1);
     } else {
-        // Parent. The child has written 0x22222222 to *its* copy by now, or will
-        // shortly; either way the parent's must still read 0x11111111.
+        // Parent. This write faults on a page it shares with the child, and the
+        // kernel has to give the parent a private copy — not hand it the shared
+        // one.
+        unsafe { core::ptr::write_volatile(&raw mut FORK_WITNESS, 0x3333_3333) };
+
         let mut status: i32 = 0;
         wait(child, &mut status);
 
         let seen = unsafe { core::ptr::read_volatile(&raw const FORK_WITNESS) };
-        if seen == 0x1111_1111 {
+        if seen == 0x3333_3333 {
             print("  parent: the child did not touch my memory\n");
         } else {
             print("  WARNING: fork shared memory, witness reads ");
             print_hex(seen);
             print("\n");
+        }
+
+        // The child is gone, so this page has one holder again. Writing it
+        // exercises the other half of the copy-on-write path: take ownership
+        // rather than copy.
+        unsafe { core::ptr::write_volatile(&raw mut FORK_WITNESS, 0x4444_4444) };
+        if unsafe { core::ptr::read_volatile(&raw const FORK_WITNESS) } == 0x4444_4444 {
+            print("  parent: still writable after the child exited\n");
+        } else {
+            print("  WARNING: parent lost write access to its own page\n");
         }
 
         if status == 7 {

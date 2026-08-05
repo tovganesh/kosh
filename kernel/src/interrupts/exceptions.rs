@@ -144,6 +144,26 @@ pub extern "x86-interrupt" fn page_fault_handler(
 
     let accessed = Cr2::read();
 
+    // Copy-on-write, before anything is printed.
+    //
+    // A write to a page shared by `fork` is not an error — it is the mechanism
+    // working. `resolve_cow` gives this address space a private copy and the
+    // faulting instruction is retried, so the common case produces no output at
+    // all. Everything below is for faults that are genuinely faults.
+    if error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
+        && error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE)
+        && accessed.as_u64() < crate::syscall::uaccess::USER_ADDRESS_LIMIT
+    {
+        match crate::memory::paging::resolve_cow(accessed.as_u64()) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(e) => {
+                serial_println!();
+                serial_println!("Copy-on-write fault at 0x{:x} could not be resolved: {}", accessed.as_u64(), e);
+            }
+        }
+    }
+
     serial_println!();
     serial_println!("==================== PAGE FAULT ====================");
     serial_println!("  accessed address : 0x{:016x}", accessed.as_u64());

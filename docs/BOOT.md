@@ -1399,6 +1399,123 @@ ksh:/$   hello2 here: exec replaced the whole image
 No job control — no `jobs`, no `fg`, no notification on exit. The task id is
 printed so a `wait` is at least possible by hand.
 
+## Copy-on-write (Phase 15)
+
+The previous phase's `fork` copied every page eagerly. That is correct, and it
+cost about 400 KiB per fork of `ksh` — most of it a `.bss` the child `exec`s away
+microseconds later. This is the optimisation, and the reference counting it
+needs.
+
+```
+Thread 1 forking: 20 page(s) shared copy-on-write into PML4 0x5e9000 (20 shared system-wide)
+  child: I inherited the value my parent set before forking
+  child: my copy of the witness is mine
+  parent: the child did not touch my memory
+  parent: still writable after the child exited
+Copy-on-write: 3 fault(s) resolved, 2 needed a copy, 0 frame(s) still shared
+```
+
+Twenty pages shared, zero copied at `fork` time, three copies made lazily —
+exactly the pages that were actually written.
+
+### Both sides, not just the child
+
+`fork` shares every owned leaf: the frame's reference count goes up, and *both*
+the parent's entry and the child's lose `WRITABLE` and gain `COPY_ON_WRITE`.
+
+Marking only the child is the classic bug, and it is silent: the parent's next
+write lands in the page the child is about to read, and the child sees a value
+its parent wrote *after* the fork. The test is built to catch precisely that, and
+the sequencing is not racy — `fork` returns in the parent with the child merely
+`Ready`, so the parent's write is guaranteed to happen first:
+
+```
+  WARNING: child saw 0000000033333333 — the parent wrote through a shared page
+```
+
+That is what removing one line — `source_mut[i].set_flags(shared)` — produces.
+
+Pages that were *already* read-only (`.text`, `.rodata`) are shared without the
+marker. Nothing can write them, so there is nothing to copy on; they still need
+the reference count, and they now have it.
+
+`COPY_ON_WRITE` is a separate bit from `WRITABLE` being clear, because a
+genuinely read-only page must keep faulting rather than being handed a writable
+copy.
+
+### The parent's TLB
+
+The parent's own entries just lost `WRITABLE`, and the CPU has the old ones
+cached. `fork_from` reloads CR3, which flushes every non-global entry. Blunt, and
+correct; the alternative is one `invlpg` per shared page, and there are as many
+of those as pages. It is only valid because the parent is the *current* address
+space, which it is — `fork` runs in the caller.
+
+### Resolving
+
+`resolve_cow` has two cases, and the second matters more than it looks:
+
+* **The frame has other holders.** Allocate one, copy 4 KiB through the physmap,
+  repoint the entry, drop a reference to the original.
+* **This is the last holder.** Nothing to copy — clear the marker and restore
+  `WRITABLE`. Without this, a process whose child has already exited would keep
+  paying a full copy for every page it writes, forever, with nobody to copy away
+  from.
+
+Both are exercised: `2 needed a copy` out of `3 fault(s) resolved`. The third is
+the parent writing after the child exited.
+
+### Two syscall-path hazards
+
+**`copy_to_user` writes at the user address.** With `CR0.WP` set, a kernel write
+to a read-only page traps — from ring 0, in the middle of a syscall that may be
+holding locks the fault handler wants. So `validate_user_range` resolves
+copy-on-write *up front* when the caller asks for write access, turning what
+would be a kernel-mode fault into an ordinary function call. It also means a
+failure comes back as an error return rather than an exception.
+
+**`validate_user_range` would have rejected the write.** A shared page is not
+`WRITABLE`, so `read(fd, buf)` into freshly-forked memory would have failed with
+`NotWritable` before the copy could happen. It treats `COPY_ON_WRITE` as
+writable-after-resolution.
+
+### The reference count, and two bugs finding a home for it
+
+One byte per frame — the sharers of a frame are address spaces, and the thread
+table holds 16, so 255 is a long way past enough. `allocate_frame` sets it to 1;
+`deallocate_frame` decrements and only really frees at zero. A frame the
+allocator never handed out has a count of 0, and freeing one is refused with a
+warning rather than putting the running kernel's own pages on the free list.
+
+Placing the table found two bugs in the same afternoon, both of the same shape —
+**a rule that was correct until the thing it described changed size**:
+
+1. The metadata went "immediately after the kernel image", which was fine while
+   it was a 16 KiB bitmap. The refcount table is 128 KiB for 512 MiB of RAM, and
+   that reaches into the module GRUB loaded at `0x195000`. The symptom was both
+   boot modules reading as all zeros and the ELF loader reporting `BadMagic`,
+   several subsystems from the cause. It is now computed from the kernel *and*
+   every module end — the only version without a size at which it silently
+   breaks. (A hardcoded 2 MiB was the rule before that, and failed the same way
+   when the kernel grew.)
+
+2. The reservation loop excluded `bitmap_start .. bitmap_start + bitmap.len()`,
+   using the bitmap's length as a proxy for "the metadata" — true when the bitmap
+   *was* the metadata. So the allocator handed out the frames holding the
+   refcount table, which promptly filled with page data:
+
+   ```
+   Thread 1 forking: 20 page(s) shared copy-on-write (112969 shared system-wide)
+   ```
+
+   112,969 frames shared after a fork of twenty pages. Worth logging a number you
+   can sanity-check by eye.
+
+### No leak
+
+Two consecutive `hello` runs from `ksh` — each a fork, an exec, and two
+teardowns — both end at 1613 used pages.
+
 ## What is deliberately still missing
 - **The filesystem is read-only.** Allocating clusters and keeping both FAT
   copies consistent is a separate problem, and a read-only filesystem that is

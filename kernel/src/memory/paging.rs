@@ -152,6 +152,133 @@ pub unsafe fn mapper_for(pml4_phys: u64) -> OffsetPageTable<'static> {
 /// allocator.
 pub const OWNED_BY_ADDRESS_SPACE: PageTableFlags = PageTableFlags::BIT_9;
 
+/// Marks a leaf that is shared copy-on-write.
+///
+/// The page is present and readable but **not** writable, and the frame's
+/// reference count is above one. A write faults; `resolve_cow` gives the writer
+/// a private copy (or, if it turns out to be the last holder, simply makes the
+/// page writable again) and the instruction retries.
+///
+/// A separate bit from `WRITABLE` being clear, because a genuinely read-only
+/// page — `.text`, `.rodata` — must keep faulting rather than being handed a
+/// writable copy.
+pub const COPY_ON_WRITE: PageTableFlags = PageTableFlags::BIT_10;
+
+/// Give the current address space a private, writable copy of a shared page.
+///
+/// Returns `Ok(true)` if it did something, `Ok(false)` if the page was not
+/// copy-on-write and the fault is real.
+///
+/// Two cases:
+///
+/// * **The frame has other holders.** Allocate one, copy 4 KiB through the
+///   physmap, point the entry at the copy and drop a reference to the original.
+/// * **This is the last holder.** Nothing to copy: clear the marker and restore
+///   `WRITABLE`. Without this case a process that forks and whose child exits
+///   would keep paying a copy for every page it writes, forever.
+///
+/// The TLB entry for a page that was cached read-only has to be invalidated
+/// explicitly — the CPU will not notice the table changed underneath it.
+/// Copy-on-write faults resolved since boot, and how many needed a real copy.
+///
+/// Logged because a copy-on-write implementation that never fires and one that
+/// works look identical from outside: both produce a correct program. The
+/// counters are the only evidence the mechanism is on the path at all.
+static COW_RESOLVED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static COW_COPIED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn cow_stats() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        COW_RESOLVED.load(Ordering::Relaxed),
+        COW_COPIED.load(Ordering::Relaxed),
+    )
+}
+
+pub fn resolve_cow(virt: u64) -> Result<bool, &'static str> {
+    use x86_64::instructions::tlb;
+    use x86_64::structures::paging::mapper::TranslateResult;
+    use x86_64::structures::paging::Translate;
+
+    let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(virt));
+
+    let (frame_phys, flags) = {
+        let mapper = unsafe { active_mapper() };
+        match mapper.translate(page.start_address()) {
+            TranslateResult::Mapped { frame, flags, .. } => {
+                (frame.start_address().as_u64(), flags)
+            }
+            _ => return Ok(false),
+        }
+    };
+
+    if !flags.contains(COPY_ON_WRITE) {
+        return Ok(false);
+    }
+
+    let old = PageFrame::from_address(frame_phys as usize);
+    let writable_flags = (flags | PageTableFlags::WRITABLE) - COPY_ON_WRITE;
+
+    // The count is read once and acted on with interrupts disabled, because two
+    // threads faulting on the same shared page must not both conclude they are
+    // the last holder.
+    crate::interrupts::without_interrupts(|| {
+        let refs = crate::memory::physical::frame_refs(old);
+
+        if refs <= 1 {
+            unsafe {
+                let mut mapper = active_mapper();
+                mapper
+                    .update_flags(page, writable_flags)
+                    .map_err(|_| "could not make the last copy writable")?
+                    .flush();
+            }
+            COW_RESOLVED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            return Ok(true);
+        }
+
+        let copy = allocate_frame().ok_or("out of memory resolving a copy-on-write fault")?;
+        let copy_phys = copy.address() as u64;
+
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (PHYSMAP_BASE + frame_phys) as *const u8,
+                (PHYSMAP_BASE + copy_phys) as *mut u8,
+                PAGE_SIZE,
+            );
+
+            let mut mapper = active_mapper();
+            // `unmap` then `map_to` rather than editing in place: the crate has
+            // no "repoint this entry" operation, and doing it by hand would mean
+            // reimplementing the table walk.
+            let (_, flush) = mapper.unmap(page).map_err(|_| "could not unmap a CoW page")?;
+            flush.ignore();
+
+            let table_flags = PageTableFlags::PRESENT
+                | PageTableFlags::WRITABLE
+                | PageTableFlags::USER_ACCESSIBLE;
+            mapper
+                .map_to_with_table_flags(
+                    page,
+                    PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(copy_phys)),
+                    writable_flags,
+                    table_flags,
+                    &mut KoshFrameAllocator,
+                )
+                .map_err(|_| "could not map a CoW copy")?
+                .flush();
+        }
+
+        // Only now: the original has one fewer holder.
+        crate::memory::physical::deallocate_frame(old);
+        tlb::flush(page.start_address());
+
+        COW_RESOLVED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        COW_COPIED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        Ok(true)
+    })
+}
+
 /// Build the kernel's own page tables and install them.
 ///
 /// `phys_mem_end` is the highest physical address that needs to appear in the
