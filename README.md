@@ -64,8 +64,8 @@ test disk, then boots the lot:
 
 ```bash
 ./scripts/run.sh              # boot it, serial on stdio (ctrl-a x to quit)
-./scripts/run.sh --check      # boot headless, assert 39 serial markers (CI)
-./scripts/run.sh --check-cli  # drive the shell through QEMU's monitor, assert 30
+./scripts/run.sh --check      # boot headless, assert 44 serial markers (CI)
+./scripts/run.sh --check-cli  # drive the shell through QEMU's monitor, assert 31
 ./scripts/run.sh --debug      # same as plain run, plus a gdb stub on :1234
 ```
 
@@ -105,7 +105,10 @@ interaction in `--check-cli`.
 **Processes and scheduling**
 - Preemptive round-robin over kernel threads, driven by the PIT at 100 Hz
 - **Per-process address spaces**: a PML4 each, kernel's upper half shared. Two
-  programs can be — and `hello` and `ksh` are — linked at the same address
+  programs can be — and `hello`, `hello2` and `ksh` all are — linked at the
+  same address
+- **`fork` and `exec`**: the child returns from a syscall it never executed,
+  into its own copy of the parent's memory; `exec` replaces the whole image
 - **Per-thread kernel stacks**, so more than one thread can be inside a syscall
 - Real blocking: `wait` parks a thread in `State::Blocked` rather than spinning
 
@@ -128,7 +131,8 @@ interaction in `--check-cli`.
   `munmap`, `clock_gettime` and `debug_print`
 - `ksh` — a shell in ring 3 with line editing, history, arrow keys, a
   recursive-descent parser, and `ls`/`cat`/`cd`/`stat`/`date`/`getpid`
-- `ksh` can launch programs: unknown commands become `spawn` + `wait`
+- `ksh` can launch programs: unknown commands become `spawn` + `wait`, and
+  `cmd &` starts one in the background
 
 **In-kernel console**
 - A fallback shell on the same keyboard, which takes over when `ksh` exits — so
@@ -136,32 +140,37 @@ interaction in `--check-cli`.
 
 ## The syscall surface
 
-44 numbers are defined; **18 do the work** and the other 26 return an error
-saying so. Nothing returns success for work it did not do — that was true of six
-of them until recently, and fixing it is the most recent change.
+44 numbers are defined; **20 do the work** and the other 24 return an error
+saying so. Nothing returns success for work it did not do.
 
-**Working** (all 18 exercised from ring 3, not just by the kernel checking
+**Working** (all 20 exercised from ring 3, not just by the kernel checking
 itself):
 
-`exit` `wait` `getpid` `yield` `spawn` · `mmap` `munmap` · `open` `close` `read`
-`write` `lseek` `stat` `getdents` · `time` `clock_gettime` · `debug_print`
-`debug_dump`
+`exit` `fork` `exec` `wait` `getpid` `yield` `spawn` · `mmap` `munmap` · `open`
+`close` `read` `write` `lseek` `stat` `getdents` · `time` `clock_gettime` ·
+`debug_print` `debug_dump`
 
 **Refuses with `NotSupported`, honestly:**
 
-`fork` `exec` `kill` `getppid` · `mprotect` `brk` `sbrk` · `fstat` `mkdir`
-`rmdir` `unlink` · all 5 IPC calls · all 4 driver calls · all 4 capability
-calls · `uname` `sysinfo`
+`kill` `getppid` · `mprotect` `brk` `sbrk` · `fstat` `mkdir` `rmdir` `unlink` ·
+all 5 IPC calls · all 4 driver calls · all 4 capability calls · `uname`
+`sysinfo`
 
 ## What does not work
 
 Being explicit about this, because the earlier version of this file claimed most
 of it.
 
-- **No `fork`.** Every process starts from an ELF. Duplicating a running address
-  space needs copy-on-write and a `#PF` handler that does the copying.
+- **`fork` copies eagerly.** Every owned page is duplicated immediately rather
+  than shared copy-on-write. That is correct `fork` semantics at the cost of one
+  memcpy per page — forking `ksh` copies about 400 KiB — and it is deliberate:
+  copy-on-write needs a per-frame reference count, and getting that wrong
+  produces double frees that surface somewhere unrelated, much later.
 - **No demand paging.** Every page of a program is populated at load time, so
-  `ksh`'s 256 KiB `.bss` costs 65 frames whether it is touched or not.
+  `ksh`'s 256 KiB `.bss` costs 65 frames whether it is touched or not — and a
+  `fork` copies all 65.
+- **No `argv`.** `exec` takes a program name and nothing else; passing arguments
+  needs somewhere to put the strings in the new address space.
 - **The filesystem is read-only.** `ksh` refuses redirection rather than
   pretending; there is no `mkdir`, `unlink` or write path.
 - **No IPC from userspace.** `kernel/src/ipc/` is ~85 KB of real queueing and
@@ -216,6 +225,7 @@ kernel/src/
   platform/rtc.rs  CMOS real-time clock
 userspace/
   hello/           static ELF that proves the loader and the newer syscalls
+  hello2/          what hello execs into — a different image at the same address
   shell/           ksh
 docs/BOOT.md       how all of the above actually works
 scripts/run.sh     build, ISO, disk image, boot, and the two CI gates
@@ -236,7 +246,9 @@ Roughly in order, each unblocking the next:
 - [x] ATA + read-only FAT32
 - [x] A shell in userspace that can launch programs
 - [x] Per-process address spaces
-- [ ] `fork` with copy-on-write, and demand paging
+- [x] `fork` and `exec`
+- [ ] Copy-on-write and demand paging, so a `fork` costs a page table rather
+      than a program
 - [ ] One process-id namespace, so the IPC and capability machinery becomes
       reachable from ring 3
 - [ ] Move the disk and filesystem out of the kernel — the point of the whole

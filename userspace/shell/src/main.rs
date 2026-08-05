@@ -265,9 +265,10 @@ fn cmd_help() {
     println("runs it on its own task, and this shell blocks until it exits.");
     println("Try 'hello'.");
     println("");
-    println("Pipes, redirection and background jobs parse but do not run:");
-    println("they need per-process address spaces, which the kernel does not");
-    println("have yet — spawn puts a second program in the same one.");
+    println("  cmd &                 start cmd without waiting for it");
+    println("");
+    println("Pipes and redirection parse but do not run: pipes need per-process");
+    println("descriptor tables, redirection needs a writable filesystem.");
 }
 
 fn cmd_ls(cwd: &str, args: &[String]) {
@@ -463,18 +464,48 @@ fn cmd_parsetest(parser: &AdvancedParser) {
 /// option; accepting the syntax and ignoring it is not.
 fn report_unsupported(parsed: &ParsedCommand) -> bool {
     if parsed.pipe_to.is_some() {
-        println("ksh: pipes need fork and exec, which the kernel does not have yet");
+        println("ksh: pipes need a way to connect two programs, which needs");
+        println("     per-process descriptor tables — the table is global today");
         return true;
     }
     if parsed.output_redirect.is_some() || parsed.input_redirect.is_some() {
         println("ksh: redirection needs a writable filesystem, which does not exist yet");
         return true;
     }
-    if parsed.background {
-        println("ksh: background jobs need fork, which the kernel does not have yet");
-        return true;
-    }
     false
+}
+
+/// Start a program without waiting for it.
+///
+/// `cmd &` used to be refused with "background jobs need fork". They do not,
+/// quite: what they need is a way to start a program and *not* block, which
+/// `spawn` has always given. The refusal outlived its reason.
+///
+/// No job control — no `jobs`, no `fg`, no notification when it finishes. The
+/// task id is printed so `wait` is at least possible by hand, and so a
+/// background job that dies is not silently gone.
+fn cmd_background(name: &str) {
+    let task = sys::spawn(name);
+
+    if task == sys::ENOENT {
+        print("ksh: ");
+        print(name);
+        println(": command not found");
+        return;
+    }
+    if task < 0 {
+        print("ksh: ");
+        print(name);
+        print(": could not start (error ");
+        print_i64(task);
+        println(")");
+        return;
+    }
+
+    print("[");
+    print_i64(task);
+    print("] ");
+    println(name);
 }
 
 /// The wall clock, from the kernel's RTC.
@@ -679,7 +710,13 @@ pub extern "C" fn ksh_main() -> ! {
             // Not a builtin: ask the kernel to run a program by that name. This
             // is the one thing a shell exists for, and until `spawn` landed it
             // was the one thing this shell could not do.
-            other => cmd_run(other),
+            other => {
+                if parsed.background {
+                    cmd_background(other)
+                } else {
+                    cmd_run(other)
+                }
+            }
         }
     }
 }

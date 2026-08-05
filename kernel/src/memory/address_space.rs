@@ -85,6 +85,38 @@ impl AddressSpace {
         self.pml4_phys
     }
 
+    /// A copy of this address space: same contents at the same addresses, in
+    /// different frames.
+    ///
+    /// ## Eager, not copy-on-write
+    ///
+    /// Every owned page is duplicated immediately. The textbook implementation
+    /// marks both copies read-only, shares the frames, and copies one page at a
+    /// time in the page-fault handler — which is faster, and is what makes
+    /// `fork` cheap enough to be followed immediately by `exec`.
+    ///
+    /// It is not done here, deliberately. Copy-on-write needs a per-frame
+    /// reference count, and getting that wrong produces double frees and
+    /// use-after-free of page tables: memory corruption that shows up somewhere
+    /// unrelated, much later. An eager copy is *correct* `fork` semantics — a
+    /// child that sees the parent's memory as it was and diverges from there —
+    /// at a cost of one memcpy per page. Forking `ksh` copies about 400 KiB.
+    ///
+    /// The cost is real and worth stating: without `exec` following, a fork is
+    /// pure waste, and with demand paging a program's untouched `.bss` would not
+    /// need copying at all. Both are the next piece of work.
+    ///
+    /// ## Shared versus copied
+    ///
+    /// A leaf without [`OWNED_BY_ADDRESS_SPACE`] is a frame this space borrowed
+    /// — the built-in ring-3 payload lives in the kernel image — and is mapped
+    /// into the child *by reference*, exactly as it is here. Copying it would
+    /// hand the child a private duplicate of the kernel's own `.user` section,
+    /// and freeing that duplicate would be freeing a kernel frame.
+    pub fn fork(&self) -> Result<(Self, usize), &'static str> {
+        fork_from(self.pml4_phys)
+    }
+
     /// Load this space into CR3.
     ///
     /// # Safety
@@ -158,6 +190,95 @@ unsafe fn free_level(table_phys: u64, level: u8) -> usize {
     // The table itself.
     deallocate_frame(PageFrame::from_address(table_phys as usize));
     freed + 1
+}
+
+/// [`AddressSpace::fork`], over a bare PML4 address.
+///
+/// The caller has the parent's PML4 but not an owning handle to it — the handle
+/// lives in the thread table behind a lock, and holding that lock across a
+/// memcpy per page would block the timer interrupt for the whole copy.
+pub fn fork_from(parent_pml4: u64) -> Result<(AddressSpace, usize), &'static str> {
+    let child = AddressSpace::new_user()?;
+    let mut copied = 0;
+
+    unsafe {
+        let parent = &*((PHYSMAP_BASE + parent_pml4) as *const PageTable);
+        let target = &mut *((PHYSMAP_BASE + child.pml4_phys) as *mut PageTable);
+
+        for i in 0..KERNEL_PML4_FIRST {
+            if parent[i].is_unused() {
+                continue;
+            }
+            match clone_level(parent[i].addr().as_u64(), parent[i].flags(), 3) {
+                Ok((frame, n)) => {
+                    target[i].set_addr(PhysAddr::new(frame), parent[i].flags());
+                    copied += n;
+                }
+                Err(e) => {
+                    // Partial copy: hand the whole thing back rather than
+                    // leaving the caller with half an address space.
+                    child.free();
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    Ok((child, copied))
+}
+
+/// Duplicate one level of page tables, allocating a new table and recursing.
+///
+/// Returns the new table's frame and how many *data* pages were copied under it.
+unsafe fn clone_level(
+    table_phys: u64,
+    _flags: PageTableFlags,
+    level: u8,
+) -> Result<(u64, usize), &'static str> {
+    let new_frame = allocate_frame().ok_or("out of memory forking page tables")?;
+    let new_phys = new_frame.address() as u64;
+
+    let source = &*((PHYSMAP_BASE + table_phys) as *const PageTable);
+    let target = &mut *((PHYSMAP_BASE + new_phys) as *mut PageTable);
+    target.zero();
+
+    let mut copied = 0;
+
+    for i in 0..512 {
+        if source[i].is_unused() {
+            continue;
+        }
+
+        let flags = source[i].flags();
+        let addr = source[i].addr().as_u64();
+
+        if level == 1 || flags.contains(PageTableFlags::HUGE_PAGE) {
+            if flags.contains(OWNED_BY_ADDRESS_SPACE) {
+                // A page this process owns: give the child its own copy.
+                let copy = match allocate_frame() {
+                    Some(f) => f.address() as u64,
+                    None => return Err("out of memory forking a page"),
+                };
+                core::ptr::copy_nonoverlapping(
+                    (PHYSMAP_BASE + addr) as *const u8,
+                    (PHYSMAP_BASE + copy) as *mut u8,
+                    crate::memory::PAGE_SIZE,
+                );
+                target[i].set_addr(PhysAddr::new(copy), flags);
+                copied += 1;
+            } else {
+                // Borrowed. Share it, and leave it untagged in the child too, so
+                // neither teardown tries to free it.
+                target[i].set_addr(PhysAddr::new(addr), flags);
+            }
+        } else {
+            let (child_table, n) = clone_level(addr, flags, level - 1)?;
+            target[i].set_addr(PhysAddr::new(child_table), flags);
+            copied += n;
+        }
+    }
+
+    Ok((new_phys, copied))
 }
 
 /// Check that every address space still agrees with the kernel about the upper

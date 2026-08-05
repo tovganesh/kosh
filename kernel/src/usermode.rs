@@ -418,6 +418,71 @@ pub fn spawn_program(name: &str) -> Result<usize, SpawnError> {
     }
 }
 
+/// Build an address space with the named boot module loaded, ready to enter.
+///
+/// The `exec` half of the loader path: same work `spawn_program` does, without
+/// creating a thread, because `exec` reuses the caller's.
+pub fn prepare_named_program(
+    name: &str,
+) -> Result<(AddressSpace, u64), crate::syscall::SyscallError> {
+    use crate::syscall::SyscallError;
+
+    let module = boot_module_named(name).ok_or(SyscallError::NotFound)?;
+    let image = unsafe { module.bytes() };
+
+    prepare_program(image).map_err(|e| match e {
+        SpawnError::NotFound => SyscallError::NotFound,
+        SpawnError::Space(_) | SpawnError::Map(_) => SyscallError::OutOfMemory,
+        SpawnError::Load(_) => SyscallError::InvalidArgument,
+        _ => SyscallError::ResourceExhausted,
+    })
+}
+
+/// Record a forked child in the program table, inheriting its parent's name.
+///
+/// Not a new program — a second thread running the same one — so it gets the
+/// parent's name with a marker, which is what makes a `fork` visible in the log
+/// without pretending a new image was loaded.
+pub fn register_forked(child: usize, parent: usize) {
+    let mut table = PROGRAMS.lock();
+
+    let parent_name = table
+        .iter()
+        .flatten()
+        .find(|p| p.thread == parent)
+        .map(|p| p.name)
+        .unwrap_or_else(|| name_bytes("forked"));
+
+    let Some(slot) = table.iter().position(|s| s.is_none()) else {
+        serial_println!("  (no program slot for the fork of thread {})", parent);
+        return;
+    };
+
+    table[slot] = Some(Program {
+        thread: child,
+        name: parent_name,
+        entry: 0,
+        stack_top: 0,
+        space: None,
+    });
+}
+
+/// Point a thread's program entry at a different name, after `exec`.
+pub fn rename_program(thread: usize, name: &str) {
+    let mut table = PROGRAMS.lock();
+    if let Some(p) = table.iter_mut().flatten().find(|p| p.thread == thread) {
+        p.name = name_bytes(name);
+    } else if let Some(slot) = table.iter().position(|s| s.is_none()) {
+        table[slot] = Some(Program {
+            thread,
+            name: name_bytes(name),
+            entry: 0,
+            stack_top: 0,
+            space: None,
+        });
+    }
+}
+
 /// Entry point of a spawned thread: take the address space, switch to it, and
 /// drop to ring 3.
 fn enter_spawned(slot: usize) {
@@ -654,6 +719,15 @@ fn run_module(name: &str) {
 /// carry ring-3 code and data descriptors.
 unsafe fn enter_ring3(entry: u64, stack_top: u64) -> ! {
     enter_ring3_with_arg(entry, stack_top, 0)
+}
+
+/// [`enter_ring3`], for `exec`, which lives in another module.
+///
+/// # Safety
+/// As [`enter_ring3`]: the address space holding `entry` and `stack_top` must
+/// already be in CR3.
+pub unsafe fn enter_ring3_at(entry: u64, stack_top: u64) -> ! {
+    enter_ring3(entry, stack_top)
 }
 
 /// As [`enter_ring3`], but with `arg` in RDI at entry.

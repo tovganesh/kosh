@@ -69,7 +69,7 @@ echo "==> building userspace programs"
 # libc, and anything that moves a String around needs them.
 USER_STD=(-Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem)
 
-for pkg in kosh-hello kosh-shell; do
+for pkg in kosh-hello kosh-hello2 kosh-shell; do
     USER_FLAGS=(--package "$pkg" --target "$TARGET_JSON" "${USER_STD[@]}")
     [ "$PROFILE" = "release" ] && USER_FLAGS+=(--release)
     cargo build "${USER_FLAGS[@]}" -Z json-target-spec 2>/dev/null \
@@ -77,8 +77,9 @@ for pkg in kosh-hello kosh-shell; do
 done
 
 HELLO="$ROOT/target/$TARGET_NAME/$PROFILE/kosh-hello"
+HELLO2="$ROOT/target/$TARGET_NAME/$PROFILE/kosh-hello2"
 KSH="$ROOT/target/$TARGET_NAME/$PROFILE/ksh"
-for bin in "$HELLO" "$KSH"; do
+for bin in "$HELLO" "$HELLO2" "$KSH"; do
     [ -f "$bin" ] || { echo "error: userspace binary not found at $bin" >&2; exit 1; }
     echo "==> $(basename "$bin"): entry $(readelf -h "$bin" | awk '/Entry point/ {print $4}')"
 done
@@ -102,6 +103,7 @@ rm -rf "$ISO_DIR"
 mkdir -p "$ISO_DIR/boot/grub"
 cp "$KERNEL" "$ISO_DIR/boot/kosh-kernel"
 cp "$HELLO" "$ISO_DIR/boot/hello"
+cp "$HELLO2" "$ISO_DIR/boot/hello2"
 cp "$KSH"   "$ISO_DIR/boot/ksh"
 
 cat > "$ISO_DIR/boot/grub/grub.cfg" <<'EOF'
@@ -120,6 +122,7 @@ set default=0
 menuentry "Kosh" {
     multiboot2 /boot/kosh-kernel
     module2 /boot/hello hello
+    module2 /boot/hello2 hello2
     module2 /boot/ksh ksh
     boot
 }
@@ -255,6 +258,11 @@ check)
         "munmap returned the pages" \
         "CLOCK_MONOTONIC moves forwards" \
         "debug_print echoed my message" \
+        "child: my copy of the witness is mine" \
+        "hello2 here: exec replaced the whole image" \
+        "hello2: my .bss is mine and it is zero" \
+        "parent: the child did not touch my memory" \
+        "and exited 7" \
         "seconds since the epoch" \
         "ELF loader: PASS" \
         "Storage: PASS" \
@@ -363,6 +371,9 @@ check-cli)
         type_line "getpid"
         type_line "exit"
         type_line "getpid"
+        # `cmd &` was refused as "needs fork" for three phases; what it actually
+        # needed was to start a program and not block, which spawn already did.
+        type_line "hello2 &"
         # The shell must refuse redirection rather than silently dropping it.
         type_line "echo a > out.txt"
         # QEMU's sendkey cannot produce a '|' through this keyboard layout, so
@@ -415,6 +426,7 @@ check-cli)
         "pipe yes" \
         "redirect out" \
         "background" \
+        "hello2 here: exec replaced the whole image" \
         "ksh: exiting" \
         "ksh exited with code 0, falling back to the kernel console" \
         "Kosh console" \

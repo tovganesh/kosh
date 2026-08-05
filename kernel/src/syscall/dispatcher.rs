@@ -194,23 +194,19 @@ fn sys_exit(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
     Ok(0)
 }
 
-/// Not implemented, and now says so.
+/// Never reached.
 ///
-/// This used to add a row to the process table, log "Fork successful", and
-/// return the new PID — without duplicating an address space, copying a stack,
-/// or creating anything that could run. Userspace saw a positive return value,
-/// concluded it was the parent, and carried on; the "child" never existed. A
-/// syscall that reports success for work it did not do is worse than one that
-/// refuses, because the caller has no way to find out.
-///
-/// Honest `fork` needs per-process page tables, which needs the kernel out of
-/// the low identity mapping first. Until then, `Err`.
+/// `fork` needs the caller's whole register frame, not just its arguments, so
+/// `kosh_syscall_handler` intercepts it before the dispatcher and calls
+/// `syscall::fork::sys_fork` directly. This entry exists so the dispatch table
+/// stays exhaustive, and returns an error that would be a real bug if anyone
+/// ever saw it.
 fn sys_fork(process_id: ProcessId, _args: [u64; 6]) -> SyscallResult {
     serial_println!(
-        "Process {} called fork, which needs per-process address spaces (not implemented)",
+        "BUG: fork reached the dispatcher for process {} — the entry stub should have taken it",
         process_id.0
     );
-    Err(SyscallError::NotSupported)
+    Err(SyscallError::InternalError)
 }
 
 /// Give up the rest of the current time slice.
@@ -227,20 +223,20 @@ fn sys_yield(_process_id: ProcessId, _args: [u64; 6]) -> SyscallResult {
     Ok(0)
 }
 
-fn sys_exec(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
-    let path_ptr = args[0];
-    let argv_ptr = args[1];
-    let envp_ptr = args[2];
-    
-    serial_println!("Process {} attempting to exec program at 0x{:x}", process_id.0, path_ptr);
-    
-    // TODO: Implement program execution
-    // This would involve:
-    // 1. Loading the new program from filesystem
-    // 2. Setting up new memory space
-    // 3. Parsing arguments and environment
-    // 4. Starting execution at program entry point
-    
+/// `exec(path, path_len)` — replaces the calling program, never returns.
+///
+/// The implementation is in `syscall::fork`, next to `fork`, because the two are
+/// halves of one mechanism and share the address-space plumbing.
+///
+/// This used to be a `serial_println!` and `Err(NotSupported)` under a four-line
+/// TODO listing what a real implementation would involve.
+#[cfg(target_arch = "x86_64")]
+fn sys_exec(_process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
+    crate::syscall::fork::sys_exec(args)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn sys_exec(_process_id: ProcessId, _args: [u64; 6]) -> SyscallResult {
     Err(SyscallError::NotSupported)
 }
 

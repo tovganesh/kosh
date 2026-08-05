@@ -1268,6 +1268,137 @@ It writes to the first and last word of the mapping and reads both back, so a
 mapping that is present but wrong fails rather than passing. `ksh` gained `date`,
 which is the RTC end to end: RTC → `sys_time` → ring 3 → civil date.
 
+## fork and exec (Phase 14)
+
+Every process so far started from an ELF, via `spawn`. `fork` produces a process
+from a *running* one, which is a different problem: the child has to appear in
+ring 3 at the parent's next instruction, with the parent's registers and its own
+copy of the parent's memory, without ever having executed the `syscall`
+instruction that created it.
+
+```
+Thread 1 forking: 20 page(s) copied into PML4 0x5c5000
+  forked thread 2 (kernel stack 0xffff90000005cdd0, resumes in ring 3 at 0x800f5c)
+  child: my copy of the witness is mine
+Thread 2 exec 'hello2':
+  old image released: 26 frame(s)
+  entering 'hello2' at 0x800000
+  hello2 here: exec replaced the whole image
+  parent: the child did not touch my memory
+  child exec'd and exited 7
+```
+
+### The control-flow half
+
+`0x800f5c` above is the instruction after the parent's `syscall`. The child gets
+there entirely through the layout of its kernel stack, written by
+`task::spawn_forked`. From the top down:
+
+```text
+  top-8    frame.user_rsp        a copy of the parent's SyscallFrame,
+  ...        ...                 highest field first
+  top-80   frame.rax  = 0
+  top-88   return address = kosh_syscall_return
+  top-96   rbp                   the switch frame kosh_switch_context pops
+  ...        ...
+  top-144  rflags
+```
+
+`kosh_switch_context` pops the seven-word switch frame and `ret`s, which leaves
+RSP at `top-80` — exactly the base of the `SyscallFrame` — with RIP at
+`kosh_syscall_return`. That is the tail of the syscall stub, newly given a label:
+it pops the frame and `sysretq`s. The child runs no kernel code written for it.
+
+`rax = 0` is the entire fork convention. The parent's `sys_fork` returns the
+child's id; the child's frame carries a zero.
+
+The parent's user RSP is reused unchanged, which is correct *only* because the
+child has its own address space: the same number names the child's own copy of
+that stack. Under the shared lower half of two phases ago, both would have been
+using one stack.
+
+### The memory half
+
+`AddressSpace::fork` copies the parent's lower half — same contents at the same
+addresses, in different frames. Leaves without `OWNED_BY_ADDRESS_SPACE` are
+frames the parent borrowed (the built-in payload lives in the kernel image) and
+are mapped into the child by reference; copying one would give the child a
+private duplicate of the kernel's `.user` section.
+
+**Eager, not copy-on-write, deliberately.** The textbook implementation marks
+both copies read-only, shares the frames, and copies one page at a time in the
+page-fault handler. That needs a per-frame reference count, and a reference count
+that is wrong produces double frees and use-after-free of page tables — memory
+corruption that surfaces somewhere unrelated, much later. An eager copy is
+*correct* fork semantics at a cost of one memcpy per page; forking `ksh` copies
+about 400 KiB. The cost is real and worth stating plainly: without an `exec`
+following, a fork is pure waste, and with demand paging an untouched `.bss` would
+not need copying at all. Both are the next piece of work.
+
+### exec
+
+A fresh address space with the new image, swapped in, and the old one freed —
+in that order, because freeing first hands the page tables the CPU is walking to
+the allocator.
+
+The new space is built *completely* before anything is disturbed. An `exec` that
+fails half-way has destroyed the only thing it could return to, so a load failure
+has to leave the caller running its current program.
+
+`exec` does not need the caller's register frame; there is nothing to return to.
+The syscall frame on the kernel stack is simply abandoned when `enter_ring3`
+takes over.
+
+### Where fork had to be intercepted
+
+`dispatch_syscall` takes `(pid, number, args)` — arguments, not registers. `fork`
+is the one syscall that needs the whole frame, so `kosh_syscall_handler` handles
+it before dispatching rather than threading a `&mut SyscallFrame` through a
+signature every other handler would ignore. The dispatcher's `sys_fork` still
+exists, and logs `BUG:` if it is ever reached.
+
+### Proving it
+
+`hello` writes a witness value, forks, and both sides write a different one. If
+the address spaces were shared, the child's write would be visible to the parent.
+`hello2` is a separate program linked at the same address as `hello` and `ksh`,
+so the only evidence `exec` worked is that something else is running there.
+
+Making `fork_from` share the lower half instead of copying it — one line — is
+more instructive than expected:
+
+```
+Thread 1 forking: 0 page(s) copied into PML4 0x5c4000
+  child: my copy of the witness is mine
+Thread 2 exec 'hello2':
+  old image released: 26 frame(s)
+...
+Process 1 syscall wait failed: InvalidArgument
+
+==================== PAGE FAULT ====================
+  accessed address : 0x0000000000800f84
+  cause            : page not present while fetching an instruction in user mode
+```
+
+The child's `exec` freed the *parent's* pages, because they were the same pages,
+and the parent then faulted fetching its own `.text`. Five markers fail.
+
+### One refusal that had outlived its reason
+
+`ksh` refused `cmd &` with "background jobs need fork". They do not, quite: what
+a background job needs is a way to start a program and *not* block, which `spawn`
+has provided since Phase 10. The refusal was written when it was true and never
+revisited.
+
+```
+ksh:/$ hello2 &
+[3] hello2
+ksh:/$   hello2 here: exec replaced the whole image
+```
+
+No job control — no `jobs`, no `fg`, no notification on exit. The task id is
+printed so a `wait` is at least possible by hand.
+
 ## What is deliberately still missing
 - **The filesystem is read-only.** Allocating clusters and keeping both FAT
   copies consistent is a separate problem, and a read-only filesystem that is
