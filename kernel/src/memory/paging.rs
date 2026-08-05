@@ -164,6 +164,174 @@ pub const OWNED_BY_ADDRESS_SPACE: PageTableFlags = PageTableFlags::BIT_9;
 /// writable copy.
 pub const COPY_ON_WRITE: PageTableFlags = PageTableFlags::BIT_10;
 
+/// Marks a page that has been *reserved* but never allocated.
+///
+/// The entry is **not present**, so any access faults; the rest of the entry
+/// carries the flags the page should have once it exists. `resolve_demand`
+/// allocates a zeroed frame on first touch.
+///
+/// This is what makes a program's `.bss`, its stack and an anonymous `mmap`
+/// cost nothing until they are used. `ksh` declares a 256 KiB heap in `.bss`;
+/// before this, all 65 frames were allocated and zeroed at load time whether the
+/// program touched them or not.
+///
+/// A non-present entry's other bits are ignored by the CPU, which is what makes
+/// it usable as somewhere to keep the intended permissions.
+pub const DEMAND_ZERO: PageTableFlags = PageTableFlags::BIT_11;
+
+/// Walk to a leaf entry, creating the intermediate tables if asked.
+///
+/// The `x86_64` crate's mapper deals in *mappings*; a reservation is not a
+/// mapping, so the table walk has to be done by hand. Returns `None` if a level
+/// is missing and `create` is false.
+///
+/// # Safety
+/// `pml4_phys` must be a live PML4 and the caller must not hold another
+/// reference into the same tables.
+unsafe fn leaf_entry(
+    pml4_phys: u64,
+    virt: u64,
+    create: bool,
+) -> Option<&'static mut x86_64::structures::paging::page_table::PageTableEntry> {
+    let indices = [
+        ((virt >> 39) & 0x1FF) as usize,
+        ((virt >> 30) & 0x1FF) as usize,
+        ((virt >> 21) & 0x1FF) as usize,
+        ((virt >> 12) & 0x1FF) as usize,
+    ];
+
+    // Intermediate entries are permissive; the leaf's own flags decide access.
+    // The same reasoning as `map_user_range_in`: the CPU takes the *most*
+    // restrictive of the path, so a supervisor-only parent would make every leaf
+    // under it supervisor-only.
+    let table_flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE;
+
+    let mut table = &mut *((PHYSMAP_BASE + pml4_phys) as *mut PageTable);
+
+    for level in 0..3 {
+        let entry = &mut table[indices[level]];
+
+        if entry.is_unused() {
+            if !create {
+                return None;
+            }
+            let frame = allocate_frame()?;
+            let phys = frame.address() as u64;
+            core::ptr::write_bytes((PHYSMAP_BASE + phys) as *mut u8, 0, PAGE_SIZE);
+            entry.set_addr(PhysAddr::new(phys), table_flags);
+        } else if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            // A huge page where a table was expected. Nothing in the lower half
+            // creates one, but walking into it as if it were a table would
+            // reinterpret 2 MiB of somebody's data as page table entries.
+            return None;
+        }
+
+        let next = entry.addr().as_u64();
+        table = &mut *((PHYSMAP_BASE + next) as *mut PageTable);
+    }
+
+    Some(&mut table[indices[3]])
+}
+
+/// Reserve `pages` at `virt` without allocating a single frame.
+///
+/// The counterpart to [`map_user_pages_in`]: same result from the program's
+/// point of view, at the cost of one page fault per page actually used instead
+/// of one allocation per page declared.
+pub fn reserve_user_pages_in(
+    pml4_phys: u64,
+    virt: u64,
+    pages: usize,
+    flags: PageTableFlags,
+) -> Result<(), &'static str> {
+    // Not present, so the CPU faults; OWNED so teardown knows the frame belongs
+    // to this address space once it exists.
+    let reserved = (flags | DEMAND_ZERO | OWNED_BY_ADDRESS_SPACE) - PageTableFlags::PRESENT;
+
+    for i in 0..pages {
+        let addr = virt + (i * PAGE_SIZE) as u64;
+        let entry = unsafe { leaf_entry(pml4_phys, addr, true) }
+            .ok_or("out of memory reserving user pages")?;
+
+        if !entry.is_unused() {
+            return Err("reserving a page that is already mapped");
+        }
+
+        // Address zero: there is no frame yet, and `resolve_demand` uses the
+        // absent PRESENT bit rather than the address to tell reserved from
+        // mapped.
+        entry.set_addr(PhysAddr::new(0), reserved);
+    }
+
+    Ok(())
+}
+
+/// Does this address have a reservation waiting on it?
+pub fn is_reserved(pml4_phys: u64, virt: u64) -> bool {
+    match unsafe { leaf_entry(pml4_phys, virt, false) } {
+        Some(entry) => entry.flags().contains(DEMAND_ZERO),
+        None => false,
+    }
+}
+
+/// Demand-zero faults serviced since boot, and pages still reserved.
+static DEMAND_FAULTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static PAGES_RESERVED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn demand_stats() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        DEMAND_FAULTS.load(Ordering::Relaxed),
+        PAGES_RESERVED.load(Ordering::Relaxed),
+    )
+}
+
+pub fn note_reserved(pages: usize) {
+    PAGES_RESERVED.fetch_add(pages as u64, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Give a reserved page a real, zeroed frame.
+///
+/// Returns `Ok(true)` if it did something, `Ok(false)` if the address was not
+/// reserved and the fault is real.
+pub fn resolve_demand(virt: u64) -> Result<bool, &'static str> {
+    use x86_64::instructions::tlb;
+
+    let pml4 = Cr3::read().0.start_address().as_u64();
+
+    let entry = match unsafe { leaf_entry(pml4, virt, false) } {
+        Some(e) => e,
+        None => return Ok(false),
+    };
+
+    let flags = entry.flags();
+    if flags.contains(PageTableFlags::PRESENT) || !flags.contains(DEMAND_ZERO) {
+        return Ok(false);
+    }
+
+    let frame = allocate_frame().ok_or("out of memory servicing a demand-zero fault")?;
+    let phys = frame.address() as u64;
+
+    unsafe {
+        // Zero before it is reachable from ring 3. Handing a process a page of
+        // somebody else's data is the classic information leak, and a reserved
+        // page is *promised* to read as zero.
+        core::ptr::write_bytes((PHYSMAP_BASE + phys) as *mut u8, 0, PAGE_SIZE);
+    }
+
+    entry.set_addr(
+        PhysAddr::new(phys),
+        (flags | PageTableFlags::PRESENT) - DEMAND_ZERO,
+    );
+
+    tlb::flush(VirtAddr::new(virt));
+    DEMAND_FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+    Ok(true)
+}
+
 /// Give the current address space a private, writable copy of a shared page.
 ///
 /// Returns `Ok(true)` if it did something, `Ok(false)` if the page was not

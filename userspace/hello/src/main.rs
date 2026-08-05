@@ -233,31 +233,93 @@ pub extern "C" fn kosh_main() -> ! {
     // mmap: memory the program was not given at load time. Until this release
     // `mmap` returned the constant 0x40000000 and reported success, so writing
     // to the result faulted.
-    let mapped = mmap(8192, PROT_READ | PROT_WRITE);
+    // A megabyte, of which this touches two pages. Under eager allocation that
+    // is 256 frames for 8 KiB of use; reserved, it is 256 page table entries.
+    const BIG: u64 = 1024 * 1024;
+    let mapped = mmap(BIG, PROT_READ | PROT_WRITE);
     if mapped < 0 {
         print("  WARNING: mmap failed\n");
     } else {
         let p = mapped as u64 as *mut u64;
+
+        // A page near the far end, which nothing has touched. It must read as
+        // zero — a reserved page is *promised* to, and handing over a frame with
+        // somebody else's data in it is the classic information leak.
+        let far = unsafe { p.byte_add((BIG - 4096) as usize) };
+        let far_before = unsafe { core::ptr::read_volatile(far) };
+
         unsafe {
             core::ptr::write_volatile(p, 0x1234_5678_9abc_def0);
-            core::ptr::write_volatile(p.add(1023), 0x0fed_cba9_8765_4321);
+            core::ptr::write_volatile(far, 0x0fed_cba9_8765_4321);
         }
         let ok = unsafe {
             core::ptr::read_volatile(p) == 0x1234_5678_9abc_def0
-                && core::ptr::read_volatile(p.add(1023)) == 0x0fed_cba9_8765_4321
+                && core::ptr::read_volatile(far) == 0x0fed_cba9_8765_4321
         };
-        if ok {
-            print("  mmap gave me 8192 usable bytes at 0x");
+
+        if far_before != 0 {
+            print("  WARNING: an untouched page came back non-zero\n");
+        } else if ok {
+            print("  mmap gave me a usable megabyte at 0x");
             print_hex(mapped as u64);
-            print("\n");
+            print(" (2 pages touched)\n");
         } else {
             print("  WARNING: mmap memory did not hold its contents\n");
         }
 
-        if munmap(mapped as u64, 8192) < 0 {
+        if munmap(mapped as u64, BIG) < 0 {
             print("  WARNING: munmap failed\n");
         } else {
             print("  munmap returned the pages\n");
+        }
+
+        // Recycled memory must not carry the last tenant's data.
+        //
+        // Checking that a *fresh* mapping reads zero proves nothing on a mostly
+        // idle system, where the allocator hands back frames that were never
+        // written. So: dirty a region, give it back, take it again, and look.
+        // Those are the same frames.
+        const SMALL: u64 = 64 * 1024;
+        const PATTERN: u64 = 0xDEAD_BEEF_CAFE_F00D;
+
+        let first = mmap(SMALL, PROT_READ | PROT_WRITE);
+        if first <= 0 {
+            print("  WARNING: second mmap failed with ");
+            print_i64(first);
+            print("\n");
+        } else {
+            let q = first as u64 as *mut u64;
+            let mut page = 0u64;
+            while page < SMALL {
+                unsafe { core::ptr::write_volatile(q.byte_add(page as usize), PATTERN) };
+                page += 4096;
+            }
+            munmap(first as u64, SMALL);
+
+            let second = mmap(SMALL, PROT_READ | PROT_WRITE);
+            if second <= 0 {
+                print("  WARNING: third mmap failed with ");
+                print_i64(second);
+                print("\n");
+            } else {
+                let r = second as u64 as *mut u64;
+                let mut leaked = 0;
+                let mut page = 0u64;
+                while page < SMALL {
+                    if unsafe { core::ptr::read_volatile(r.byte_add(page as usize)) } == PATTERN {
+                        leaked += 1;
+                    }
+                    page += 4096;
+                }
+                if leaked == 0 {
+                    print("  recycled pages came back zeroed\n");
+                } else {
+                    print("  WARNING: ");
+                    print_i64(leaked);
+                    print(" recycled page(s) still held the old contents\n");
+                }
+                munmap(second as u64, SMALL);
+            }
         }
     }
 

@@ -175,9 +175,14 @@ unsafe fn free_level(table_phys: u64, level: u8) -> usize {
         let addr = entry.addr().as_u64();
 
         if level == 1 || flags.contains(PageTableFlags::HUGE_PAGE) {
-            // A leaf. Free the frame only if this space owns it — the built-in
-            // ring-3 payload is mapped straight out of the kernel image.
-            if flags.contains(OWNED_BY_ADDRESS_SPACE) {
+            // A leaf. Free the frame only if this space owns it *and* one exists
+            // — the built-in ring-3 payload is mapped straight out of the kernel
+            // image, and a reservation has no frame at all. Freeing a
+            // reservation would hand physical frame 0 to the allocator, once per
+            // untouched page.
+            if flags.contains(PageTableFlags::PRESENT)
+                && flags.contains(OWNED_BY_ADDRESS_SPACE)
+            {
                 deallocate_frame(PageFrame::from_address(addr as usize));
                 freed += 1;
             }
@@ -269,6 +274,15 @@ unsafe fn clone_level(
         let addr = source[i].addr().as_u64();
 
         if level == 1 || flags.contains(PageTableFlags::HUGE_PAGE) {
+            if !flags.contains(PageTableFlags::PRESENT) {
+                // A reservation: no frame yet, so there is nothing to share and
+                // nothing to count. The child inherits the promise, and whichever
+                // side touches the page first gets its own zeroed frame — which
+                // is exactly the semantics `fork` wants for untouched memory.
+                target[i].set_addr(PhysAddr::new(0), flags);
+                continue;
+            }
+
             if flags.contains(OWNED_BY_ADDRESS_SPACE) {
                 // A page this process owns: share the frame, and make both sides
                 // fault on their next write.

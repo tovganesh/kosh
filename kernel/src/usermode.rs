@@ -352,8 +352,12 @@ fn prepare_program(image: &[u8]) -> Result<(AddressSpace, u64), SpawnError> {
         | PageTableFlags::USER_ACCESSIBLE
         | PageTableFlags::NO_EXECUTE;
 
-    let mapped = paging::map_user_pages_in(
-        unsafe { paging::mapper_for(space.pml4_phys()) },
+    // Reserved, not allocated. A program that uses one page of stack should not
+    // pay for sixteen — and the sixteen exist precisely because `ksh`'s parser
+    // occasionally needs them, not because anything uses them on the way to the
+    // first prompt.
+    let mapped = paging::reserve_user_pages_in(
+        space.pml4_phys(),
         stack_bottom,
         USER_STACK_PAGES_MAX,
         stack_flags,
@@ -363,6 +367,7 @@ fn prepare_program(image: &[u8]) -> Result<(AddressSpace, u64), SpawnError> {
         unsafe { space.free() };
         return Err(SpawnError::Map(e));
     }
+    paging::note_reserved(USER_STACK_PAGES_MAX);
 
     serial_println!(
         "  loaded {} segment(s), {} bytes, entry 0x{:x}, stack 0x{:x}..0x{:x}",

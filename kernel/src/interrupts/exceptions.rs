@@ -164,6 +164,26 @@ pub extern "x86-interrupt" fn page_fault_handler(
         }
     }
 
+    // Demand-zero, likewise before anything is printed. A first touch of a
+    // reserved page — a program's `.bss`, its stack, an anonymous `mmap` — is
+    // the mechanism working, not an error.
+    if !error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
+        && accessed.as_u64() < crate::syscall::uaccess::USER_ADDRESS_LIMIT
+    {
+        match crate::memory::paging::resolve_demand(accessed.as_u64()) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(e) => {
+                serial_println!();
+                serial_println!(
+                    "Demand-zero fault at 0x{:x} could not be serviced: {}",
+                    accessed.as_u64(),
+                    e
+                );
+            }
+        }
+    }
+
     serial_println!();
     serial_println!("==================== PAGE FAULT ====================");
     serial_println!("  accessed address : 0x{:016x}", accessed.as_u64());

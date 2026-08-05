@@ -458,11 +458,20 @@ fn sys_mmap(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
         find_free_region(pages).ok_or(SyscallError::OutOfMemory)?
     };
 
-    crate::memory::paging::map_user_pages(base, pages, page_flags)
-        .map_err(|e| {
+    // Reserved rather than allocated: `mmap` is the syscall most likely to be
+    // asked for more than the caller will touch, and a reservation costs a page
+    // table entry. The pages still read as zero — the fault handler zeroes each
+    // frame before it is reachable — so nothing about the contract changes.
+    let pml4 = crate::memory::paging::kernel_pml4_phys();
+    let target = crate::task::current_address_space_pml4().unwrap_or(pml4);
+
+    crate::memory::paging::reserve_user_pages_in(target, base, pages, page_flags).map_err(
+        |e| {
             serial_println!("Process {} mmap failed: {}", process_id.0, e);
             SyscallError::OutOfMemory
-        })?;
+        },
+    )?;
+    crate::memory::paging::note_reserved(pages);
 
     if syscall_trace_enabled() {
         serial_println!(
@@ -483,11 +492,22 @@ fn sys_mmap(_process_id: ProcessId, _args: [u64; 6]) -> SyscallResult {
     Err(SyscallError::NotSupported)
 }
 
-/// Is every page of this span currently unmapped in the calling process?
+/// Is every page of this span free — neither mapped nor reserved?
+///
+/// `translate` only sees *mappings*, and a reserved page is not one, so asking
+/// it alone would happily hand out an address that already has a promise
+/// attached. `reserve_user_pages_in` would then refuse, but only after the
+/// scan had picked the address.
 #[cfg(target_arch = "x86_64")]
 fn region_free(base: u64, pages: usize) -> bool {
+    let pml4 = match crate::task::current_address_space_pml4() {
+        Some(p) => p,
+        None => return false,
+    };
     (0..pages).all(|i| {
-        crate::memory::paging::translate(base + (i * crate::memory::PAGE_SIZE) as u64).is_none()
+        let addr = base + (i * crate::memory::PAGE_SIZE) as u64;
+        crate::memory::paging::translate(addr).is_none()
+            && !crate::memory::paging::is_reserved(pml4, addr)
     })
 }
 

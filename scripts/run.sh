@@ -254,8 +254,10 @@ check)
         "hello from a loaded ELF binary" \
         ".bss was zeroed correctly" \
         "stack is writable and readable" \
-        "mmap gave me 8192 usable bytes" \
+        "mmap gave me a usable megabyte" \
+        "Demand paging: " \
         "munmap returned the pages" \
+        "recycled pages came back zeroed" \
         "CLOCK_MONOTONIC moves forwards" \
         "debug_print echoed my message" \
         "child: I inherited the value my parent set before forking" \

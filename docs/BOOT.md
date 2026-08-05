@@ -1516,6 +1516,94 @@ Placing the table found two bugs in the same afternoon, both of the same shape �
 Two consecutive `hello` runs from `ksh` — each a fork, an exec, and two
 teardowns — both end at 1613 used pages.
 
+## Demand paging (Phase 16)
+
+Copy-on-write saved the *copy*. This saves the allocation.
+
+```
+  segment: vaddr 0x80d000 filesz 0 memsz 262200 [rw-] -> 0 page(s), 65 reserved
+  mmap gave me a usable megabyte at 0x0000000010000000 (2 pages touched)
+  recycled pages came back zeroed
+Demand paging: 322 page(s) reserved, 38 touched (284 never allocated)
+```
+
+`ksh` declares a 256 KiB heap in `.bss`. Every one of those 65 frames used to be
+allocated and zeroed at load time; now none of them are, and the shell reaches
+its first prompt having touched a handful.
+
+### A page table entry with nothing behind it
+
+A reservation is a **non-present** entry carrying the flags the page should have
+once it exists, plus a `DEMAND_ZERO` marker. Any access faults; the handler
+allocates a zeroed frame, sets `PRESENT`, clears the marker, and the instruction
+retries.
+
+The CPU ignores every bit of a non-present entry except the present bit itself,
+which is what makes the entry usable as somewhere to keep the intended
+permissions until they are needed.
+
+The `x86_64` crate's mapper deals in *mappings*, and a reservation is not one, so
+`leaf_entry` walks the four levels by hand — creating intermediate tables when
+asked, and refusing to walk *into* a huge page, because reinterpreting 2 MiB of
+somebody's data as page table entries is not a failure mode worth having.
+
+### Three places it applies
+
+| | before | after |
+|---|---|---|
+| the ELF `.bss` tail | every page of `p_memsz` allocated and zeroed | only pages holding file bytes; the rest reserved |
+| the user stack | 16 pages per program | 16 reservations |
+| anonymous `mmap` | the whole span | the whole span, reserved |
+
+The stack is the clearest case of the old cost: sixteen pages exist because
+`ksh`'s recursive-descent parser occasionally needs them, not because anything
+uses them on the way to the first prompt.
+
+### What had to learn about absent pages
+
+- **`fork`** copies the reservation rather than sharing a frame — there is no
+  frame. Whichever side touches the page first gets its own zeroed one, which is
+  exactly the semantics `fork` wants for untouched memory.
+- **Teardown** must not free a reservation. `entry.addr()` on one returns zero,
+  so the previous code would have handed physical frame 0 to the allocator once
+  per untouched page.
+- **`uaccess`** materialises before checking. `copy_to_user` writes at the *user*
+  address, so a reserved destination would fault from ring 0 mid-syscall — the
+  same hazard copy-on-write has, with the same fix.
+- **`mmap`'s free-region scan** had to learn that a reservation occupies an
+  address. `translate` only reports mappings, so the scan would happily pick a
+  range that already had a promise attached.
+
+### Proving it, and a test that was not a test
+
+The obvious check — "a fresh `mmap` reads as zero" — proves nothing on a mostly
+idle system, where the allocator hands back frames nothing has ever written. It
+passed with the zeroing deliberately removed.
+
+The version that works recycles: dirty a region with a pattern, `munmap` it,
+`mmap` again — those are the same frames — and look.
+
+```
+  WARNING: 16 recycled page(s) still held the old contents
+```
+
+That is what removing the `write_bytes` produces. All sixteen, every time.
+
+### The same bug, twice, in two files
+
+The second `mmap` in a program failed with `EBADF`, and the first worked.
+
+`validate_mmap_args` checked `args[4]` — the file descriptor — whenever
+`MAP_ANONYMOUS` was absent, using the mask `0x01`. `MAP_ANONYMOUS` is `0x20`, so
+the check ran on every call; `fd` arrives in R8, which a four-argument syscall
+wrapper never sets; and by the second `mmap` R8 happened to hold something above
+1024.
+
+This is the identical bug fixed in `sys_mmap` itself one phase ago, written up
+then as *"a syscall must not read an argument the ABI does not require the caller
+to set"* — and the validator, ten lines away, kept it. Writing the lesson down
+did not find the second instance. Grepping for `args[4]` would have.
+
 ## What is deliberately still missing
 - **The filesystem is read-only.** Allocating clusters and keeping both FAT
   copies consistent is a separate problem, and a read-only filesystem that is
