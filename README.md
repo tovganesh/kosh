@@ -53,19 +53,19 @@ be accurate about what runs and blunt about what doesn't. If something is listed
 under **Works**, there is a marker in `scripts/run.sh` that fails if it stops
 working.
 
-`docs/BOOT.md` is the long version: 1,100 lines on how the boot chain, paging,
-scheduling, ring 3, the filesystem and the address-space work actually function,
-including the bugs found along the way and how each was caught.
+`docs/BOOT.md` is the long version: how the boot chain, paging, scheduling,
+ring 3, the filesystem, the address-space work and the driver interface actually
+function, including the bugs found along the way and how each was caught.
 
 ## Running it
 
-One command builds the kernel, both userspace programs, a GRUB ISO and a FAT32
+One command builds the kernel, the four userspace programs, a GRUB ISO and a FAT32
 test disk, then boots the lot:
 
 ```bash
 ./scripts/run.sh              # boot it, serial on stdio (ctrl-a x to quit)
-./scripts/run.sh --check      # boot headless, assert 52 serial markers (CI)
-./scripts/run.sh --check-cli  # drive the shell through QEMU's monitor, assert 32
+./scripts/run.sh --check      # boot headless, assert 62 serial markers (CI)
+./scripts/run.sh --check-cli  # drive the shell through QEMU's monitor, assert 35
 ./scripts/run.sh --debug      # same as plain run, plus a gdb stub on :1234
 ```
 
@@ -123,13 +123,25 @@ interaction in `--check-cli`.
 - `SYSCALL`/`SYSRET` with a `swapgs`-free per-CPU block reached through `gs:`
 - User-pointer validation that checks range *and* page permissions, tested from
   the user side by a payload that deliberately passes a kernel address
-- A ring-3 fault kills the process and the kernel carries on
+- A ring-3 fault of *any* kind kills the process and the kernel carries on —
+  not just a page fault, which is all it used to be
 - A static ELF64 loader: `PT_LOAD` segments mapped at their `p_vaddr` with
   per-segment permissions and a zeroed `.bss` tail
 
 **Devices and storage**
 - 8259 PIC remap, PIT timer, PS/2 keyboard on IRQ1
 - ATA PIO driver on the legacy IDE ports — IDENTIFY, LBA28 reads
+- **A disk driver in ring 3.** `userspace/ata-driver` reads the same disk from
+  an unprivileged process, using `in` and `out` directly — no syscall per port.
+  Its ports come from the TSS I/O permission bitmap, 9 bits granted to that
+  thread and denied to every other; a process without the grant that touches
+  0x1F7 is killed and the system carries on
+- Devices are named, not addressed: `request_device("ata0")` is checked against a
+  `DeviceAccess` capability, and the kernel decides which ports the name means —
+  so a disk driver cannot ask for the interrupt controller
+- One driver per device at a time: while a ring-3 driver holds `ata0`, the
+  kernel's own block layer refuses that channel, and the claim is released even
+  if the driver crashes
 - Read-only FAT32: BPB validation, cluster-chain walking, long filenames
 - CMOS RTC, so `date` prints the real date
 
@@ -140,6 +152,8 @@ interaction in `--check-cli`.
   recursive-descent parser, and `ls`/`cat`/`cd`/`stat`/`date`/`getpid`
 - `ksh` can launch programs: unknown commands become `spawn` + `wait`, and
   `cmd &` starts one in the background
+- `ata-driver` — the ATA driver as an ordinary ring-3 process, driving a real
+  disk with `in` and `out` and answering block reads over IPC
 
 **Processes and IPC**
 - A process *is* a ring-3 thread with an address space, registered in the
@@ -156,15 +170,16 @@ interaction in `--check-cli`.
 
 ## The syscall surface
 
-44 numbers are defined; **23 do the work** and the other 21 return an error
+46 numbers are defined; **25 do the work** and the other 21 return an error
 saying so. Nothing returns success for work it did not do.
 
-**Working** (all 23 exercised from ring 3, not just by the kernel checking
+**Working** (all 25 exercised from ring 3, not just by the kernel checking
 itself):
 
 `exit` `fork` `exec` `wait` `getpid` `getppid` `yield` `spawn` · `mmap`
 `munmap` · `open` `close` `read` `write` `lseek` `stat` `getdents` · `time`
-`clock_gettime` · `send_message` `receive_message` · `debug_print` `debug_dump`
+`clock_gettime` · `send_message` `receive_message` · `request_device`
+`release_device` · `debug_print` `debug_dump`
 
 **Refuses with `NotSupported`, honestly:**
 
@@ -193,9 +208,17 @@ of it.
   path — a process may message its parent and its children, and nothing else —
   but the four capability syscalls still return `NotSupported`, so a program
   cannot inspect or delegate what it holds.
-- **Not actually a microkernel yet.** The ATA driver, the filesystem and the
-  keyboard driver are all *in* the kernel. That is the opposite of the intended
-  design and is where the IPC work above leads.
+- **Only the disk driver is out of the kernel, and there are two of it.** The
+  filesystem and the keyboard driver are still in-kernel, and `block/ata.rs` is
+  still there too — it stands aside while the ring-3 driver holds the channel
+  rather than being gone. It can be deleted once `fat32` moves out and stops
+  needing it, which is the next piece of work.
+- **Drivers are trusted by boot-module name.** `DRIVER_IMAGES` in `usermode.rs`
+  maps `ata-driver` to `ata0`, so the trust root is "GRUB loaded it from the
+  ISO". A real capability system delegates from `init`; this is a two-entry table
+  standing in for one.
+- **Ring 3 cannot receive interrupts.** The userspace driver polls, exactly as
+  the in-kernel one does. Turning IRQ14 into a message is not implemented.
 - **`userspace/init`, `fs-service`, `driver-manager` do not run.** They are not
   built, not on the ISO, have no linker scripts, and depend on `fork`/`exec`.
 - **`drivers/*` are not drivers.** `storage` and `network` are trait skeletons
@@ -232,13 +255,15 @@ kernel/src/
   task/            preemptive kernel threads and the context switch
   syscall/         SYSCALL entry, dispatcher, user-pointer checks, files
   elf.rs           static ELF64 loader
-  block/ata.rs     ATA PIO driver
+  block/ata.rs     ATA PIO driver (stands aside for the ring-3 one)
   fs/fat32.rs      read-only FAT32
   console/         the in-kernel fallback shell
-  platform/rtc.rs  CMOS real-time clock
+  platform/rtc.rs      CMOS real-time clock
+  platform/devports.rs which ports a named device is, and who holds it
 userspace/
   hello/           static ELF that proves the loader and the newer syscalls
   hello2/          what hello execs into — a different image at the same address
+  ata-driver/      the ATA driver, in ring 3, talking to the disk over IPC
   shell/           ksh
 docs/BOOT.md       how all of the above actually works
 scripts/run.sh     build, ISO, disk image, boot, and the two CI gates
@@ -263,8 +288,9 @@ Roughly in order, each unblocking the next:
 - [x] Copy-on-write, so a `fork` costs a page table rather than a program
 - [x] Demand paging, so an untouched `.bss` costs nothing at all
 - [x] One process-id namespace, so IPC and capabilities became reachable
-- [ ] Move the disk and filesystem out of the kernel — the point of the whole
-      exercise
+- [x] The disk driver out of the kernel, with port permissions to make it possible
+- [ ] The filesystem out of the kernel, so `block/ata.rs` can be deleted
+- [ ] `argv` for `exec`, so a driver can be told what to serve
 - [ ] FAT32 writes
 - [ ] `userspace/init` doing its job
 

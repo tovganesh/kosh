@@ -96,6 +96,8 @@ pub fn dispatch_syscall(
         SYS_DRIVER_UNREGISTER => sys_driver_unregister(process_id, args),
         SYS_DRIVER_REQUEST => sys_driver_request(process_id, args),
         SYS_DRIVER_RESPONSE => sys_driver_response(process_id, args),
+        SYS_REQUEST_DEVICE => sys_request_device(process_id, args),
+        SYS_RELEASE_DEVICE => sys_release_device(process_id, args),
         
         // System information
         SYS_GETDENTS => crate::syscall::files::sys_getdents(args),
@@ -911,6 +913,101 @@ fn sys_driver_response(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
     
     // TODO: Implement driver response
     Err(SyscallError::NotSupported)
+}
+
+/// Longest device name `request_device` will look at.
+const MAX_DEVICE_NAME: usize = 16;
+
+/// Read a device name out of userspace and find it in the table.
+fn device_arg(args: [u64; 6]) -> Result<usize, SyscallError> {
+    let len = args[1] as usize;
+    if len == 0 || len > MAX_DEVICE_NAME {
+        return Err(SyscallError::InvalidArgument);
+    }
+
+    let mut buf = [0u8; MAX_DEVICE_NAME];
+    crate::syscall::uaccess::copy_from_user(args[0], &mut buf[..len])
+        .map_err(|_| SyscallError::InvalidArgument)?;
+
+    let name = core::str::from_utf8(&buf[..len]).map_err(|_| SyscallError::InvalidArgument)?;
+    crate::platform::devports::index_of(name).ok_or(SyscallError::NotFound)
+}
+
+/// `request_device(name_ptr, name_len)` -> 0
+///
+/// Three things have to be true, and each refuses differently:
+///
+/// 1. the name is a device the kernel is willing to hand out at all — the table
+///    in `platform::devports` is the entire list, and it does not contain the
+///    interrupt controller, the timer or the serial port;
+/// 2. the caller holds `DeviceAccess` for it, which is granted at spawn to boot
+///    modules the kernel recognises as drivers;
+/// 3. nobody else is driving it, because two drivers polling one status register
+///    is a corruption bug that only shows up under load.
+///
+/// On success the thread's ports appear in the TSS I/O permission bitmap
+/// immediately, not at the next context switch — the `in` on the line after this
+/// call would otherwise still fault.
+fn sys_request_device(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
+    use crate::ipc::capability::{check_capability, CapabilityType, ResourceId};
+    use crate::platform::devports;
+
+    let index = device_arg(args)?;
+    let device = &devports::DEVICES[index];
+
+    if !check_capability(
+        process_id,
+        CapabilityType::DeviceAccess,
+        &ResourceId::Device(alloc::string::String::from(device.name)),
+    ) {
+        serial_println!(
+            "  process {} asked for '{}' without a DeviceAccess capability — refused",
+            process_id.0,
+            device.name
+        );
+        return Err(SyscallError::PermissionDenied);
+    }
+
+    devports::claim(index, process_id.0 as usize).map_err(|_| SyscallError::Busy)?;
+    crate::task::grant_io_device(index);
+
+    serial_println!(
+        "  process {} now drives '{}' ({}) — ports in ring 3",
+        process_id.0,
+        device.name,
+        device.description
+    );
+
+    // A claim nothing enforces is a comment. Check it here, at the moment the
+    // claim is taken, rather than trusting that `block/ata.rs` consults the
+    // table: `probe` refuses before it touches a single port, so asking is safe
+    // even with a driver mid-command.
+    #[cfg(target_arch = "x86_64")]
+    if device.name == "ata0" {
+        use crate::block::ata::{AtaDisk, Channel, Drive};
+        use crate::block::BlockError;
+        match AtaDisk::probe(Channel::Primary, Drive::Master) {
+            Err(BlockError::ClaimedByUserspace) => {
+                serial_println!("  the kernel's own ATA driver now refuses ata0")
+            }
+            _ => serial_println!("  WARNING: the kernel's ATA driver still drives ata0"),
+        }
+    }
+
+    Ok(0)
+}
+
+/// `release_device(name_ptr, name_len)` -> 0
+///
+/// Only the claim is dropped here, not the bitmap: the ports go away when the
+/// thread exits or is next scheduled with a smaller grant. That asymmetry is on
+/// purpose — a driver handing a disk back should not be able to keep half-issued
+/// commands in flight, so `claim` is what the kernel's own block layer consults.
+fn sys_release_device(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
+    let index = device_arg(args)?;
+    crate::platform::devports::release_all(process_id.0 as usize);
+    let _ = index;
+    Ok(0)
 }
 
 // System information system calls

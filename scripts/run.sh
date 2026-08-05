@@ -69,7 +69,7 @@ echo "==> building userspace programs"
 # libc, and anything that moves a String around needs them.
 USER_STD=(-Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem)
 
-for pkg in kosh-hello kosh-hello2 kosh-shell; do
+for pkg in kosh-hello kosh-hello2 kosh-ata-driver kosh-shell; do
     USER_FLAGS=(--package "$pkg" --target "$TARGET_JSON" "${USER_STD[@]}")
     [ "$PROFILE" = "release" ] && USER_FLAGS+=(--release)
     cargo build "${USER_FLAGS[@]}" -Z json-target-spec 2>/dev/null \
@@ -78,8 +78,9 @@ done
 
 HELLO="$ROOT/target/$TARGET_NAME/$PROFILE/kosh-hello"
 HELLO2="$ROOT/target/$TARGET_NAME/$PROFILE/kosh-hello2"
+ATADRV="$ROOT/target/$TARGET_NAME/$PROFILE/kosh-ata-driver"
 KSH="$ROOT/target/$TARGET_NAME/$PROFILE/ksh"
-for bin in "$HELLO" "$HELLO2" "$KSH"; do
+for bin in "$HELLO" "$HELLO2" "$ATADRV" "$KSH"; do
     [ -f "$bin" ] || { echo "error: userspace binary not found at $bin" >&2; exit 1; }
     echo "==> $(basename "$bin"): entry $(readelf -h "$bin" | awk '/Entry point/ {print $4}')"
 done
@@ -104,6 +105,7 @@ mkdir -p "$ISO_DIR/boot/grub"
 cp "$KERNEL" "$ISO_DIR/boot/kosh-kernel"
 cp "$HELLO" "$ISO_DIR/boot/hello"
 cp "$HELLO2" "$ISO_DIR/boot/hello2"
+cp "$ATADRV" "$ISO_DIR/boot/ata-driver"
 cp "$KSH"   "$ISO_DIR/boot/ksh"
 
 cat > "$ISO_DIR/boot/grub/grub.cfg" <<'EOF'
@@ -123,6 +125,7 @@ menuentry "Kosh" {
     multiboot2 /boot/kosh-kernel
     module2 /boot/hello hello
     module2 /boot/hello2 hello2
+    module2 /boot/ata-driver ata-driver
     module2 /boot/ksh ksh
     boot
 }
@@ -260,6 +263,15 @@ check)
         "recycled pages came back zeroed" \
         "CLOCK_MONOTONIC moves forwards" \
         "debug_print echoed my message" \
+        "I/O bitmap at TSS+" \
+        "ata-driver: got the ata0 ports" \
+        "the kernel's own ATA driver now refuses ata0" \
+        "IDENTIFY succeeded from ring 3" \
+        "a FAT32 boot sector, signature and all" \
+        "a second sector read back different bytes" \
+        "refused a read past the end of the disk" \
+        "driver exited and gave ata0 back" \
+        "killed for touching its ports" \
         "child: I inherited the value my parent set before forking" \
         "child: my copy of the witness is mine" \
         "parent: still writable after the child exited" \
@@ -403,11 +415,17 @@ check-cli)
         type_line "df"
         sleep 1
         echo quit
-    } | timeout 180 qemu-system-x86_64 "${QEMU_ARGS[@]}" \
+    # 240s, not 180: the session now also spawns a disk driver twice and waits
+    # for it to identify a drive and serve four requests each time.
+    } | timeout 240 qemu-system-x86_64 "${QEMU_ARGS[@]}" \
             -serial "file:$SERIAL" -display none -monitor stdio >/dev/null 2>&1 || true
 
     echo "--- console session ---"
-    sed -n '/ksh: the Kosh shell/,$p' "$SERIAL" 2>/dev/null | head -110
+    # `|| true` because `head` closing the pipe sends SIGPIPE to `sed`, and
+    # `set -o pipefail` turns that into a failed script — a failure mode that
+    # only appears once the log grows past the line limit, which is to say on
+    # the day you add output rather than the day you write the line.
+    { sed -n '/ksh: the Kosh shell/,$p' "$SERIAL" 2>/dev/null | head -110; } || true
     echo "-----------------------"
 
     fail=0
@@ -436,6 +454,9 @@ check-cli)
         "background" \
         "hello2 here: exec replaced the whole image" \
         "child: messaging my grandparent was refused" \
+        "the ring-3 driver identified a disk of" \
+        "read LBA 0 in ring 3: a FAT32 boot sector" \
+        "killed for touching its ports" \
         "ksh: exiting" \
         "ksh exited with code 0, falling back to the kernel console" \
         "Kosh console" \

@@ -83,9 +83,39 @@ pub struct AtaDisk {
     name: [u8; 8],
 }
 
+impl Channel {
+    /// The name this channel goes by in `platform::devports`.
+    const fn device_name(self) -> &'static str {
+        match self {
+            Channel::Primary => "ata0",
+            Channel::Secondary => "ata1",
+        }
+    }
+}
+
 impl AtaDisk {
+    /// Refuse if a ring-3 driver is currently driving this channel.
+    ///
+    /// The two drivers share one set of registers and neither can see the
+    /// other's half-issued command: this one writes the LBA registers, the
+    /// user-space one writes its own, and the command that follows reads
+    /// whichever sector the last writer named. It is not a race that fails
+    /// loudly — it silently returns the wrong sector's bytes.
+    ///
+    /// So the claim is checked on every entry point rather than once at probe
+    /// time. A driver can be started and can exit while the system runs, and
+    /// `fat32` holds an `AtaDisk` across all of it.
+    fn check_not_claimed(channel: Channel) -> Result<(), BlockError> {
+        if crate::platform::devports::is_claimed(channel.device_name()) {
+            Err(BlockError::ClaimedByUserspace)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Look for a drive and read its parameters with IDENTIFY.
     pub fn probe(channel: Channel, drive: Drive) -> Result<Self, BlockError> {
+        Self::check_not_claimed(channel)?;
         let io = channel.io_base();
 
         unsafe {
@@ -272,6 +302,7 @@ impl BlockDevice for AtaDisk {
     }
 
     fn read_blocks(&self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+        Self::check_not_claimed(self.channel)?;
         if buf.len() % BLOCK_SIZE != 0 {
             return Err(BlockError::BadBufferSize);
         }
@@ -302,6 +333,7 @@ impl BlockDevice for AtaDisk {
     }
 
     fn write_blocks(&self, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+        Self::check_not_claimed(self.channel)?;
         if buf.len() % BLOCK_SIZE != 0 {
             return Err(BlockError::BadBufferSize);
         }

@@ -115,6 +115,15 @@ pub struct Thread {
     /// Another thread is in `wait_for` on this one, so `reap_finished` must
     /// leave the slot alone until that waiter has collected the exit code.
     awaited: bool,
+    /// Which I/O devices this thread may drive from ring 3.
+    ///
+    /// A bitmask of `platform::devports::DEVICES` indices, installed into the
+    /// TSS I/O permission bitmap on every switch to this thread. Zero — no
+    /// ports — for everything but a driver, and zero is what a `fork`ed child
+    /// gets too: hardware is not inherited, because two processes polling the
+    /// same status register is exactly the failure the claim table exists to
+    /// prevent.
+    io_grant: u32,
 }
 
 impl Thread {
@@ -214,6 +223,7 @@ pub fn init() {
             address_space: None,
             exit_code: 0,
             awaited: false,
+            io_grant: crate::platform::devports::NO_GRANT,
         });
         sched.current = 0;
     });
@@ -253,6 +263,7 @@ pub fn spawn(name: &'static str, entry: fn(usize), arg: usize) -> Result<usize, 
             address_space: None,
             exit_code: 0,
             awaited: false,
+            io_grant: crate::platform::devports::NO_GRANT,
         });
 
         serial_println!(
@@ -366,6 +377,7 @@ pub fn spawn_forked(
             address_space: Some(space),
             exit_code: 0,
             awaited: false,
+            io_grant: crate::platform::devports::NO_GRANT,
         });
 
         serial_println!(
@@ -490,21 +502,27 @@ pub fn schedule() {
                         .as_ref()
                         .map(|a| a.pml4_phys())
                         .unwrap_or_else(crate::memory::paging::kernel_pml4_phys);
+                    let next_io = sched.threads[next].as_ref().unwrap().io_grant;
                     let prev_rsp = sched.threads[current].as_mut().unwrap().rsp_ptr();
 
-                    Some((prev_rsp, next_rsp, next, next_top, next_cr3))
+                    Some((prev_rsp, next_rsp, next, next_top, next_cr3, next_io))
                 }
             }
         }
         // lock dropped here, before the switch
     };
 
-    if let Some((prev_rsp, next_rsp, next, next_top, next_cr3)) = plan {
+    if let Some((prev_rsp, next_rsp, next, next_top, next_cr3, next_io)) = plan {
         // Before the switch, not after: the incoming thread may resume straight
         // into `sysretq` and be in ring 3 — able to fault or syscall — before
         // any instruction after `kosh_switch_context` in *this* frame runs.
         // Interrupts are off, so publishing early is not visible to anyone else.
         publish_kernel_stack(next as u64, next_top);
+
+        // Same argument, same window: the incoming thread could be executing
+        // `in` before this frame continues. Interrupts are off, which is what
+        // `set_io_grant` requires.
+        unsafe { crate::gdt::set_io_grant(next_io) };
 
         // Switch page tables if the incoming thread lives somewhere else.
         //
@@ -632,6 +650,54 @@ pub fn adopt_address_space(space: AddressSpace) {
         }
     });
 }
+
+/// Give the running thread the ports of device `index`, from now on.
+///
+/// Installs into the live bitmap as well as the thread's record: the thread is
+/// already running, so waiting for the next context switch would mean the `in`
+/// immediately after `request_device` returns still faulting.
+pub fn grant_io_device(index: usize) {
+    without_interrupts(|| {
+        let grant = {
+            let mut sched = SCHEDULER.lock();
+            let current = sched.current;
+            match sched.threads[current].as_mut() {
+                Some(t) => {
+                    t.io_grant |= crate::platform::devports::grant_bit(index);
+                    t.io_grant
+                }
+                None => return,
+            }
+        };
+        unsafe { crate::gdt::set_io_grant(grant) };
+    });
+}
+
+/// Ports the running thread holds, for diagnostics.
+pub fn current_io_grant() -> u32 {
+    without_interrupts(|| {
+        let sched = SCHEDULER.lock();
+        sched.threads[sched.current].as_ref().map(|t| t.io_grant).unwrap_or(0)
+    })
+}
+
+/// Kill the running thread because it did something it is not allowed to.
+///
+/// The distinction from [`exit_current`] is only the exit code, but the code is
+/// the point: a parent's `wait` cannot otherwise tell "the child finished" from
+/// "the child was executing an instruction the CPU refused". `hello`'s
+/// I/O-permission test turns on exactly that difference.
+pub fn kill_current(reason_code: i32) -> ! {
+    set_exit_code(reason_code);
+    exit_current()
+}
+
+/// Exit code a thread gets when the kernel terminates it for a fault.
+///
+/// Negative so it cannot collide with a status a program chose for itself —
+/// `sys_exit` takes an unsigned byte-ish value in practice, and a program that
+/// exits 137 is not the same thing as one that was killed.
+pub const EXIT_KILLED: i32 = -9;
 
 /// Retire the running thread and never come back.
 pub fn exit_current() -> ! {

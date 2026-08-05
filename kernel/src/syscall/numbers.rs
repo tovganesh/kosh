@@ -50,6 +50,17 @@ pub const SYS_DRIVER_REGISTER: u64 = 40;
 pub const SYS_DRIVER_UNREGISTER: u64 = 41;
 pub const SYS_DRIVER_REQUEST: u64 = 42;
 pub const SYS_DRIVER_RESPONSE: u64 = 43;
+/// `request_device(name_ptr, name_len)` -> 0
+///
+/// Ask for direct `in`/`out` access to a named device's ports. A *name*, not a
+/// port range: the kernel decides what "ata0" consists of (see
+/// `platform::devports`), so a driver cannot ask for the interrupt controller.
+pub const SYS_REQUEST_DEVICE: u64 = 44;
+/// `release_device(name_ptr, name_len)` -> 0
+///
+/// Give the ports back. Implicit on exit, so this is only for a driver that
+/// wants to hand a disk over while it keeps running.
+pub const SYS_RELEASE_DEVICE: u64 = 45;
 
 /// System information system calls
 pub const SYS_UNAME: u64 = 50;
@@ -137,6 +148,8 @@ pub fn syscall_name(syscall_number: u64) -> &'static str {
         SYS_DRIVER_UNREGISTER => "driver_unregister",
         SYS_DRIVER_REQUEST => "driver_request",
         SYS_DRIVER_RESPONSE => "driver_response",
+        SYS_REQUEST_DEVICE => "request_device",
+        SYS_RELEASE_DEVICE => "release_device",
         
         SYS_GETDENTS => "getdents",
         SYS_UNAME => "uname",

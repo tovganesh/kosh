@@ -28,6 +28,34 @@
 //! to mutate it, which is why [`set_kernel_stack`] used to be
 //! `unimplemented!()`. The table and the TSS are now plain statics initialised
 //! imperatively, in a defined order.
+//!
+//! ## The I/O permission bitmap
+//!
+//! A driver in ring 3 has to execute `in` and `out`. There are three ways to let
+//! it, and only one of them is worth having:
+//!
+//! * **A port-I/O system call.** Safe, and unusably slow: a 512-byte ATA sector
+//!   is 256 16-bit port reads, so a one-sector read becomes 256 round trips
+//!   through the syscall stub.
+//! * **IOPL = 3 in the thread's RFLAGS.** One bit, and it grants *every* port —
+//!   the PIC at 0x20, the PIT at 0x40, the CMOS at 0x70, COM1 at 0x3F8. A disk
+//!   driver that can mask the timer interrupt is not isolated from the kernel in
+//!   any sense that matters.
+//! * **The TSS I/O permission bitmap**, which is what this does. With IOPL = 0,
+//!   the CPU consults one bit per port, in the TSS, on every `in`/`out`. A
+//!   granted port costs nothing at run time; a denied one raises #GP.
+//!
+//! The bitmap is per-*task* in the hardware's sense, which since we do not use
+//! hardware task switching means there is one of it. So it is rewritten on
+//! context switch from the incoming thread's grant — see [`set_io_grant`] — the
+//! same way `RSP0` is, and for the same reason.
+//!
+//! `TaskStateSegment` from the `x86_64` crate has an `iomap_base` field but no
+//! room after it, and `Descriptor::tss_segment` hard-codes the limit to
+//! `size_of::<TaskStateSegment>() - 1`. A bitmap that starts past the segment
+//! limit means "deny everything" — which is a perfectly good default and exactly
+//! what the stock descriptor gives you, but it is not a bitmap. Hence
+//! [`TssWithIoBitmap`] and a descriptor built by hand.
 
 use core::ptr::{addr_of, addr_of_mut};
 
@@ -54,7 +82,43 @@ static mut DOUBLE_FAULT_STACK: [u8; DOUBLE_FAULT_STACK_SIZE] = [0; DOUBLE_FAULT_
 /// first context switch, during which nothing runs in ring 3.
 static mut BOOT_KERNEL_STACK: [u8; BOOT_KERNEL_STACK_SIZE] = [0; BOOT_KERNEL_STACK_SIZE];
 
-static mut TSS: TaskStateSegment = TaskStateSegment::new();
+/// Ports the bitmap covers. Everything a PC's legacy hardware lives at is below
+/// 0x400: the PIC (0x20), the PIT (0x40), the keyboard controller (0x60), the
+/// CMOS (0x70), the ATA channels (0x1F0, 0x170, 0x3F6, 0x376), VGA (0x3C0) and
+/// the serial ports (0x3F8, 0x2F8).
+///
+/// A port whose bit lies past the segment limit is *denied*, so stopping at 1024
+/// rather than 65536 fails closed. 8 KiB of always-ones would be the alternative.
+pub const IO_PORT_LIMIT: u16 = 1024;
+const IO_BITMAP_BYTES: usize = (IO_PORT_LIMIT as usize) / 8;
+
+/// The TSS with the bitmap laid out immediately after it.
+///
+/// `packed(4)` matches `TaskStateSegment`'s own representation, so `bitmap`
+/// really does start at offset 104 — which is the value written into
+/// `iomap_base`, and the CPU will silently read the wrong bytes if the two
+/// disagree.
+#[repr(C, packed(4))]
+struct TssWithIoBitmap {
+    tss: TaskStateSegment,
+    bitmap: [u8; IO_BITMAP_BYTES],
+    /// The terminator byte.
+    ///
+    /// An `out dx, ax` at port 1023 asks the CPU about ports 1023 and 1024, and
+    /// it reads the *pair* of bytes containing them — one byte past the bitmap.
+    /// The manual requires that byte to be 0xFF and present within the limit;
+    /// without it the CPU would read whatever follows in memory and could allow
+    /// an access off the end of the table.
+    terminator: u8,
+}
+
+static mut TSS_IO: TssWithIoBitmap = TssWithIoBitmap {
+    tss: TaskStateSegment::new(),
+    // All ones: deny. A thread gets ports only by being handed a grant.
+    bitmap: [0xFF; IO_BITMAP_BYTES],
+    terminator: 0xFF,
+};
+
 static mut GDT: GlobalDescriptorTable = GlobalDescriptorTable::new();
 
 #[derive(Debug, Clone, Copy)]
@@ -77,7 +141,7 @@ pub fn init() {
     serial_println!("Setting up GDT and TSS...");
 
     unsafe {
-        let tss = &mut *addr_of_mut!(TSS);
+        let tss = &mut (*addr_of_mut!(TSS_IO)).tss;
 
         tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
             let start = VirtAddr::from_ptr(addr_of!(DOUBLE_FAULT_STACK));
@@ -89,6 +153,12 @@ pub fn init() {
             start + BOOT_KERNEL_STACK_SIZE
         };
 
+        // Offset of `bitmap` within the segment. `TaskStateSegment` is 104 bytes
+        // and `packed(4)` adds no padding, so this is 104 — computed rather than
+        // written out, because a hard-coded 104 that stops being true produces a
+        // bitmap the CPU reads from the wrong place and no diagnostic at all.
+        tss.iomap_base = core::mem::size_of::<TaskStateSegment>() as u16;
+
         let gdt = &mut *addr_of_mut!(GDT);
 
         // Order is load-bearing — see the module docs.
@@ -96,7 +166,7 @@ pub fn init() {
         let kernel_data = gdt.add_entry(Descriptor::kernel_data_segment());
         let user_data = gdt.add_entry(Descriptor::user_data_segment());
         let user_code = gdt.add_entry(Descriptor::user_code_segment());
-        let tss_sel = gdt.add_entry(Descriptor::tss_segment(&*addr_of!(TSS)));
+        let tss_sel = gdt.add_entry(tss_descriptor_with_bitmap());
 
         let selectors = Selectors {
             kernel_code,
@@ -130,7 +200,34 @@ pub fn init() {
             "  TSS.RSP0 = 0x{:x} (boot stack; per-thread from the first switch)",
             tss.privilege_stack_table[0].as_u64()
         );
+        serial_println!(
+            "  I/O bitmap at TSS+{}, {} bytes, ports 0..{} all denied",
+            tss.iomap_base,
+            IO_BITMAP_BYTES,
+            IO_PORT_LIMIT - 1
+        );
     }
+}
+
+/// The TSS descriptor, with the limit stretched over the bitmap.
+///
+/// `Descriptor::tss_segment` cannot be used: it computes the limit from
+/// `size_of::<TaskStateSegment>()`, which stops just before `iomap_base` points.
+/// The failure mode is not a crash — a bitmap outside the limit reads as all
+/// ones, so every port is denied and a driver simply never works.
+fn tss_descriptor_with_bitmap() -> Descriptor {
+    let ptr = addr_of!(TSS_IO) as u64;
+    // Inclusive bound, hence the -1.
+    let limit = (core::mem::size_of::<TssWithIoBitmap>() - 1) as u64;
+
+    let low = (1u64 << 47)                        // present
+        | (0b1001u64 << 40)                       // type: available 64-bit TSS
+        | ((ptr & 0x00FF_FFFF) << 16)             // base 0..24
+        | (((ptr >> 24) & 0xFF) << 56)            // base 24..32
+        | (limit & 0xFFFF);                       // limit 0..16
+    let high = ptr >> 32; // base 32..64
+
+    Descriptor::SystemSegment(low, high)
 }
 
 /// Point RSP0 at `top`.
@@ -145,13 +242,57 @@ pub fn init() {
 /// the stack it is already using, and the syscall frame is not at risk.
 pub fn set_kernel_stack(top: VirtAddr) {
     unsafe {
-        (*addr_of_mut!(TSS)).privilege_stack_table[0] = top;
+        (*addr_of_mut!(TSS_IO)).tss.privilege_stack_table[0] = top;
     }
 }
 
 /// Current RSP0, for diagnostics.
 pub fn kernel_stack() -> VirtAddr {
-    unsafe { (*addr_of!(TSS)).privilege_stack_table[0] }
+    unsafe { (*addr_of!(TSS_IO)).tss.privilege_stack_table[0] }
+}
+
+/// Grant currently installed in the bitmap.
+///
+/// Cached so the common switch — between threads that hold no ports, which is
+/// all of them but the driver — touches nothing. Rewriting 128 bytes on every
+/// tick would work and would be silly.
+static mut INSTALLED_IO_GRANT: u32 = 0;
+
+/// Write `grant`'s ports into the bitmap, denying everything else.
+///
+/// Called from the scheduler with the incoming thread's grant, alongside
+/// `set_kernel_stack`. The two failures are symmetrical: forget `set_kernel_stack`
+/// and a thread lands on another's kernel stack; forget this and a thread
+/// inherits another's hardware.
+///
+/// # Safety
+/// Must be called with interrupts disabled — it mutates a table the CPU reads.
+pub unsafe fn set_io_grant(grant: u32) {
+    if INSTALLED_IO_GRANT == grant {
+        return;
+    }
+
+    let tss_io = &mut *addr_of_mut!(TSS_IO);
+    tss_io.bitmap.fill(0xFF);
+
+    for (base, len) in crate::platform::devports::ports_for_grant(grant) {
+        for port in base..base.saturating_add(len) {
+            if port >= IO_PORT_LIMIT {
+                continue;
+            }
+            tss_io.bitmap[(port / 8) as usize] &= !(1u8 << (port % 8));
+        }
+    }
+
+    INSTALLED_IO_GRANT = grant;
+}
+
+/// Whether port `port` is currently permitted in ring 3. Diagnostics only.
+pub fn io_port_allowed(port: u16) -> bool {
+    if port >= IO_PORT_LIMIT {
+        return false;
+    }
+    unsafe { (*addr_of!(TSS_IO)).bitmap[(port / 8) as usize] & (1u8 << (port % 8)) == 0 }
 }
 
 /// Top of the stack `init` installed as RSP0.
