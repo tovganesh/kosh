@@ -59,12 +59,28 @@ const TIME_SLICE_TICKS: u32 = 2;
 pub enum State {
     Ready,
     Running,
-    /// Waiting for the thread with this id to finish. Skipped by the scheduler,
-    /// so a `wait` costs nothing while it blocks — as opposed to spinning on
-    /// `yield_now`, which is what the first version of this did and which meant
-    /// a shell waiting for a child consumed half the CPU.
-    Blocked { on: usize },
+    /// Not runnable, for one of the reasons below. Skipped by the scheduler, so
+    /// blocking costs nothing — as opposed to spinning on `yield_now`, which is
+    /// what the first version of `wait` did and which meant a shell waiting for
+    /// a child consumed half the CPU.
+    Blocked(BlockedOn),
     Finished,
+}
+
+/// Why a thread is not runnable.
+///
+/// Two reasons, and they need different wake paths: a thread waiting for a child
+/// is woken by that child exiting, a thread waiting for a message by anyone
+/// sending it one. Collapsing them into a single "blocked" would mean waking
+/// every blocked thread on either event and letting each work out whether it was
+/// meant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockedOn {
+    /// The thread with this id finishing.
+    Thread(usize),
+    /// A message arriving in this process's queue. The id is the thread's own,
+    /// because a process and its thread share one id.
+    Message(usize),
 }
 
 pub struct Thread {
@@ -675,10 +691,47 @@ pub fn exit_current() -> ! {
     }
 }
 
+/// Park the running thread until a message arrives for it.
+///
+/// Returns once something has called [`wake_for_message`] with this thread's id.
+/// The caller re-checks its queue afterwards rather than trusting the wake-up:
+/// a spurious wake is harmless, a missed re-check is a hang.
+pub fn block_for_message() {
+    let id = current_id();
+
+    without_interrupts(|| {
+        let mut sched = SCHEDULER.lock();
+        let current = sched.current;
+        if let Some(t) = sched.threads[current].as_mut() {
+            t.state = State::Blocked(BlockedOn::Message(id));
+        }
+    });
+
+    schedule();
+}
+
+/// Make a thread waiting for a message runnable again.
+///
+/// Called from the send path, *after* every IPC lock has been released: this
+/// takes the scheduler lock, and holding two of those in the wrong order is how
+/// a kernel stops.
+pub fn wake_for_message(thread: usize) {
+    without_interrupts(|| {
+        let mut sched = SCHEDULER.lock();
+        for slot in sched.threads.iter_mut() {
+            if let Some(t) = slot {
+                if t.state == State::Blocked(BlockedOn::Message(thread)) {
+                    t.state = State::Ready;
+                }
+            }
+        }
+    });
+}
+
 fn wake_waiters_locked(sched: &mut Scheduler, finished: usize) {
     for slot in sched.threads.iter_mut() {
         if let Some(t) = slot {
-            if t.state == (State::Blocked { on: finished }) {
+            if t.state == State::Blocked(BlockedOn::Thread(finished)) {
                 t.state = State::Ready;
             }
         }
@@ -726,7 +779,7 @@ pub fn wait_for(id: usize) -> Result<i32, &'static str> {
                 );
                 if !finished {
                     if let Some(t) = sched.threads[current].as_mut() {
-                        t.state = State::Blocked { on: id };
+                        t.state = State::Blocked(BlockedOn::Thread(id));
                     }
                 }
                 finished

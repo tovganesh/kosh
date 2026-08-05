@@ -413,7 +413,8 @@ pub fn spawn_program(name: &str) -> Result<usize, SpawnError> {
 
     match crate::task::spawn("spawned", enter_spawned, slot) {
         Ok(thread) => {
-            serial_println!("spawn '{}': thread {}, entry 0x{:x}", name, thread, entry);
+            register_process(thread, Some(crate::task::current_id()), name);
+            serial_println!("spawn '{}': thread {} (pid {}), entry 0x{:x}", name, thread, thread, entry);
             Ok(thread)
         }
         Err(e) => {
@@ -443,12 +444,72 @@ pub fn prepare_named_program(
     })
 }
 
+/// Register a ring-3 thread as a process, and give it what IPC needs.
+///
+/// A process here *is* a thread with an address space — there is no separate
+/// abstraction, and pretending otherwise is what left the process table holding
+/// three synthetic rows while every real program ran outside it. So the pid is
+/// the thread id, and this is the one place a process comes into existence.
+///
+/// Three things are set up together, because a process missing any of them
+/// fails somewhere unhelpful:
+///
+/// * the process table entry, without which `send_message` reports
+///   `SenderNotFound`;
+/// * a message queue, without which a `receive` before the first `send` reports
+///   `ReceiverNotFound` rather than "no message";
+/// * a capability to exchange messages with its parent, and the parent's to
+///   reply — which is the whole of the security policy, and is deliberately
+///   narrow. A process can talk to its parent and its children. Anything else
+///   is `PermissionDenied`, and that is testable rather than assumed.
+pub fn register_process(thread: usize, parent: Option<usize>, name: &str) {
+    use crate::process::{ProcessId, ProcessPriority};
+
+    let pid = ProcessId::new(thread as u32);
+    let parent_pid = parent.map(|p| ProcessId::new(p as u32));
+
+    if let Err(e) = crate::process::create_process_with_pid(
+        pid,
+        parent_pid,
+        alloc::string::String::from(name),
+        ProcessPriority::Normal,
+    ) {
+        serial_println!("  could not register process {}: {:?}", thread, e);
+        return;
+    }
+
+    if let Err(e) = crate::ipc::queue::create_message_queue(pid) {
+        serial_println!("  could not create a message queue for {}: {:?}", thread, e);
+    }
+
+    // A channel with the parent, in both directions. `create_secure_ipc_channel`
+    // grants each side `SendMessage` scoped to the other specifically — not
+    // `ResourceId::Any`, which is what `grant_system_process_capabilities` hands
+    // out and which would make the capability check unable to refuse anything.
+    if let Some(parent_pid) = parent_pid {
+        if let Err(e) = crate::ipc::security::create_secure_ipc_channel(pid, parent_pid) {
+            serial_println!("  could not open an IPC channel {}<->{}: {:?}", thread, parent_pid.0, e);
+        }
+    }
+}
+
+/// Retire a process when its thread exits.
+fn deregister_process(thread: usize) {
+    use crate::process::ProcessId;
+    let pid = ProcessId::new(thread as u32);
+
+    let _ = crate::ipc::queue::remove_message_queue(pid);
+    let _ = crate::process::remove_process(pid);
+}
+
 /// Record a forked child in the program table, inheriting its parent's name.
 ///
 /// Not a new program — a second thread running the same one — so it gets the
 /// parent's name with a marker, which is what makes a `fork` visible in the log
 /// without pretending a new image was loaded.
 pub fn register_forked(child: usize, parent: usize) {
+    register_process(child, Some(parent), "forked");
+
     let mut table = PROGRAMS.lock();
 
     let parent_name = table
@@ -547,6 +608,8 @@ fn release_slot(slot: usize) {
 /// function did the unmapping too, walking a recorded list of ranges; that list
 /// existed because there was nothing else that knew what a program had mapped.
 pub fn on_thread_exit(thread: usize) {
+    deregister_process(thread);
+
     let taken = {
         let mut table = PROGRAMS.lock();
         let found = table.iter().position(|s| matches!(s, Some(p) if p.thread == thread));
@@ -702,6 +765,10 @@ fn run_module(name: &str) {
     }
 
     register_running(name);
+    // A program the kernel started for itself has no parent process, so no IPC
+    // channel: nothing has a capability to message it and it has none to
+    // message anything. `ksh` gets one the moment it spawns a child.
+    register_process(crate::task::current_id(), None, name);
     crate::task::adopt_address_space(space);
 
     serial_println!("Entering loaded ELF in ring 3...");

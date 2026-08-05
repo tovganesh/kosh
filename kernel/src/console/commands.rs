@@ -133,7 +133,8 @@ fn threads() {
             crate::task::State::Running => "running",
             crate::task::State::Ready => "ready",
             crate::task::State::Finished => "finished",
-            crate::task::State::Blocked { on } => {
+            crate::task::State::Blocked(crate::task::BlockedOn::Message(_)) => "msg-wait",
+            crate::task::State::Blocked(crate::task::BlockedOn::Thread(on)) => {
                 let text = alloc::format!("wait({})", on);
                 let bytes = text.as_bytes();
                 let take = core::cmp::min(bytes.len(), blocked.len());

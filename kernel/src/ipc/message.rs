@@ -310,12 +310,12 @@ pub fn send_message(message: Message) -> Result<(), MessageError> {
                    message.header.receiver.0);
     
     // Validate sender exists
-    if crate::process::get_process(message.header.sender).is_none() {
+    if !crate::process::process_exists(message.header.sender) {
         return Err(MessageError::SenderNotFound);
     }
     
     // Validate receiver exists
-    if crate::process::get_process(message.header.receiver).is_none() {
+    if !crate::process::process_exists(message.header.receiver) {
         return Err(MessageError::ReceiverNotFound);
     }
     
@@ -341,7 +341,7 @@ pub fn receive_message(receiver: ProcessId) -> Result<Message, MessageError> {
     serial_println!("Process {} attempting to receive message", receiver.0);
     
     // Validate receiver exists
-    if crate::process::get_process(receiver).is_none() {
+    if !crate::process::process_exists(receiver) {
         return Err(MessageError::ReceiverNotFound);
     }
     

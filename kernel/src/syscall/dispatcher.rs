@@ -332,15 +332,20 @@ fn sys_getpid(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
     Ok(process_id.0 as u64)
 }
 
-/// Not implemented, and no longer pretending otherwise.
+/// `getppid()` -> parent's pid
 ///
-/// This returned `Ok(0)` under a TODO, which userspace cannot tell apart from a
-/// genuine "no parent" — and 0 is what a real `getppid` returns for the process
-/// that has none. There is no parent to report: `spawn` hands back a task id and
-/// records nothing about who called it, so a process hierarchy does not exist
-/// yet. Refusing says that; returning 0 says the opposite.
-fn sys_getppid(_process_id: ProcessId, _args: [u64; 6]) -> SyscallResult {
-    Err(SyscallError::NotSupported)
+/// Real now that a process hierarchy exists: `spawn` and `fork` record the
+/// creating process as the parent, which is also what decides who may send whom
+/// a message.
+///
+/// It returned `Ok(0)` under a TODO for a long time — indistinguishable from a
+/// genuine "no parent", which is what 0 means — and then `NotSupported` once
+/// that was noticed. A program started by the kernel rather than by another
+/// program genuinely has no parent, and gets 0.
+fn sys_getppid(process_id: ProcessId, _args: [u64; 6]) -> SyscallResult {
+    Ok(crate::process::parent_of(process_id)
+        .map(|p| p.0 as u64)
+        .unwrap_or(0))
 }
 
 fn sys_kill(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
@@ -700,59 +705,137 @@ fn sys_unlink(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
 }
 
 // IPC system calls
-/// `send_message(receiver, ptr, len)`
+/// Largest message a process can send. The queue caps a *process* at 64 KiB
+/// total, so a single message has to be well under that or one send fills it.
+const MAX_MESSAGE_BYTES: usize = 4096;
+
+/// `send_message(receiver_pid, ptr, len)`
 ///
-/// Not implemented, and it now says so instead of delivering something else.
+/// Copies the caller's bytes into a message and enqueues it on the receiver.
 ///
-/// What it used to do is the most subtle fabrication in this kernel, because
-/// most of it was real. It reached `ipc::message::send_message`, which genuinely
-/// validates the sender and receiver, checks a `SendMessage` capability and
-/// enqueues — but `args[1]`, the caller's buffer, was bound to `_message_ptr`
-/// and never read. In its place went:
+/// What this replaces is the subtlest fabrication this kernel had, because most
+/// of it was real: it reached `ipc::message::send_message`, which genuinely
+/// validates sender and receiver, checks a capability and enqueues — but
+/// `args[1]`, the caller's buffer, was bound to `_message_ptr` and never read.
+/// In its place went a synthetic `MessageData::Text(format!("Message from
+/// process {} (len={})", pid, len))`, so the receiver got a *description* of the
+/// message instead of the message, and the sender got `Ok(0)`.
 ///
-/// ```text
-/// MessageData::Text(format!("Message from process {} (len={})", pid, len))
-/// ```
-///
-/// so the receiver got a synthetic string describing the message instead of the
-/// message, and the sender got `Ok(0)`.
-///
-/// Copying the payload is the easy part — `uaccess::copy_from_user` already
-/// exists. What blocks this is that there are **two unrelated id namespaces**:
-/// `syscall/entry.rs` passes the calling *thread's* id as the `ProcessId`, while
-/// `ipc::message::send_message` looks the sender up in `process::ProcessTable`,
-/// whose only entries are the three synthetic ones the boot self-test creates.
-/// A ring-3 caller is not in that table, so every send would fail
-/// `SenderNotFound` even with a real payload.
-///
-/// Reconciling those namespaces — one process table that `spawn` registers into,
-/// with the thread as a member of a process rather than a synonym for one — is
-/// the work. `kernel/src/ipc/` is ~85 KB of implemented queueing and capability
-/// machinery waiting on it.
+/// Copying the payload was never the hard part; `uaccess::copy_from_user` has
+/// existed for phases. The blocker was that `syscall/entry.rs` passed a *thread*
+/// id where the IPC layer expected a `ProcessTable` entry, so every send would
+/// have failed `SenderNotFound` even with real bytes. Those namespaces are one
+/// now — a process *is* a ring-3 thread, registered at the same id — which is
+/// what makes this implementable rather than a different fabrication.
+#[cfg(target_arch = "x86_64")]
 fn sys_send_message(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
-    serial_println!(
-        "Process {} called send_message({}, 0x{:x}, {}): IPC needs one process-id namespace first",
-        process_id.0,
-        args[0],
-        args[1],
-        args[2]
+    use alloc::vec;
+
+    let receiver = ProcessId::new(args[0] as u32);
+    let ptr = args[1];
+    let len = args[2] as usize;
+
+    if len == 0 || len > MAX_MESSAGE_BYTES {
+        return Err(SyscallError::InvalidArgument);
+    }
+
+    let mut buf = vec![0u8; len];
+    crate::syscall::uaccess::copy_from_user(ptr, &mut buf)
+        .map_err(|_| SyscallError::InvalidArgument)?;
+
+    let message = crate::ipc::message::create_message(
+        process_id,
+        receiver,
+        crate::ipc::message::MessageType::ServiceRequest,
+        crate::ipc::message::MessageData::Bytes(buf),
     );
+
+    crate::ipc::message::send_message(message)?;
+
+    // Wake the receiver *after* every IPC lock has been dropped. `wake_for_message`
+    // takes the scheduler lock, and holding that and a queue lock in opposite
+    // orders on two paths is how a kernel stops.
+    crate::task::wake_for_message(receiver.0 as usize);
+
+    if syscall_trace_enabled() {
+        serial_println!(
+            "Process {} sent {} byte(s) to {}",
+            process_id.0,
+            len,
+            receiver.0
+        );
+    }
+
+    Ok(len as u64)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn sys_send_message(_process_id: ProcessId, _args: [u64; 6]) -> SyscallResult {
     Err(SyscallError::NotSupported)
 }
 
-/// `receive_message(timeout_ms)`
+/// `receive_message(buf_ptr, buf_len, blocking)` -> (sender << 32) | length
 ///
-/// Not implemented, for the same reason as [`sys_send_message`]. This one did
-/// dequeue for real — and then returned only `message_id`, dropping the payload
-/// on the floor under a `// In a real implementation, we would copy the message
-/// data to user space`. A caller that got a message id had no way to read the
-/// message.
+/// Copies the next message's payload to the caller and reports who sent it and
+/// how long it was, packed into one return value because a syscall has one.
+///
+/// This used to dequeue for real and then return only the message id, dropping
+/// the payload under a `// In a real implementation, we would copy the message
+/// data to user space`. A caller that got an id had no way to read the message.
+///
+/// `blocking` non-zero parks the thread in `State::Blocked(BlockedOn::Message)`
+/// until someone sends, rather than spinning on `yield`. The loop around the
+/// block is not paranoia: a wake-up is a hint, and re-checking the queue is what
+/// makes a spurious one harmless.
+#[cfg(target_arch = "x86_64")]
 fn sys_receive_message(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
-    serial_println!(
-        "Process {} called receive_message({}): IPC needs one process-id namespace first",
-        process_id.0,
-        args[0]
-    );
+    let out = args[0];
+    let capacity = args[1] as usize;
+    let blocking = args[2] != 0;
+
+    if capacity == 0 || capacity > MAX_MESSAGE_BYTES {
+        return Err(SyscallError::InvalidArgument);
+    }
+
+    let message = loop {
+        match crate::ipc::message::receive_message(process_id) {
+            Ok(m) => break m,
+            Err(crate::ipc::MessageError::NoMessage) if blocking => {
+                crate::task::block_for_message();
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
+
+    let payload: &[u8] = match &message.data {
+        crate::ipc::message::MessageData::Bytes(b) => b,
+        crate::ipc::message::MessageData::Text(t) => t.as_bytes(),
+        // The other variants exist for kernel-internal senders. Userspace only
+        // ever produces `Bytes`, and a message it cannot represent is better
+        // refused than silently truncated to nothing.
+        _ => return Err(SyscallError::NotSupported),
+    };
+
+    let n = core::cmp::min(payload.len(), capacity);
+    crate::syscall::uaccess::copy_to_user(out, &payload[..n])
+        .map_err(|_| SyscallError::InvalidArgument)?;
+
+    if syscall_trace_enabled() {
+        serial_println!(
+            "Process {} received {} byte(s) from {}",
+            process_id.0,
+            n,
+            message.header.sender.0
+        );
+    }
+
+    // Sender in the high half, length in the low half. Both fit: pids are u32
+    // and a message is capped at 4 KiB.
+    Ok(((message.header.sender.0 as u64) << 32) | n as u64)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn sys_receive_message(_process_id: ProcessId, _args: [u64; 6]) -> SyscallResult {
     Err(SyscallError::NotSupported)
 }
 

@@ -278,6 +278,60 @@ impl ProcessTable {
         Ok(pid)
     }
     
+    /// Create a process with a caller-chosen PID.
+    ///
+    /// The table's own PID allocator is a monotonic counter, which is fine for a
+    /// system where processes are created by the table. Here they are not: a
+    /// process *is* a ring-3 thread, and the thread table already assigned it an
+    /// id. Two allocators would mean two namespaces, which is exactly the split
+    /// this phase exists to remove — `syscall/entry.rs` passed a thread id where
+    /// the IPC layer expected a table entry, so every send failed or, worse,
+    /// aliased one of the three synthetic processes at pids 1-3.
+    pub fn create_process_with_pid(
+        &mut self,
+        pid: ProcessId,
+        parent_pid: Option<ProcessId>,
+        name: String,
+        priority: ProcessPriority,
+    ) -> Result<ProcessId, ProcessError> {
+        if self.processes.len() >= self.max_processes {
+            return Err(ProcessError::ProcessTableFull);
+        }
+        if self.get_process(pid).is_some() {
+            return Err(ProcessError::InvalidPid);
+        }
+
+        let mut process = Process::new(pid, parent_pid, name, priority);
+        process.set_state(ProcessState::Ready);
+
+        if let Some(parent_pid) = parent_pid {
+            if let Some(parent) = self.get_process_mut(parent_pid) {
+                parent.add_child(pid);
+            }
+        }
+
+        self.processes.push(Some(process));
+
+        // Keep the counter clear of hand-picked ids, so a later
+        // `create_process` cannot collide with one.
+        if pid.0 >= self.next_pid {
+            self.next_pid = pid.0 + 1;
+        }
+
+        Ok(pid)
+    }
+
+    /// Does this PID name a live process?
+    ///
+    /// Cheaper than [`Self::get_process`] on the IPC path, and much cheaper than
+    /// the module-level `get_process`, which clones the process's name into a
+    /// fresh `String` just to answer this question — twice per `send_message`.
+    pub fn exists(&self, pid: ProcessId) -> bool {
+        self.processes
+            .iter()
+            .any(|p| p.as_ref().map_or(false, |proc| proc.pid == pid))
+    }
+
     /// Get a process by PID (immutable reference)
     pub fn get_process(&self, pid: ProcessId) -> Option<&Process> {
         self.processes.iter()
@@ -556,6 +610,38 @@ pub fn get_current_process() -> Option<ProcessId> {
 }
 
 /// Get all runnable processes
+/// Register a process at a caller-chosen PID.
+pub fn create_process_with_pid(
+    pid: ProcessId,
+    parent_pid: Option<ProcessId>,
+    name: String,
+    priority: ProcessPriority,
+) -> Result<ProcessId, ProcessError> {
+    let mut guard = PROCESS_TABLE.lock();
+    match guard.as_mut() {
+        Some(table) => table.create_process_with_pid(pid, parent_pid, name, priority),
+        None => Err(ProcessError::ProcessNotFound),
+    }
+}
+
+/// Does this PID name a live process?
+pub fn process_exists(pid: ProcessId) -> bool {
+    PROCESS_TABLE
+        .lock()
+        .as_ref()
+        .map(|table| table.exists(pid))
+        .unwrap_or(false)
+}
+
+/// Parent of a process, if it has one.
+pub fn parent_of(pid: ProcessId) -> Option<ProcessId> {
+    PROCESS_TABLE
+        .lock()
+        .as_ref()
+        .and_then(|table| table.get_process(pid))
+        .and_then(|p| p.parent_pid)
+}
+
 pub fn get_runnable_processes() -> Vec<ProcessId> {
     let table = PROCESS_TABLE.lock();
     if let Some(table) = table.as_ref() {

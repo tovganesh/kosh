@@ -263,11 +263,14 @@ check)
         "child: I inherited the value my parent set before forking" \
         "child: my copy of the witness is mine" \
         "parent: still writable after the child exited" \
+        "message, bytes and all" \
+        "sending to a pid that does not exist was refused" \
         "Copy-on-write: " \
         "hello2 here: exec replaced the whole image" \
         "hello2: my .bss is mine and it is zero" \
         "parent: the child did not touch my memory" \
         "and exited 7" \
+        "capability check not exercised" \
         "seconds since the epoch" \
         "ELF loader: PASS" \
         "Storage: PASS" \
@@ -432,6 +435,7 @@ check-cli)
         "redirect out" \
         "background" \
         "hello2 here: exec replaced the whole image" \
+        "child: messaging my grandparent was refused" \
         "ksh: exiting" \
         "ksh exited with code 0, falling back to the kernel console" \
         "Kosh console" \
