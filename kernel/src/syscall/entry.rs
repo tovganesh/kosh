@@ -39,7 +39,10 @@ use crate::serial_println;
 
 /// Registers the stub pushes, in push order (so the first field is at the
 /// lowest address — the layout the stub builds by pushing RAX last).
+///
+/// `Copy`, because `fork` has to duplicate one onto the child's kernel stack.
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub struct SyscallFrame {
     pub rax: u64,
     pub rdi: u64,
@@ -65,6 +68,11 @@ pub struct SyscallFrame {
 
 extern "C" {
     fn kosh_syscall_entry();
+    /// Tail of the syscall stub: pops a [`SyscallFrame`] and `sysretq`s.
+    ///
+    /// Not called — jumped to, by `ret`, from a stack `task::spawn_forked` laid
+    /// out. Declaring it here is how its address is obtained.
+    pub fn kosh_syscall_return();
 }
 
 core::arch::global_asm!(
@@ -108,6 +116,17 @@ kosh_syscall_entry:
 
     movq    %rax, (%rsp)        /* return value into frame.rax */
 
+/* The return path, entered with RSP pointing at a complete SyscallFrame whose
+   rax already holds the value to give the caller.
+
+   Exposed as a symbol because a forked child has to come out here without ever
+   having executed the `syscall` instruction: `fork` builds a copy of the
+   parent's frame on the child's fresh kernel stack, with rax set to 0, and
+   arranges for the context switch to `ret` straight to this label. The child
+   then returns to ring 3 at the parent's RIP, on the parent's user RSP — which
+   in the child's address space is its own copy of that stack. */
+.global kosh_syscall_return
+kosh_syscall_return:
     popq    %rax
     popq    %rdi
     popq    %rsi
@@ -132,6 +151,18 @@ pub extern "C" fn kosh_syscall_handler(frame: &mut SyscallFrame) -> u64 {
 
     SYSCALL_COUNT.fetch_add(1, Ordering::Relaxed);
 
+    // `fork` is the one syscall that needs the caller's register frame rather
+    // than just its arguments: the child returns to exactly where the parent
+    // called from. Handled here instead of threading a `&mut SyscallFrame`
+    // through `dispatch_syscall`, which every other handler would have to
+    // ignore.
+    if number == crate::syscall::numbers::SYS_FORK {
+        return match crate::syscall::fork::sys_fork(frame) {
+            Ok(v) => v,
+            Err(e) => negative_errno(e),
+        };
+    }
+
     // The calling thread's id, which is now a real answer rather than the
     // hardcoded `1` this used while only one thread could be in ring 3. It is
     // also what `spawn` returns and what `wait` takes, so a log line naming a
@@ -153,11 +184,22 @@ pub extern "C" fn kosh_syscall_handler(frame: &mut SyscallFrame) -> u64 {
             // something named "errno". Negating it here — the obvious thing to
             // write — flips errors positive, and userspace then reads every
             // failure as success. Normalise instead of assuming.
-            let errno = err.to_errno() as i64;
-            let negative = if errno > 0 { -errno } else { errno };
-            negative as u64
+            negative_errno(err)
         }
     }
+}
+
+/// Normalise a `SyscallError` into the negative value userspace tests the sign
+/// of.
+///
+/// `to_errno()` already returns *negative* numbers (-22 for EINVAL, and so on),
+/// which is unusual for something named "errno". Negating it — the obvious thing
+/// to write — flips errors positive, and userspace then reads every failure as
+/// success.
+fn negative_errno(err: crate::syscall::SyscallError) -> u64 {
+    let errno = err.to_errno() as i64;
+    let negative = if errno > 0 { -errno } else { errno };
+    negative as u64
 }
 
 static SYSCALL_COUNT: AtomicU64 = AtomicU64::new(0);

@@ -250,6 +250,150 @@ pub fn spawn(name: &'static str, entry: fn(usize), arg: usize) -> Result<usize, 
     })
 }
 
+/// Create a thread that will return from a system call it never executed.
+///
+/// This is what `fork` needs and what `spawn` cannot express. A normal thread
+/// starts at a Rust `fn(usize)`; a forked child has to appear in ring 3 at the
+/// parent's RIP, on the parent's user RSP, with every register the parent had
+/// and `rax` set to 0.
+///
+/// It is arranged entirely by how the child's kernel stack is laid out. From the
+/// top down:
+///
+/// ```text
+///   top-8    frame.user_rsp        the SyscallFrame the syscall stub's tail
+///   ...        ...                 expects, highest field first
+///   top-80   frame.rax  = 0
+///   top-88   return address = kosh_syscall_return
+///   top-96   rbp                   the switch frame kosh_switch_context pops
+///   ...        ...
+///   top-144  rflags
+/// ```
+///
+/// `kosh_switch_context` pops the seven-word switch frame and `ret`s, which
+/// leaves RSP at `top-80` — exactly the base of the `SyscallFrame` — with RIP at
+/// `kosh_syscall_return`. That code pops the frame and `sysretq`s. The child has
+/// never run a single instruction of kernel code written for it.
+///
+/// The parent's user RSP is used unchanged, which is correct precisely because
+/// the child has its own address space: the same number names the child's own
+/// copy of that stack.
+pub fn spawn_forked(
+    name: &'static str,
+    frame: &crate::syscall::entry::SyscallFrame,
+    space: AddressSpace,
+) -> Result<usize, &'static str> {
+    let mut stack = alloc::vec![0u8; STACK_SIZE].into_boxed_slice();
+    let top = (stack.as_mut_ptr() as u64 + stack.len() as u64) & !0xF;
+
+    let mut child_frame = *frame;
+    // The one difference between parent and child, and the whole of the fork
+    // convention: the parent gets the child's id, the child gets 0.
+    child_frame.rax = 0;
+
+    unsafe {
+        let put = |offset: u64, value: u64| {
+            core::ptr::write((top - offset) as *mut u64, value);
+        };
+
+        // The SyscallFrame, in the layout the stub's tail pops.
+        put(8, child_frame.user_rsp);
+        put(16, child_frame.rflags);
+        put(24, child_frame.rip);
+        put(32, child_frame.r9);
+        put(40, child_frame.r8);
+        put(48, child_frame.r10);
+        put(56, child_frame.rdx);
+        put(64, child_frame.rsi);
+        put(72, child_frame.rdi);
+        put(80, child_frame.rax);
+
+        // Where `ret` goes.
+        put(88, crate::syscall::entry::kosh_syscall_return as usize as u64);
+
+        // The switch frame. Callee-saved registers do not matter — the frame
+        // above overwrites everything the child will actually use — but they
+        // have to be *there*, because the switch pops them.
+        put(96, 0); // rbp
+        put(104, 0); // rbx
+        put(112, 0); // r12
+        put(120, 0); // r13
+        put(128, 0); // r14
+        put(136, 0); // r15
+
+        // IF clear: the switch happens inside the scheduler with interrupts off.
+        // The child's real RFLAGS come from the frame, at `sysretq`.
+        put(144, 0x0000_0002);
+    }
+
+    let rsp = top - 144;
+
+    without_interrupts(|| {
+        let mut sched = SCHEDULER.lock();
+
+        let slot = sched
+            .threads
+            .iter()
+            .position(|t| t.is_none())
+            .ok_or("thread table full")?;
+
+        sched.threads[slot] = Some(Thread {
+            id: slot,
+            name,
+            rsp,
+            _stack: Some(stack),
+            kernel_stack_top: top,
+            state: State::Ready,
+            // No entry function: this thread never enters Rust.
+            entry: None,
+            ticks: 0,
+            address_space: Some(space),
+            exit_code: 0,
+            awaited: false,
+        });
+
+        serial_println!(
+            "  forked thread {} (kernel stack 0x{:x}, resumes in ring 3 at 0x{:x})",
+            slot,
+            top,
+            child_frame.rip
+        );
+        Ok(slot)
+    })
+}
+
+/// PML4 of the running thread's own address space, if it has one.
+///
+/// `None` means the thread is running on the kernel's tables — a kernel thread,
+/// which cannot be forked.
+pub fn current_address_space_pml4() -> Option<u64> {
+    without_interrupts(|| {
+        let sched = SCHEDULER.lock();
+        let current = sched.current;
+        sched.threads[current]
+            .as_ref()
+            .and_then(|t| t.address_space.as_ref())
+            .map(|a| a.pml4_phys())
+    })
+}
+
+/// Swap the running thread's address space, returning the old one.
+///
+/// `exec`'s half of the work. The new space is activated before the old is
+/// handed back, so the caller can free it — which is safe only in that order,
+/// and only because this runs on a kernel stack the two spaces share.
+pub fn replace_address_space(space: AddressSpace) -> Option<AddressSpace> {
+    without_interrupts(|| {
+        let mut sched = SCHEDULER.lock();
+        let current = sched.current;
+        let thread = sched.threads[current].as_mut()?;
+        let old = thread.address_space.replace(space);
+        // Safe: everything executing right now is in the shared upper half.
+        unsafe { thread.address_space.as_ref().unwrap().activate() };
+        old
+    })
+}
+
 /// Begin preempting. Called once the demo threads exist.
 pub fn start() {
     ENABLED.store(true, Ordering::SeqCst);

@@ -1,0 +1,16 @@
+[package]
+name = "kosh-hello2"
+version = "0.1.0"
+edition = "2021"
+
+# The program `hello` execs into.
+#
+# It exists to be a *different* image at the same link address: `exec` has to
+# replace the caller's entire address space, and the only way to tell that
+# happened is for something else to be running afterwards.
+
+[dependencies]
+
+[[bin]]
+name = "kosh-hello2"
+path = "src/main.rs"

@@ -127,22 +127,21 @@ fn validate_fork_args(args: &[u64; 6]) -> Result<(), SyscallError> {
     Ok(())
 }
 
+/// `exec(path_ptr, path_len)`.
+///
+/// The same shape as `spawn`: an explicit length rather than a NUL terminator,
+/// so the span can be bound-checked before the kernel walks user memory. The
+/// previous version validated `args[1]` and `args[2]` as `argv`/`envp` pointer
+/// arrays, which this ABI does not have — and `argv` support needs somewhere to
+/// put the strings in the new address space, which is its own job.
 fn validate_exec_args(process_id: ProcessId, args: &[u64; 6]) -> Result<(), SyscallError> {
     let path_ptr = args[0];
-    let argv_ptr = args[1];
-    let envp_ptr = args[2];
-    
-    validate_user_string(process_id, path_ptr, 4096)?;
-    
-    if argv_ptr != 0 {
-        validate_user_pointer(process_id, argv_ptr, 8, false)?; // At least one pointer
+    let path_len = args[1];
+
+    if path_len == 0 || path_len > 255 {
+        return Err(SyscallError::InvalidArgument);
     }
-    
-    if envp_ptr != 0 {
-        validate_user_pointer(process_id, envp_ptr, 8, false)?; // At least one pointer
-    }
-    
-    Ok(())
+    validate_user_pointer(process_id, path_ptr, path_len as usize, false)
 }
 
 /// `wait(task_id, status_ptr)`.

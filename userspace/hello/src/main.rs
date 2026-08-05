@@ -19,6 +19,9 @@
 use core::panic::PanicInfo;
 
 const SYS_EXIT: u64 = 1;
+const SYS_FORK: u64 = 2;
+const SYS_EXEC: u64 = 3;
+const SYS_WAIT: u64 = 4;
 const SYS_GETPID: u64 = 5;
 const SYS_MMAP: u64 = 10;
 const SYS_MUNMAP: u64 = 11;
@@ -36,6 +39,12 @@ const MAP_PRIVATE: u64 = 0x02;
 const MAP_ANONYMOUS: u64 = 0x20;
 
 const CLOCK_MONOTONIC: u64 = 1;
+
+/// Written before `fork` and again after it, by both parent and child, to prove
+/// they are looking at different memory. A `static mut` rather than a stack
+/// variable because it lives in `.bss` — the part of the address space the
+/// eager copy has to duplicate.
+static mut FORK_WITNESS: u64 = 0;
 
 /// Zero-initialised, so it occupies no space in the file. If the loader forgets
 /// to zero the gap between `p_filesz` and `p_memsz`, this reads as garbage.
@@ -106,6 +115,18 @@ fn debug_print(message: &str) -> i64 {
             0,
         )
     }
+}
+
+fn fork() -> i64 {
+    unsafe { syscall3(SYS_FORK, 0, 0, 0) }
+}
+
+fn wait(task: i64, status: &mut i32) -> i64 {
+    unsafe { syscall3(SYS_WAIT, task as u64, status as *mut i32 as u64, 0) }
+}
+
+fn exec(name: &str) -> i64 {
+    unsafe { syscall3(SYS_EXEC, name.as_ptr() as u64, name.len() as u64, 0) }
 }
 
 fn exit(code: u64) -> ! {
@@ -270,6 +291,57 @@ pub extern "C" fn kosh_main() -> ! {
         print("  WARNING: debug_print failed\n");
     } else {
         print("  debug_print echoed my message\n");
+    }
+
+    // fork. The parent writes a witness value, forks, and then both sides write
+    // a different one — if the address spaces were shared, the second write would
+    // be visible to the first process and the values would agree.
+    //
+    // `hello` is spawned by `ksh` and also run at boot, so this must not recurse:
+    // the child execs `hello2`, a different program, and does not fork again.
+    unsafe { core::ptr::write_volatile(&raw mut FORK_WITNESS, 0x1111_1111) };
+
+    let child = fork();
+    if child < 0 {
+        print("  WARNING: fork failed\n");
+    } else if child == 0 {
+        // Child. Prove the copy diverged, then become a different program.
+        unsafe { core::ptr::write_volatile(&raw mut FORK_WITNESS, 0x2222_2222) };
+        let seen = unsafe { core::ptr::read_volatile(&raw const FORK_WITNESS) };
+        if seen == 0x2222_2222 {
+            print("  child: my copy of the witness is mine\n");
+        } else {
+            print("  WARNING: child could not write its own memory\n");
+        }
+
+        // exec never returns. If it does, it failed.
+        let err = exec("hello2");
+        print("  WARNING: exec returned ");
+        print_i64(err);
+        print("\n");
+        exit(1);
+    } else {
+        // Parent. The child has written 0x22222222 to *its* copy by now, or will
+        // shortly; either way the parent's must still read 0x11111111.
+        let mut status: i32 = 0;
+        wait(child, &mut status);
+
+        let seen = unsafe { core::ptr::read_volatile(&raw const FORK_WITNESS) };
+        if seen == 0x1111_1111 {
+            print("  parent: the child did not touch my memory\n");
+        } else {
+            print("  WARNING: fork shared memory, witness reads ");
+            print_hex(seen);
+            print("\n");
+        }
+
+        if status == 7 {
+            print("  child exec'd and exited 7\n");
+        } else {
+            print("  WARNING: unexpected child status ");
+            print_i64(status as i64);
+            print("\n");
+        }
     }
 
     print("  exiting cleanly\n");

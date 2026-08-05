@@ -5,6 +5,7 @@ use crate::{serial_println, println};
 pub mod dispatcher;
 pub mod entry;
 pub mod files;
+pub mod fork;
 pub mod numbers;
 pub mod uaccess;
 pub mod validation;
