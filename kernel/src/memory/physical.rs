@@ -99,6 +99,17 @@ pub struct PhysicalMemoryManager {
     reserved_frames: usize,
     /// Start of the bitmap in memory
     bitmap_start: usize,
+    /// How many address spaces are using each frame.
+    ///
+    /// Copy-on-write is what makes this necessary: after a `fork` the same
+    /// frame appears in two sets of page tables, and whichever process exits
+    /// first must not hand it back to the allocator. `deallocate_frame`
+    /// decrements; the frame is only really freed at zero.
+    ///
+    /// `u8` rather than `u16`: the sharers of a frame are address spaces, and
+    /// the thread table holds 16. 255 is a long way past that, and an overflow
+    /// is reported rather than wrapped.
+    refcounts: &'static mut [u8],
 }
 
 impl PhysicalMemoryManager {
@@ -128,22 +139,40 @@ impl PhysicalMemoryManager {
         
         // Calculate bitmap size (1 bit per page frame)
         let bitmap_size = (total_frames + 7) / 8; // Round up to nearest byte
+        // ...and the refcount table, one byte per frame, immediately after it.
+        let refcount_size = total_frames;
+        let metadata_size = bitmap_size + refcount_size;
         
-        // Place the bitmap immediately after the kernel image. The previous
-        // hardcoded 2 MiB only worked by accident (the kernel happened to be
-        // small enough) and would silently corrupt the kernel once it grew.
+        // Place the metadata after the kernel image *and* after every boot
+        // module.
+        //
+        // "After the kernel image" was the rule until the refcount table
+        // arrived, and it was correct only because the bitmap was small: 16 KiB
+        // fits in the gap GRUB leaves before the first module. The refcount
+        // table is one byte per frame — 128 KiB for 512 MiB of RAM — which
+        // reaches straight into the module GRUB loaded at 0x195000. The symptom
+        // was both modules reading as all zeros and the ELF loader reporting
+        // `BadMagic`, several subsystems away from the cause.
+        //
+        // A hardcoded 2 MiB was the rule before *that*, and failed the same way
+        // once the kernel grew. Computing the bound is the only version that
+        // does not have a size at which it silently breaks.
         let (_kernel_start, kernel_end) = kernel_image_range();
-        let bitmap_start = align_up(kernel_end);
-        let bitmap_end = bitmap_start + bitmap_size;
+        let mut metadata_after = kernel_end;
+        for module in boot_info.module_tags() {
+            metadata_after = metadata_after.max(module.end_address() as usize);
+        }
+        let bitmap_start = align_up(metadata_after);
+        let bitmap_end = bitmap_start + metadata_size;
         
-        // Ensure bitmap doesn't overlap with any reserved areas
+        // Ensure the metadata doesn't overlap with any reserved areas
         for area in memory_map.memory_areas() {
             if area.typ() != MemoryAreaType::Available {
                 let area_start = area.start_address() as usize;
                 let area_end = area.end_address() as usize;
                 
                 if bitmap_start < area_end && bitmap_end > area_start {
-                    return Err("Cannot place bitmap - overlaps with reserved memory");
+                    return Err("Cannot place the frame metadata - overlaps with reserved memory");
                 }
             }
         }
@@ -160,9 +189,27 @@ impl PhysicalMemoryManager {
                 bitmap_size,
             )
         };
+        let refcounts = unsafe {
+            core::slice::from_raw_parts_mut(
+                crate::memory::paging::kernel_virt((bitmap_start + bitmap_size) as u64) as *mut u8,
+                refcount_size,
+            )
+        };
         
         // Clear the bitmap (all pages initially marked as used)
         bitmap.fill(0xFF);
+        // Nobody holds a reference to anything yet. Frames the allocator never
+        // hands out — the kernel image, this table, low memory — stay at zero
+        // for the life of the system, which is what makes an accidental
+        // `deallocate_frame` on one of them detectable rather than silent.
+        refcounts.fill(0);
+        
+        serial_println!(
+            "  frame metadata  : bitmap {} bytes + refcounts {} bytes at 0x{:x}",
+            bitmap_size,
+            refcount_size,
+            bitmap_start
+        );
         
         // The bitmap is filled with 0xFF above, i.e. every frame starts out
         // marked used. The counters have to agree with that, otherwise the
@@ -175,6 +222,7 @@ impl PhysicalMemoryManager {
             used_frames: total_frames,
             reserved_frames: 0,
             bitmap_start,
+            refcounts,
         };
         
         // Mark available memory areas as free
@@ -218,7 +266,7 @@ impl PhysicalMemoryManager {
                     if frame_addr < 0x100000
                         || (frame_addr >= kernel_start && frame_addr < kernel_end)
                         || (frame_addr >= self.bitmap_start
-                            && frame_addr < self.bitmap_start + self.bitmap.len())
+                            && frame_addr < self.metadata_end())
                     {
                         self.reserved_frames += 1;
                         continue;
@@ -285,6 +333,8 @@ impl PhysicalMemoryManager {
                         if frame_num < self.total_frames {
                             let frame = PageFrame(frame_num);
                             self.mark_frame_used(frame);
+                            // One owner: whoever asked for it.
+                            self.refcounts[frame_num] = 1;
                             return Some(frame);
                         }
                     }
@@ -334,6 +384,13 @@ impl PhysicalMemoryManager {
     }
     
     /// Deallocate a page frame
+    /// Drop one reference to a frame, freeing it when the last one goes.
+    ///
+    /// Before copy-on-write this unconditionally marked the frame free, which
+    /// was correct because a frame had exactly one owner. After `fork`, two
+    /// address spaces can hold the same frame, and whichever process exits
+    /// first would otherwise hand a page the other is still reading back to the
+    /// allocator.
     pub fn deallocate_frame(&mut self, frame: PageFrame) {
         if frame.0 >= self.total_frames {
             return;
@@ -344,8 +401,70 @@ impl PhysicalMemoryManager {
             serial_println!("Warning: Attempted to free already free frame {}", frame.0);
             return;
         }
-        
-        self.mark_frame_free(frame);
+
+        match self.refcounts[frame.0] {
+            0 => {
+                // A frame the allocator never handed out: the kernel image, the
+                // metadata tables, low memory. Freeing one is a bug in the
+                // caller, and marking it free would put the running kernel's own
+                // pages on the free list.
+                serial_println!(
+                    "Warning: refusing to free frame {} (0x{:x}) — it was never allocated",
+                    frame.0,
+                    frame.address()
+                );
+                return;
+            }
+            1 => {
+                self.refcounts[frame.0] = 0;
+                self.mark_frame_free(frame);
+            }
+            n => {
+                self.refcounts[frame.0] = n - 1;
+            }
+        }
+    }
+
+    /// Take another reference to an already-allocated frame.
+    ///
+    /// Returns the new count, or `None` if the frame was not allocated or the
+    /// count would overflow.
+    pub fn share_frame(&mut self, frame: PageFrame) -> Option<u8> {
+        if frame.0 >= self.total_frames {
+            return None;
+        }
+        let current = self.refcounts[frame.0];
+        if current == 0 || current == u8::MAX {
+            return None;
+        }
+        self.refcounts[frame.0] = current + 1;
+        Some(current + 1)
+    }
+
+    /// End of the frame metadata: the bitmap *and* the refcount table.
+    ///
+    /// The reservation loop used `bitmap_start + bitmap.len()`, which was right
+    /// while the bitmap was the only metadata. Adding the refcount table without
+    /// this made the allocator hand out the frames holding the refcount table,
+    /// which then filled with page data — and `shared_frames()` reported 112,969
+    /// frames shared after a fork of 20 pages, which is how it was noticed.
+    fn metadata_end(&self) -> usize {
+        self.bitmap_start + self.bitmap.len() + self.refcounts.len()
+    }
+
+    /// How many address spaces hold this frame. 0 means the allocator does not
+    /// own it.
+    pub fn frame_refs(&self, frame: PageFrame) -> u8 {
+        if frame.0 >= self.total_frames {
+            return 0;
+        }
+        self.refcounts[frame.0]
+    }
+
+    /// How many frames currently have more than one holder. Diagnostics — it is
+    /// the number that shows copy-on-write is doing anything.
+    pub fn shared_frames(&self) -> usize {
+        self.refcounts.iter().filter(|&&c| c > 1).count()
     }
     
     /// Deallocate multiple contiguous page frames
@@ -462,6 +581,30 @@ pub fn allocate_frames(count: usize) -> Option<PageFrame> {
 }
 
 /// Deallocate a page frame
+/// Take another reference to a frame. See
+/// [`PhysicalMemoryManager::share_frame`].
+pub fn share_frame(frame: PageFrame) -> Option<u8> {
+    PHYSICAL_MEMORY_MANAGER.lock().as_mut()?.share_frame(frame)
+}
+
+/// How many address spaces hold this frame.
+pub fn frame_refs(frame: PageFrame) -> u8 {
+    PHYSICAL_MEMORY_MANAGER
+        .lock()
+        .as_ref()
+        .map(|m| m.frame_refs(frame))
+        .unwrap_or(0)
+}
+
+/// Frames held by more than one address space.
+pub fn shared_frames() -> usize {
+    PHYSICAL_MEMORY_MANAGER
+        .lock()
+        .as_ref()
+        .map(|m| m.shared_frames())
+        .unwrap_or(0)
+}
+
 pub fn deallocate_frame(frame: PageFrame) {
     if let Some(manager) = PHYSICAL_MEMORY_MANAGER.lock().as_mut() {
         manager.deallocate_frame(frame);
@@ -482,7 +625,10 @@ pub fn deallocate_frames(start_frame: PageFrame, count: usize) {
 pub fn bitmap_extent() -> (usize, usize) {
     let guard = PHYSICAL_MEMORY_MANAGER.lock();
     match guard.as_ref() {
-        Some(m) => (m.bitmap_start, m.bitmap_start + m.bitmap.len()),
+        Some(m) => (
+            m.bitmap_start,
+            m.bitmap_start + m.bitmap.len() + m.refcounts.len(),
+        ),
         None => (0, 0),
     }
 }

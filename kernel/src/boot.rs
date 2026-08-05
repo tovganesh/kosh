@@ -856,6 +856,14 @@ fn init_usermode() {
     serial_println!("--- back in ring 0 ---");
     crate::task::reap_finished();
 
+    let (cow_resolved, cow_copied) = crate::memory::paging::cow_stats();
+    serial_println!(
+        "Copy-on-write: {} fault(s) resolved, {} needed a copy, {} frame(s) still shared",
+        cow_resolved,
+        cow_copied,
+        crate::memory::physical::shared_frames()
+    );
+
     let elf_syscalls = crate::syscall::entry::syscall_count() - before_elf;
     if elf_syscalls >= 5 {
         serial_println!(

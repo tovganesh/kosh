@@ -63,10 +63,11 @@ pub fn sys_fork(frame: &SyscallFrame) -> SyscallResult {
     })?;
 
     serial_println!(
-        "Thread {} forking: {} page(s) copied into PML4 0x{:x}",
+        "Thread {} forking: {} page(s) shared copy-on-write into PML4 0x{:x} ({} shared system-wide)",
         parent,
         copied,
-        child_space.pml4_phys()
+        child_space.pml4_phys(),
+        crate::memory::physical::shared_frames()
     );
 
     match crate::task::spawn_forked("forked", frame, child_space) {

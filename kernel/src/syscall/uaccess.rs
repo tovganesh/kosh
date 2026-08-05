@@ -27,7 +27,7 @@ use crate::memory::PAGE_SIZE;
 
 /// First address of the higher (kernel) half. Anything at or above this is
 /// never a valid user pointer.
-const USER_ADDRESS_LIMIT: u64 = 0x0000_8000_0000_0000;
+pub const USER_ADDRESS_LIMIT: u64 = 0x0000_8000_0000_0000;
 
 /// Refuse absurdly large transfers outright rather than walking millions of
 /// page-table entries on behalf of a hostile caller.
@@ -77,7 +77,22 @@ pub fn validate_user_range(ptr: u64, len: usize, writable: bool) -> Result<(), U
                     return Err(UserAccessError::NotUserAccessible);
                 }
                 if writable && !flags.contains(PageTableFlags::WRITABLE) {
-                    return Err(UserAccessError::NotWritable);
+                    // A copy-on-write page is writable — it just needs the copy
+                    // doing first. Resolve it here rather than letting the write
+                    // below fault: `copy_to_user` writes at the *user* address,
+                    // so with CR0.WP set a shared page would trap into the page
+                    // fault handler from ring 0, in the middle of a syscall that
+                    // may be holding locks the handler wants.
+                    //
+                    // Doing it up front turns that into an ordinary function
+                    // call. It also means a failure is reported as an error
+                    // return rather than a fault.
+                    if flags.contains(crate::memory::paging::COPY_ON_WRITE) {
+                        crate::memory::paging::resolve_cow(page)
+                            .map_err(|_| UserAccessError::NotWritable)?;
+                    } else {
+                        return Err(UserAccessError::NotWritable);
+                    }
                 }
             }
             _ => return Err(UserAccessError::NotMapped),

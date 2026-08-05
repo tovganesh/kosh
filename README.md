@@ -64,7 +64,7 @@ test disk, then boots the lot:
 
 ```bash
 ./scripts/run.sh              # boot it, serial on stdio (ctrl-a x to quit)
-./scripts/run.sh --check      # boot headless, assert 44 serial markers (CI)
+./scripts/run.sh --check      # boot headless, assert 47 serial markers (CI)
 ./scripts/run.sh --check-cli  # drive the shell through QEMU's monitor, assert 31
 ./scripts/run.sh --debug      # same as plain run, plus a gdb stub on :1234
 ```
@@ -107,8 +107,11 @@ interaction in `--check-cli`.
 - **Per-process address spaces**: a PML4 each, kernel's upper half shared. Two
   programs can be — and `hello`, `hello2` and `ksh` all are — linked at the
   same address
-- **`fork` and `exec`**: the child returns from a syscall it never executed,
-  into its own copy of the parent's memory; `exec` replaces the whole image
+- **`fork` and `exec`**: the child returns from a syscall it never executed;
+  `exec` replaces the whole image
+- **Copy-on-write**: a `fork` copies no page data at all. Both sides go
+  read-only, the frame reference count goes up, and the first write from either
+  side faults into a private copy
 - **Per-thread kernel stacks**, so more than one thread can be inside a syscall
 - Real blocking: `wait` parks a thread in `State::Blocked` rather than spinning
 
@@ -161,14 +164,11 @@ all 5 IPC calls · all 4 driver calls · all 4 capability calls · `uname`
 Being explicit about this, because the earlier version of this file claimed most
 of it.
 
-- **`fork` copies eagerly.** Every owned page is duplicated immediately rather
-  than shared copy-on-write. That is correct `fork` semantics at the cost of one
-  memcpy per page — forking `ksh` copies about 400 KiB — and it is deliberate:
-  copy-on-write needs a per-frame reference count, and getting that wrong
-  produces double frees that surface somewhere unrelated, much later.
-- **No demand paging.** Every page of a program is populated at load time, so
-  `ksh`'s 256 KiB `.bss` costs 65 frames whether it is touched or not — and a
-  `fork` copies all 65.
+- **No demand paging.** Every page of a program is allocated and populated at
+  load time, so `ksh`'s 256 KiB `.bss` costs 65 frames whether it is touched or
+  not. Copy-on-write means a `fork` no longer *copies* those 65, but the program
+  still pays for them at load. `mmap` has the same problem: it allocates the
+  whole span up front.
 - **No `argv`.** `exec` takes a program name and nothing else; passing arguments
   needs somewhere to put the strings in the new address space.
 - **The filesystem is read-only.** `ksh` refuses redirection rather than
@@ -247,8 +247,8 @@ Roughly in order, each unblocking the next:
 - [x] A shell in userspace that can launch programs
 - [x] Per-process address spaces
 - [x] `fork` and `exec`
-- [ ] Copy-on-write and demand paging, so a `fork` costs a page table rather
-      than a program
+- [x] Copy-on-write, so a `fork` costs a page table rather than a program
+- [ ] Demand paging, so an untouched `.bss` costs nothing at all
 - [ ] One process-id namespace, so the IPC and capability machinery becomes
       reachable from ring 3
 - [ ] Move the disk and filesystem out of the kernel — the point of the whole
