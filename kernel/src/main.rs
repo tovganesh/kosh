@@ -23,13 +23,11 @@ mod gdt;
 #[cfg(target_arch = "x86_64")]
 mod percpu;
 #[cfg(target_arch = "x86_64")]
-mod block;
 #[cfg(target_arch = "x86_64")]
 mod console;
 #[cfg(target_arch = "x86_64")]
 mod elf;
 #[cfg(target_arch = "x86_64")]
-mod fs;
 #[cfg(target_arch = "x86_64")]
 mod usermode;
 #[cfg(target_arch = "x86_64")]

@@ -60,13 +60,9 @@ pub fn execute(line: &str, cwd: &mut String, editor: &LineEditor) {
         "history" => history(editor),
 
         // Filesystem. These exist now because there is a disk underneath them.
-        "ls" | "dir" => ls(cwd, &args, arg_count),
-        "cd" => cd(cwd, &args, arg_count),
-        "pwd" => out!("{}", cwd),
-        "cat" => cat(cwd, &args, arg_count),
-        "stat" => stat(cwd, &args, arg_count),
-        "lsblk" => lsblk(),
-        "df" | "mount" => df(),
+        "ls" | "cd" | "pwd" | "cat" | "stat" | "lsblk" | "df" | "mount" => {
+            out!("{}: the kernel has no filesystem — run it from ksh", command);
+        }
 
         "fault" => fault(&args, arg_count),
 
@@ -99,13 +95,10 @@ fn help() {
     out!("  translate <hex>       walk the page tables for an address");
     out!("  history               previous commands");
     out!();
-    out!("  ls [-a] [path]        list a directory");
+
     out!("  cd <path>             change directory");
     out!("  pwd                   print the working directory");
-    out!("  cat <path>            print a file");
-    out!("  stat <path>           file or directory details");
-    out!("  lsblk                 block devices");
-    out!("  df, mount             mounted filesystem");
+    out!("  (no file commands: the filesystem runs in ring 3, so use ksh)");
     out!();
     out!("  fault <kind>          deliberately fault: null, page, breakpoint");
     out!("  reboot                triple-fault the machine");
@@ -374,256 +367,20 @@ fn reboot() {
 
 
 // --- filesystem ------------------------------------------------------------
-
-/// Turn a user-supplied path into an absolute, normalised one.
-///
-/// Relative paths, `.` and `..` are resolved here rather than in the
-/// filesystem layer: FAT has no notion of a working directory, and neither
-/// should a filesystem driver.
-fn resolve(cwd: &str, arg: &str) -> String {
-    let combined = if arg.starts_with('/') {
-        String::from(arg)
-    } else {
-        let mut s = String::from(cwd);
-        if !s.ends_with('/') {
-            s.push('/');
-        }
-        s.push_str(arg);
-        s
-    };
-
-    let mut parts: Vec<&str> = Vec::new();
-    for component in combined.split('/') {
-        match component {
-            "" | "." => {}
-            ".." => {
-                // `..` at the root stays at the root, as it does everywhere else.
-                parts.pop();
-            }
-            other => parts.push(other),
-        }
-    }
-
-    if parts.is_empty() {
-        return String::from("/");
-    }
-
-    let mut out = String::new();
-    for part in parts {
-        out.push('/');
-        out.push_str(part);
-    }
-    out
-}
-
-fn require_fs() -> bool {
-    if crate::fs::is_mounted() {
-        return true;
-    }
-    out!("no filesystem mounted");
-    out!("(attach a disk: -drive file=disk.img,format=raw,if=ide,index=0,media=disk)");
-    false
-}
-
-fn ls(cwd: &str, args: &[&str; 8], count: usize) {
-    if !require_fs() {
-        return;
-    }
-
-    // Only one flag so far, so this stays a simple scan rather than a parser.
-    let mut show_all = false;
-    let mut target: Option<&str> = None;
-    for i in 0..count {
-        match args[i] {
-            "-a" | "--all" => show_all = true,
-            other if other.starts_with('-') => {
-                out!("ls: unknown option {}", other);
-                return;
-            }
-            other => target = Some(other),
-        }
-    }
-
-    let path = match target {
-        Some(t) => resolve(cwd, t),
-        None => String::from(cwd),
-    };
-
-    match crate::fs::read_dir(&path) {
-        Ok(entries) => {
-            let mut shown = 0;
-            let mut bytes = 0u64;
-
-            for entry in entries.iter() {
-                if !show_all && (entry.name == "." || entry.name == "..") {
-                    continue;
-                }
-
-                out!(
-                    "{}{}{:>10}  {}",
-                    if entry.is_dir { "d" } else { "-" },
-                    if entry.is_read_only() { "r-" } else { "rw" },
-                    if entry.is_dir {
-                        String::from("-")
-                    } else {
-                        let mut s = String::new();
-                        use core::fmt::Write;
-                        let _ = write!(s, "{}", entry.size);
-                        s
-                    },
-                    entry.name
-                );
-
-                shown += 1;
-                bytes += entry.size as u64;
-            }
-
-            out!();
-            out!(
-                "{} {}, {} bytes",
-                shown,
-                if shown == 1 { "entry" } else { "entries" },
-                bytes
-            );
-        }
-        Err(e) => out!("ls: {}: {}", path, describe_error(e)),
-    }
-}
-
-fn cd(cwd: &mut String, args: &[&str; 8], count: usize) {
-    if !require_fs() {
-        return;
-    }
-
-    // Bare `cd` goes to the root, since there are no home directories.
-    let target = if count == 0 { "/" } else { args[0] };
-    let path = resolve(cwd, target);
-
-    match crate::fs::lookup(&path) {
-        Ok(entry) if entry.is_dir => {
-            *cwd = path;
-        }
-        Ok(_) => out!("cd: {}: not a directory", path),
-        Err(e) => out!("cd: {}: {}", path, describe_error(e)),
-    }
-}
-
-/// Largest file `cat` will print. Big enough for anything on the test image,
-/// small enough that a stray `cat` of a huge file does not lock up the console
-/// for a minute of PIO reads.
-const CAT_LIMIT: usize = 64 * 1024;
-
-fn cat(cwd: &str, args: &[&str; 8], count: usize) {
-    if !require_fs() {
-        return;
-    }
-    if count == 0 {
-        out!("usage: cat <path>");
-        return;
-    }
-
-    for i in 0..count {
-        let path = resolve(cwd, args[i]);
-
-        match crate::fs::read_file(&path, CAT_LIMIT) {
-            Ok(bytes) => {
-                if bytes.is_empty() {
-                    continue;
-                }
-
-                // Print a line at a time. Character by character would be two
-                // lock acquisitions and a format call per byte, which is
-                // painfully slow for anything but the smallest file.
-                let mut line = String::new();
-                let mut binary = 0usize;
-
-                for &b in bytes.iter() {
-                    match b {
-                        b'\n' => {
-                            out!("{}", line);
-                            line.clear();
-                        }
-                        b'\r' => {}
-                        b'\t' => line.push('\t'),
-                        0x20..=0x7e => line.push(b as char),
-                        _ => {
-                            binary += 1;
-                            line.push('.');
-                        }
-                    }
-                }
-                if !line.is_empty() {
-                    out!("{}", line);
-                }
-
-                if binary > 0 {
-                    out!("[{} non-printable byte(s) shown as '.']", binary);
-                }
-                if bytes.len() == CAT_LIMIT {
-                    out!("[truncated at {} bytes]", CAT_LIMIT);
-                }
-            }
-            Err(e) => out!("cat: {}: {}", path, describe_error(e)),
-        }
-    }
-}
-
-fn stat(cwd: &str, args: &[&str; 8], count: usize) {
-    if !require_fs() {
-        return;
-    }
-    if count == 0 {
-        out!("usage: stat <path>");
-        return;
-    }
-
-    let path = resolve(cwd, args[0]);
-    match crate::fs::lookup(&path) {
-        Ok(entry) => {
-            out!("{}", path);
-            out!("  name          {}", entry.name);
-            out!("  type          {}", if entry.is_dir { "directory" } else { "file" });
-            out!("  size          {} bytes", entry.size);
-            out!("  first cluster {}", entry.first_cluster);
-            out!("  attributes    0x{:02x}{}", entry.attributes,
-                 if entry.is_read_only() { " (read-only)" } else { "" });
-        }
-        Err(e) => out!("stat: {}: {}", path, describe_error(e)),
-    }
-}
-
-fn lsblk() {
-    match crate::block::with_device(|d| (String::from(d.name()), d.block_count())) {
-        Some((name, blocks)) => {
-            out!(
-                "{}  {} blocks x {} bytes  ({} MB)",
-                name,
-                blocks,
-                crate::block::BLOCK_SIZE,
-                blocks * crate::block::BLOCK_SIZE as u64 / (1024 * 1024)
-            );
-        }
-        None => out!("no block devices"),
-    }
-}
-
-fn df() {
-    match crate::fs::describe() {
-        Some(d) => out!("{}", d),
-        None => out!("nothing mounted"),
-    }
-}
-
-fn describe_error(e: crate::fs::fat32::FsError) -> &'static str {
-    use crate::fs::fat32::FsError;
-    match e {
-        FsError::NotFound => "no such file or directory",
-        FsError::NotADirectory => "not a directory",
-        FsError::IsADirectory => "is a directory",
-        FsError::NotFat32 => "not a FAT32 filesystem",
-        FsError::BadGeometry(why) => why,
-        FsError::CorruptChain => "corrupt cluster chain",
-        FsError::NameTooLong => "name too long",
-        FsError::Block(_) => "disk read error",
-    }
-}
+// The filesystem commands — `ls`, `cd`, `pwd`, `cat`, `stat`, `lsblk`, `df` —
+// used to live here, 250 lines of them reading `crate::fs` directly.
+//
+// They are gone, and not because the console got smaller. The kernel no longer
+// contains a filesystem or a disk driver, so there is nothing here for them to
+// read: `ksh` gets its files by messaging `userspace/fs-service`, which gets its
+// sectors by messaging `userspace/ata-driver`.
+//
+// The obvious repair — make this console an IPC client too — does not work, and
+// the reason is the interesting part. This console runs *because userspace has
+// stopped*: it takes the keyboard when `init` exits. At that moment there is no
+// `fs` service to ask. A fallback shell that can only work when the thing it is
+// a fallback for is running is not a fallback.
+//
+// So the disk commands moved to `ksh`, where the services exist, and what is
+// left here is what the kernel actually knows: its own memory, its own threads,
+// its own interrupt counts. That is a smaller console and a more honest one.

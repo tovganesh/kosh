@@ -109,6 +109,7 @@ const FS_OP_READ: u32 = 2;
 const FS_OP_LSEEK: u32 = 3;
 const FS_OP_STAT: u32 = 4;
 const FS_OP_GETDENTS: u32 = 5;
+const FS_OP_STATFS: u32 = 7;
 
 const FS_REQ_HEADER: usize = 40;
 const FS_REP_HEADER: usize = 24;
@@ -307,6 +308,24 @@ pub fn getdents(path: &str, out: &mut [RawDirEntry]) -> i64 {
     }
 
     filled as i64
+}
+
+/// A description of the mounted volume and the disk under it.
+///
+/// The service returns text, and this returns text. `df` used to be an in-kernel
+/// console command reading `crate::fs::describe()`; the kernel has no filesystem
+/// now, so the only process that can answer is the one that mounted it.
+pub fn statfs(out: &mut [u8]) -> i64 {
+    let (status, len, _, _) = fs_call(FS_OP_STATFS, 0, 0, 0, 0, "");
+    if status < 0 {
+        return status as i64;
+    }
+    let n = core::cmp::min(len, out.len());
+    unsafe {
+        let reply = &*core::ptr::addr_of!(FS_REPLY);
+        out[..n].copy_from_slice(&reply[FS_REP_HEADER..FS_REP_HEADER + n]);
+    }
+    n as i64
 }
 
 pub fn stat(path: &str, out: &mut RawDirEntry) -> i64 {
