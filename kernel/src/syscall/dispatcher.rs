@@ -98,6 +98,8 @@ pub fn dispatch_syscall(
         SYS_DRIVER_RESPONSE => sys_driver_response(process_id, args),
         SYS_REQUEST_DEVICE => sys_request_device(process_id, args),
         SYS_RELEASE_DEVICE => sys_release_device(process_id, args),
+        SYS_REGISTER_SERVICE => sys_register_service(process_id, args),
+        SYS_LOOKUP_SERVICE => sys_lookup_service(process_id, args),
         
         // System information
         SYS_GETDENTS => crate::syscall::files::sys_getdents(args),
@@ -913,6 +915,48 @@ fn sys_driver_response(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
     
     // TODO: Implement driver response
     Err(SyscallError::NotSupported)
+}
+
+/// Longest service name, matching `ipc::services`.
+const MAX_SERVICE_NAME: usize = 16;
+
+/// Read a service name out of userspace.
+fn service_name_arg(args: [u64; 6], buf: &mut [u8; MAX_SERVICE_NAME]) -> Result<usize, SyscallError> {
+    let len = args[1] as usize;
+    if len == 0 || len > MAX_SERVICE_NAME {
+        return Err(SyscallError::InvalidArgument);
+    }
+    crate::syscall::uaccess::copy_from_user(args[0], &mut buf[..len])
+        .map_err(|_| SyscallError::InvalidArgument)?;
+    core::str::from_utf8(&buf[..len]).map_err(|_| SyscallError::InvalidArgument)?;
+    Ok(len)
+}
+
+/// `register_service(name_ptr, name_len)` -> 0
+fn sys_register_service(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
+    use crate::ipc::services::ServiceError;
+
+    let mut buf = [0u8; MAX_SERVICE_NAME];
+    let len = service_name_arg(args, &mut buf)?;
+    let name = core::str::from_utf8(&buf[..len]).unwrap();
+
+    crate::ipc::services::register(name, process_id).map_err(|e| match e {
+        ServiceError::NameTaken => SyscallError::AlreadyExists,
+        ServiceError::TableFull => SyscallError::ResourceExhausted,
+        _ => SyscallError::InvalidArgument,
+    })?;
+    Ok(0)
+}
+
+/// `lookup_service(name_ptr, name_len)` -> pid
+fn sys_lookup_service(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
+    let mut buf = [0u8; MAX_SERVICE_NAME];
+    let len = service_name_arg(args, &mut buf)?;
+    let name = core::str::from_utf8(&buf[..len]).unwrap();
+
+    let pid = crate::ipc::services::lookup(name, process_id)
+        .map_err(|_| SyscallError::NotFound)?;
+    Ok(pid.0 as u64)
 }
 
 /// Longest device name `request_device` will look at.

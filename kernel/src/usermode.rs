@@ -61,7 +61,7 @@ impl BootModule {
     }
 }
 
-const MAX_BOOT_MODULES: usize = 6;
+const MAX_BOOT_MODULES: usize = 8;
 static BOOT_MODULES: Mutex<[Option<BootModule>; MAX_BOOT_MODULES]> =
     Mutex::new([None; MAX_BOOT_MODULES]);
 
@@ -540,6 +540,7 @@ fn deregister_process(thread: usize) {
     // could touch it again until reboot. Surviving a driver crash is most of the
     // argument for running drivers in ring 3 at all.
     crate::platform::devports::release_all(thread);
+    crate::ipc::services::unregister_pid(pid);
 
     let _ = crate::ipc::queue::remove_message_queue(pid);
     let _ = crate::process::remove_process(pid);
@@ -770,9 +771,13 @@ pub fn run_boot_module(_arg: usize) {
     run_module("hello")
 }
 
-/// Load the userspace shell and hand it the console.
-pub fn run_shell(_arg: usize) {
-    run_module("ksh")
+/// Load process 1.
+///
+/// The only program the kernel starts. Everything else — the block driver, the
+/// filesystem, the shell — is `init`'s to spawn, which is what makes the process
+/// tree a tree rather than a list of things the kernel happened to know about.
+pub fn run_init(_arg: usize) {
+    run_module("init")
 }
 
 /// Load a boot module into a fresh address space and enter it.

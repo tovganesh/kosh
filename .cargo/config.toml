@@ -6,3 +6,11 @@ rustflags = ["-C", "code-model=kernel"]
 
 [target.'cfg(target_arch = "aarch64")']
 rustflags = ["-C", "target-feature=+strict-align"]
+# The kernel builds for the built-in x86_64-unknown-none target, which defaults
+# to a position-independent relocation model. The kernel is loaded at one fixed
+# virtual address by a linker script and has no dynamic loader, so PIC gains it
+# nothing and costs it a link error: `R_X86_64_32 cannot be used against local
+# symbol`. The JSON spec userspace uses says the same thing declaratively; a
+# built-in target can only be told from here.
+[target.x86_64-unknown-none]
+rustflags = ["-C", "code-model=kernel", "-C", "relocation-model=static"]

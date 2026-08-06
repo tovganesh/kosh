@@ -83,6 +83,25 @@ pub enum BlockedOn {
     Message(usize),
 }
 
+/// A 512-byte `FXSAVE` area.
+///
+/// 16-byte alignment is architectural, not a preference: `fxsave64` faults on a
+/// misaligned destination.
+#[repr(C, align(16))]
+struct FpuState {
+    data: [u8; 512],
+}
+
+impl FpuState {
+    const fn new() -> Self {
+        Self { data: [0; 512] }
+    }
+
+    fn as_ptr(&mut self) -> *mut u8 {
+        self.data.as_mut_ptr()
+    }
+}
+
 pub struct Thread {
     pub id: usize,
     pub name: &'static str,
@@ -115,6 +134,19 @@ pub struct Thread {
     /// Another thread is in `wait_for` on this one, so `reap_finished` must
     /// leave the slot alone until that waiter has collected the exit code.
     awaited: bool,
+    /// This thread's x87/SSE register file while it is not running.
+    ///
+    /// `kosh_switch_context` saves the callee-saved *general* registers and
+    /// nothing else, which was correct for as long as one ring-3 program ran at
+    /// a time. It stopped being correct the moment the disk driver, the
+    /// filesystem, the shell and a test program were all in ring 3 together:
+    /// the compiler uses xmm registers freely — a 16-byte `movaps` is the
+    /// natural way to write four adjacent `u32`s — so a thread preempted between
+    /// loading a value into xmm0 and storing it got somebody else's xmm0 back.
+    ///
+    /// It presented as a driver whose reply header was zeros while its payload
+    /// was perfect, which is not where anyone looks for a scheduling bug.
+    fpu: FpuState,
     /// Which I/O devices this thread may drive from ring 3.
     ///
     /// A bitmask of `platform::devports::DEVICES` indices, installed into the
@@ -223,6 +255,7 @@ pub fn init() {
             address_space: None,
             exit_code: 0,
             awaited: false,
+            fpu: FpuState::new(),
             io_grant: crate::platform::devports::NO_GRANT,
         });
         sched.current = 0;
@@ -263,6 +296,7 @@ pub fn spawn(name: &'static str, entry: fn(usize), arg: usize) -> Result<usize, 
             address_space: None,
             exit_code: 0,
             awaited: false,
+            fpu: FpuState::new(),
             io_grant: crate::platform::devports::NO_GRANT,
         });
 
@@ -377,6 +411,7 @@ pub fn spawn_forked(
             address_space: Some(space),
             exit_code: 0,
             awaited: false,
+            fpu: FpuState::new(),
             io_grant: crate::platform::devports::NO_GRANT,
         });
 
@@ -503,16 +538,18 @@ pub fn schedule() {
                         .map(|a| a.pml4_phys())
                         .unwrap_or_else(crate::memory::paging::kernel_pml4_phys);
                     let next_io = sched.threads[next].as_ref().unwrap().io_grant;
-                    let prev_rsp = sched.threads[current].as_mut().unwrap().rsp_ptr();
+                    let prev = sched.threads[current].as_mut().unwrap();
+                    let prev_fpu = prev.fpu.as_ptr();
+                    let prev_rsp = prev.rsp_ptr();
 
-                    Some((prev_rsp, next_rsp, next, next_top, next_cr3, next_io))
+                    Some((prev_rsp, prev_fpu, next_rsp, next, next_top, next_cr3, next_io))
                 }
             }
         }
         // lock dropped here, before the switch
     };
 
-    if let Some((prev_rsp, next_rsp, next, next_top, next_cr3, next_io)) = plan {
+    if let Some((prev_rsp, prev_fpu, next_rsp, next, next_top, next_cr3, next_io)) = plan {
         // Before the switch, not after: the incoming thread may resume straight
         // into `sysretq` and be in ring 3 — able to fault or syscall — before
         // any instruction after `kosh_switch_context` in *this* frame runs.
@@ -547,7 +584,20 @@ pub fn schedule() {
             }
         }
 
-        unsafe { kosh_switch_context(prev_rsp, next_rsp) };
+        // The x87/SSE file, which `kosh_switch_context` does not touch.
+        //
+        // Both instructions name the *same* pointer, and that is the whole
+        // trick: this frame belongs to the outgoing thread, so when it is
+        // eventually resumed it comes back to the line after the switch — in its
+        // own frame, with its own `prev_fpu` — and restores what it saved. A
+        // thread that has never been here yet (one just spawned, or a forked
+        // child resuming at `kosh_syscall_return`) simply never executes the
+        // restore, which is why the area needs no valid initial contents.
+        unsafe {
+            core::arch::asm!("fxsave64 [{}]", in(reg) prev_fpu, options(nostack));
+            kosh_switch_context(prev_rsp, next_rsp);
+            core::arch::asm!("fxrstor64 [{}]", in(reg) prev_fpu, options(nostack));
+        }
     }
 
     if saved {

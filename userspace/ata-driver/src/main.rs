@@ -24,6 +24,7 @@ const SYS_WRITE: u64 = 23;
 const SYS_SEND_MESSAGE: u64 = 30;
 const SYS_RECEIVE_MESSAGE: u64 = 31;
 const SYS_REQUEST_DEVICE: u64 = 44;
+const SYS_REGISTER_SERVICE: u64 = 46;
 
 // --- the block protocol ----------------------------------------------------
 //
@@ -74,6 +75,21 @@ unsafe fn syscall3(number: u64, a1: u64, a2: u64, a3: u64) -> i64 {
 
 fn print(s: &str) {
     unsafe { syscall3(SYS_WRITE, 1, s.as_ptr() as u64, s.len() as u64) };
+}
+
+fn print_u64(mut value: u64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    if value == 0 {
+        i -= 1;
+        buf[i] = b'0';
+    }
+    while value > 0 {
+        i -= 1;
+        buf[i] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    unsafe { syscall3(SYS_WRITE, 1, buf[i..].as_ptr() as u64, (buf.len() - i) as u64) };
 }
 
 fn exit(code: u64) -> ! {
@@ -412,7 +428,28 @@ pub extern "C" fn ata_driver_main() -> ! {
 
     print("  ata-driver: IDENTIFY succeeded from ring 3\n");
 
-    // Serve until told to stop. The parent sends OP_SHUTDOWN when it is done,
+    // Claim the name clients look this driver up by.
+    //
+    // After the IDENTIFY, not before: a name in the registry is a promise that
+    // requests will be answered, and a driver that registered first and then
+    // failed to find a disk would have clients blocking on a server that is
+    // about to exit.
+    let service = "block";
+    if unsafe {
+        syscall3(
+            SYS_REGISTER_SERVICE,
+            service.as_ptr() as u64,
+            service.len() as u64,
+            0,
+        )
+    } < 0
+    {
+        print("  ata-driver: could not register as 'block'\n");
+        exit(4);
+    }
+    print("  ata-driver: registered as the 'block' service\n");
+
+    // Serve until told to stop. `init` sends OP_SHUTDOWN when the shell exits,
     // which releases `ata0` and lets the kernel's own block layer have the disk
     // back — see `platform::devports`.
     while serve_one() {}

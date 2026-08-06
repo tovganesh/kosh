@@ -14,6 +14,18 @@ cd "$ROOT"
 
 TARGET_JSON="x86_64-kosh.json"
 TARGET_NAME="x86_64-kosh"
+# The kernel is built for the *built-in* x86_64-unknown-none target, not the
+# JSON one userspace uses. The difference is one line of its spec:
+#
+#     "features": "-mmx,-sse,+soft-float"
+#
+# A kernel compiled with SSE spills xmm registers freely, and the `syscall`
+# instruction preserves nothing — so a ring-3 program holding a value in xmm0
+# across a system call gets it back corrupted. That is not a hypothetical; see
+# docs/BOOT.md. rustc refuses `+soft-float` in a custom target spec ("target
+# feature `soft-float` is incompatible with the ABI"), which is why this is a
+# built-in target rather than another .json beside the first.
+KERNEL_TARGET_NAME="x86_64-unknown-none"
 PROFILE="${PROFILE:-release}"
 BUILD_DIR="$ROOT/build"
 ISO_DIR="$BUILD_DIR/iso"
@@ -44,7 +56,7 @@ need mcopy      "Install mtools (macOS: brew install mtools)"
 # --- build ------------------------------------------------------------------
 
 echo "==> building kernel ($PROFILE)"
-CARGO_FLAGS=(--package kosh-kernel --target "$TARGET_JSON" -Z build-std=core,alloc)
+CARGO_FLAGS=(--package kosh-kernel --target "$KERNEL_TARGET_NAME" -Z build-std=core,alloc)
 [ "$PROFILE" = "release" ] && CARGO_FLAGS+=(--release)
 
 # Nightlies from mid-2025 onwards gate .json target specs behind an unstable
@@ -59,7 +71,7 @@ else
     fi
 fi
 
-KERNEL="$ROOT/target/$TARGET_NAME/$PROFILE/kosh-kernel"
+KERNEL="$ROOT/target/$KERNEL_TARGET_NAME/$PROFILE/kosh-kernel"
 [ -f "$KERNEL" ] || { echo "error: kernel binary not found at $KERNEL" >&2; exit 1; }
 
 # Userspace programs shipped as GRUB modules. These are ordinary static ELF
@@ -69,7 +81,7 @@ echo "==> building userspace programs"
 # libc, and anything that moves a String around needs them.
 USER_STD=(-Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem)
 
-for pkg in kosh-hello kosh-hello2 kosh-ata-driver kosh-shell; do
+for pkg in kosh-hello kosh-hello2 kosh-ata-driver kosh-fs-service kosh-init kosh-shell; do
     USER_FLAGS=(--package "$pkg" --target "$TARGET_JSON" "${USER_STD[@]}")
     [ "$PROFILE" = "release" ] && USER_FLAGS+=(--release)
     cargo build "${USER_FLAGS[@]}" -Z json-target-spec 2>/dev/null \
@@ -79,8 +91,10 @@ done
 HELLO="$ROOT/target/$TARGET_NAME/$PROFILE/kosh-hello"
 HELLO2="$ROOT/target/$TARGET_NAME/$PROFILE/kosh-hello2"
 ATADRV="$ROOT/target/$TARGET_NAME/$PROFILE/kosh-ata-driver"
+FSSVC="$ROOT/target/$TARGET_NAME/$PROFILE/kosh-fs-service"
+INIT="$ROOT/target/$TARGET_NAME/$PROFILE/kosh-init"
 KSH="$ROOT/target/$TARGET_NAME/$PROFILE/ksh"
-for bin in "$HELLO" "$HELLO2" "$ATADRV" "$KSH"; do
+for bin in "$HELLO" "$HELLO2" "$ATADRV" "$FSSVC" "$INIT" "$KSH"; do
     [ -f "$bin" ] || { echo "error: userspace binary not found at $bin" >&2; exit 1; }
     echo "==> $(basename "$bin"): entry $(readelf -h "$bin" | awk '/Entry point/ {print $4}')"
 done
@@ -106,6 +120,8 @@ cp "$KERNEL" "$ISO_DIR/boot/kosh-kernel"
 cp "$HELLO" "$ISO_DIR/boot/hello"
 cp "$HELLO2" "$ISO_DIR/boot/hello2"
 cp "$ATADRV" "$ISO_DIR/boot/ata-driver"
+cp "$FSSVC" "$ISO_DIR/boot/fs-service"
+cp "$INIT"  "$ISO_DIR/boot/init"
 cp "$KSH"   "$ISO_DIR/boot/ksh"
 
 cat > "$ISO_DIR/boot/grub/grub.cfg" <<'EOF'
@@ -126,6 +142,8 @@ menuentry "Kosh" {
     module2 /boot/hello hello
     module2 /boot/hello2 hello2
     module2 /boot/ata-driver ata-driver
+    module2 /boot/fs-service fs-service
+    module2 /boot/init init
     module2 /boot/ksh ksh
     boot
 }
@@ -264,13 +282,16 @@ check)
         "CLOCK_MONOTONIC moves forwards" \
         "debug_print echoed my message" \
         "I/O bitmap at TSS+" \
+        "no block service here, disk test not exercised" \
+        "init: kosh userspace starting" \
         "ata-driver: got the ata0 ports" \
+        "registered as the 'block' service" \
+        "service 'block' registered by process" \
+        "fs-service: mounted" \
+        "service 'fs' registered by process" \
+        "init: userspace is up, handing the console to ksh" \
         "the kernel's own ATA driver now refuses ata0" \
         "IDENTIFY succeeded from ring 3" \
-        "a FAT32 boot sector, signature and all" \
-        "a second sector read back different bytes" \
-        "refused a read past the end of the disk" \
-        "driver exited and gave ata0 back" \
         "killed for touching its ports" \
         "child: I inherited the value my parent set before forking" \
         "child: my copy of the witness is mine" \
@@ -289,7 +310,7 @@ check)
         "Filesystem: PASS" \
         "Kernel initialization complete" \
         "supervisor started on its own thread" \
-        "starting the userspace shell" \
+        "starting userspace at init" \
         "ksh: the Kosh shell, in ring 3"
     do
         if grep -qF "$marker" "$SERIAL" 2>/dev/null; then
@@ -454,11 +475,16 @@ check-cli)
         "background" \
         "hello2 here: exec replaced the whole image" \
         "child: messaging my grandparent was refused" \
+        "found the 'block' service, which is not my parent or my child" \
         "the ring-3 driver identified a disk of" \
         "read LBA 0 in ring 3: a FAT32 boot sector" \
+        "a second sector read back different bytes" \
+        "the driver refused a read past the end of the disk" \
         "killed for touching its ports" \
         "ksh: exiting" \
-        "ksh exited with code 0, falling back to the kernel console" \
+        "init: ksh exited with 0, shutting the services down" \
+        "init: services stopped, exiting" \
+        "init exited with code 0, falling back to the kernel console" \
         "Kosh console" \
         "Kosh 0.1.0 x86_64" \
         "physical memory:" \
