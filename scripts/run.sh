@@ -290,7 +290,6 @@ check)
         "fs-service: mounted" \
         "service 'fs' registered by process" \
         "init: userspace is up, handing the console to ksh" \
-        "the kernel's own ATA driver now refuses ata0" \
         "IDENTIFY succeeded from ring 3" \
         "killed for touching its ports" \
         "child: I inherited the value my parent set before forking" \
@@ -306,8 +305,6 @@ check)
         "capability check not exercised" \
         "seconds since the epoch" \
         "ELF loader: PASS" \
-        "Storage: PASS" \
-        "Filesystem: PASS" \
         "Kernel initialization complete" \
         "supervisor started on its own thread" \
         "starting userspace at init" \
@@ -421,6 +418,7 @@ check-cli)
         # the pipe path is checked by running the tokenizer directly instead of
         # by typing one.
         type_line "parsetest"
+        type_line "df"
         type_line "history"
 
         # Leaving ksh must hand the console back to the kernel, which is both a
@@ -429,11 +427,13 @@ check-cli)
         sleep 2
 
         # --- the in-kernel debug console ---
+        # No file commands here any more: the kernel has no filesystem, and this
+        # console only runs *because* userspace has stopped, so it cannot ask the
+        # fs service either. `df` above is the ksh one.
         type_line "uname"
         type_line "mem"
         type_line "ps"
-        type_line "lsblk"
-        type_line "df"
+        type_line "ls"
         sleep 1
         echo quit
     # 240s, not 180: the session now also spawns a disk driver twice and waits
@@ -490,6 +490,7 @@ check-cli)
         "physical memory:" \
         "context switches since boot" \
         "QEMU HARDDISK" \
+        "the kernel has no filesystem" \
         "FAT32 'KOSHDISK'"
     do
         if grep -qF "$(printf '%b' "$marker")" "$SERIAL" 2>/dev/null; then

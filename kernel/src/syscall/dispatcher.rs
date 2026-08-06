@@ -73,16 +73,8 @@ pub fn dispatch_syscall(
         SYS_SBRK => sys_sbrk(process_id, args),
         
         // File system
-        SYS_OPEN => crate::syscall::files::sys_open(args),
-        SYS_CLOSE => crate::syscall::files::sys_close(args),
         SYS_READ => crate::syscall::files::sys_read(args),
         SYS_WRITE => sys_write(process_id, args),
-        SYS_LSEEK => crate::syscall::files::sys_lseek(args),
-        SYS_STAT => crate::syscall::files::sys_stat(args),
-        SYS_FSTAT => sys_fstat(process_id, args),
-        SYS_MKDIR => sys_mkdir(process_id, args),
-        SYS_RMDIR => sys_rmdir(process_id, args),
-        SYS_UNLINK => sys_unlink(process_id, args),
         
         // IPC
         SYS_SEND_MESSAGE => sys_send_message(process_id, args),
@@ -102,7 +94,6 @@ pub fn dispatch_syscall(
         SYS_LOOKUP_SERVICE => sys_lookup_service(process_id, args),
         
         // System information
-        SYS_GETDENTS => crate::syscall::files::sys_getdents(args),
         SYS_UNAME => sys_uname(process_id, args),
         SYS_SYSINFO => sys_sysinfo(process_id, args),
         SYS_TIME => sys_time(process_id, args),
@@ -163,23 +154,10 @@ fn sys_exit(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
         exit_code
     );
 
-    // The descriptor table is global — one table for the whole system, because
-    // there is no per-process state to hang one off. So closing everything is
-    // only safe when this is the last program running; otherwise a short-lived
-    // program exiting would close the shell's open files behind its back.
-    #[cfg(target_arch = "x86_64")]
-    let last_program = crate::usermode::resident_count() <= 1;
-    #[cfg(not(target_arch = "x86_64"))]
-    let last_program = true;
-
-    if last_program {
-        crate::syscall::files::close_all();
-    } else {
-        serial_println!(
-            "  (leaving {} open file(s) alone: another program is still resident)",
-            crate::syscall::files::open_count()
-        );
-    }
+    // Nothing to close. The global descriptor table this used to tear down went
+    // with the in-kernel filesystem; an open file is now the `fs` service's
+    // bookkeeping, and it is that service's job to notice a client that stopped
+    // talking to it.
 
     // Actually terminate. The ring-3 program runs on a kernel thread, so
     // retiring that thread is the exit: `exit_current` marks it finished and
@@ -1022,21 +1000,11 @@ fn sys_request_device(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
         device.description
     );
 
-    // A claim nothing enforces is a comment. Check it here, at the moment the
-    // claim is taken, rather than trusting that `block/ata.rs` consults the
-    // table: `probe` refuses before it touches a single port, so asking is safe
-    // even with a driver mid-command.
-    #[cfg(target_arch = "x86_64")]
-    if device.name == "ata0" {
-        use crate::block::ata::{AtaDisk, Channel, Drive};
-        use crate::block::BlockError;
-        match AtaDisk::probe(Channel::Primary, Drive::Master) {
-            Err(BlockError::ClaimedByUserspace) => {
-                serial_println!("  the kernel's own ATA driver now refuses ata0")
-            }
-            _ => serial_println!("  WARNING: the kernel's ATA driver still drives ata0"),
-        }
-    }
+    // The claim used to be checked here against the kernel's own ATA driver,
+    // which stood aside while a ring-3 driver held the channel. There is no
+    // kernel ATA driver any more, so the claim's only remaining job is to stop
+    // two *ring-3* drivers from taking the same device — which `devports::claim`
+    // above already refused.
 
     Ok(0)
 }
@@ -1249,10 +1217,6 @@ fn sys_debug_dump(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
             );
         }
         DUMP_FILES => {
-            serial_println!("DUMP[{}] {} open file(s):", process_id.0, crate::syscall::files::open_count());
-            crate::syscall::files::describe_open(|fd, path, size, offset| {
-                serial_println!("  fd {} {} ({} bytes, at {})", fd, path, size, offset);
-            });
         }
         _ => return Err(SyscallError::InvalidArgument),
     }

@@ -254,7 +254,8 @@ fn cmd_help() {
     println("  cat <path>            print a file");
     println("  cd <path>             change directory");
     println("  pwd                   print the working directory");
-    println("  stat <path>           file details");
+    println("  stat <path>           file details
+  df, lsblk, mount      the mounted filesystem and its disk");
     println("  history               previous commands");
     println("  parsetest             run the tokenizer over sample inputs");
     println("  date                  the wall clock, from the RTC");
@@ -392,6 +393,25 @@ fn cmd_stat(cwd: &str, args: &[String]) {
     print("  size  ");
     print_u64(info.size as u64);
     println(" bytes");
+}
+
+/// The mounted filesystem and the disk under it.
+///
+/// This was two commands in the in-kernel console — `df` read `crate::fs` and
+/// `lsblk` read `crate::block`. Neither module exists any more, and from here
+/// they are one question with one answer, because the only process that knows
+/// either is the one that mounted the volume.
+fn cmd_df() {
+    let mut buf = [0u8; 256];
+    let n = sys::statfs(&mut buf);
+    if n < 0 {
+        println("df: the fs service did not answer");
+        return;
+    }
+    match core::str::from_utf8(&buf[..n as usize]) {
+        Ok(text) => println(text),
+        Err(_) => println("df: the fs service answered with something unreadable"),
+    }
 }
 
 fn cmd_history(history: &CommandHistory) {
@@ -702,6 +722,7 @@ pub extern "C" fn ksh_main() -> ! {
             "cd" => cmd_cd(&mut cwd, &parsed.args),
             "pwd" => println(&cwd),
             "stat" => cmd_stat(&cwd, &parsed.args),
+            "df" | "mount" | "lsblk" => cmd_df(),
             "history" => cmd_history(&history),
             "parsetest" => cmd_parsetest(&parser),
             "date" => cmd_date(),

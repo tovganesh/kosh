@@ -30,14 +30,8 @@ pub fn validate_syscall_args(
         SYS_MPROTECT => validate_mprotect_args(args),
         SYS_BRK | SYS_SBRK => validate_brk_args(args),
         
-        SYS_OPEN => validate_open_args(process_id, args),
-        SYS_CLOSE => validate_close_args(args),
         SYS_READ => validate_read_args(process_id, args),
         SYS_WRITE => validate_write_args(process_id, args),
-        SYS_LSEEK => validate_lseek_args(args),
-        SYS_STAT | SYS_FSTAT => validate_stat_args(process_id, args),
-        SYS_MKDIR => validate_mkdir_args(process_id, args),
-        SYS_RMDIR | SYS_UNLINK => validate_unlink_args(process_id, args),
         
         SYS_SEND_MESSAGE => validate_send_message_args(process_id, args),
         SYS_RECEIVE_MESSAGE => validate_receive_message_args(process_id, args),
@@ -60,8 +54,6 @@ pub fn validate_syscall_args(
         SYS_CHECK_CAPABILITY => validate_check_capability_args(process_id, args),
         SYS_LIST_CAPABILITIES => validate_list_capabilities_args(args),
         
-        SYS_GETDENTS => validate_getdents_args(process_id, args),
-
         SYS_DEBUG_PRINT => validate_debug_print_args(args),
         SYS_DEBUG_DUMP => validate_debug_dump_args(args),
         
@@ -260,46 +252,6 @@ fn validate_brk_args(args: &[u64; 6]) -> Result<(), SyscallError> {
     Ok(())
 }
 
-// File system syscall validations
-fn validate_open_args(process_id: ProcessId, args: &[u64; 6]) -> Result<(), SyscallError> {
-    let path_ptr = args[0];
-    let flags = args[1];
-    let mode = args[2];
-    
-    validate_user_string(process_id, path_ptr, 4096)?;
-    
-    // Basic flag validation
-    if flags > 0xFFFF {
-        return Err(SyscallError::InvalidArgument);
-    }
-    
-    Ok(())
-}
-
-fn validate_getdents_args(process_id: ProcessId, args: &[u64; 6]) -> Result<(), SyscallError> {
-    let path_ptr = args[0];
-    let path_len = args[1];
-    let buf_ptr = args[2];
-    let buf_len = args[3];
-
-    if path_len == 0 || path_len > 4096 {
-        return Err(SyscallError::InvalidArgument);
-    }
-    validate_user_pointer(process_id, path_ptr, path_len as usize, false)?;
-
-    if buf_len == 0 {
-        return Err(SyscallError::InvalidArgument);
-    }
-    validate_user_pointer(process_id, buf_ptr, buf_len as usize, true)?;
-
-    Ok(())
-}
-
-fn validate_close_args(args: &[u64; 6]) -> Result<(), SyscallError> {
-    let fd = args[0];
-    validate_file_descriptor(fd)
-}
-
 fn validate_read_args(process_id: ProcessId, args: &[u64; 6]) -> Result<(), SyscallError> {
     let fd = args[0];
     let buf_ptr = args[1];
@@ -328,55 +280,6 @@ fn validate_write_args(process_id: ProcessId, args: &[u64; 6]) -> Result<(), Sys
     }
     
     Ok(())
-}
-
-fn validate_lseek_args(args: &[u64; 6]) -> Result<(), SyscallError> {
-    let fd = args[0];
-    let offset = args[1];
-    let whence = args[2];
-    
-    validate_file_descriptor(fd)?;
-    
-    // Validate whence parameter (SEEK_SET, SEEK_CUR, SEEK_END)
-    if whence > 2 {
-        return Err(SyscallError::InvalidArgument);
-    }
-    
-    Ok(())
-}
-
-fn validate_stat_args(process_id: ProcessId, args: &[u64; 6]) -> Result<(), SyscallError> {
-    // ABI: (path_ptr, path_len, out_ptr). This used to validate args[1] as a
-    // 144-byte writable buffer — but args[1] is the path *length*, so it was
-    // checking whether the address `9` (or whatever the path length happened to
-    // be) was mapped. It never is: that is page 0, the null guard. Every stat
-    // call failed with InvalidArgument before its handler ran, while open and
-    // getdents — whose validators happen to match their ABIs — worked.
-    let path_ptr = args[0];
-    let path_len = args[1];
-    let out_ptr = args[2];
-
-    if path_len == 0 || path_len > 4096 {
-        return Err(SyscallError::InvalidArgument);
-    }
-    validate_user_pointer(process_id, path_ptr, path_len as usize, false)?;
-    validate_user_pointer(process_id, out_ptr, core::mem::size_of::<crate::syscall::files::UserDirEntry>(), true)?;
-
-    Ok(())
-}
-
-fn validate_mkdir_args(process_id: ProcessId, args: &[u64; 6]) -> Result<(), SyscallError> {
-    let path_ptr = args[0];
-    let mode = args[1];
-    
-    validate_user_string(process_id, path_ptr, 4096)?;
-    
-    Ok(())
-}
-
-fn validate_unlink_args(process_id: ProcessId, args: &[u64; 6]) -> Result<(), SyscallError> {
-    let path_ptr = args[0];
-    validate_user_string(process_id, path_ptr, 4096)
 }
 
 // IPC syscall validations

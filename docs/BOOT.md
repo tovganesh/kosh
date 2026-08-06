@@ -2077,6 +2077,91 @@ through `fs`, and the kernel's own copies serve the boot-time probe and the
 console's `df` and `lsblk`. Deleting them means teaching the in-kernel console to
 be an IPC client too, which is the next piece of work rather than this one.
 
+## The kernel forgets how to read a disk (Phase 20)
+
+Phase 19 moved FAT32 to ring 3 and left the kernel's copy in place, because the
+in-kernel console's `df` and `lsblk` still read it. Both are gone now, along with
+the block layer, the ATA driver, the descriptor table and six system calls —
+2,071 lines deleted against 164 added.
+
+### What went
+
+| removed | lines |
+|---|---|
+| `kernel/src/fs/` (mod + fat32) | 854 |
+| `kernel/src/block/` (mod + ata) | 452 |
+| `kernel/src/syscall/files.rs`, all but console input and one helper | 244 |
+| `kernel/src/console/commands.rs`, the file commands | ~250 |
+| `SYS_OPEN` `SYS_CLOSE` `SYS_LSEEK` `SYS_STAT` `SYS_FSTAT` `SYS_MKDIR` `SYS_RMDIR` `SYS_UNLINK` `SYS_GETDENTS` and their validators | — |
+
+The syscall numbers are *gone*, not refusing. A number that exists and always
+fails is a worse answer than one that does not exist: it invites a caller to
+handle an error that will never succeed on retry, and it makes the syscall table
+a museum. `read` survives, because `read(0, …)` is the keyboard, and the keyboard
+is one of the two devices still inside the kernel — the timer is the other.
+
+`path_from_user` survives too, and for a reason worth separating from the rest:
+`spawn` and `exec` take a *boot-module* name. That is a string from userspace,
+and it never had anything to do with a filesystem.
+
+### The fallback console cannot be an IPC client
+
+The obvious repair for `df` and `lsblk` was to make the in-kernel console talk to
+the `fs` service like everything else. It does not work, and the reason is the
+useful part.
+
+That console runs **because userspace has stopped**. It takes the keyboard when
+`init` exits. At that moment there is no `fs` service to ask, and no `block`
+service under it. A fallback shell that only works while the thing it is a
+fallback for is running is not a fallback.
+
+So the disk commands moved to `ksh`, where the services exist, and the kernel
+console now says so:
+
+```
+kosh> ls
+ls: the kernel has no filesystem — run it from ksh
+```
+
+What is left in it is what the kernel actually knows: its own memory, its own
+threads, its own interrupt counts. A smaller console, and a more honest one.
+
+### `df` and `lsblk` became one command
+
+They were two because the kernel had two modules. From ring 3 they are one
+question with one answer, because the only process that knows either is the one
+that mounted the volume:
+
+```
+ksh:/$ df
+FAT32 'KOSHDISK', 64 MB, 512 B/cluster, 2 FAT(s) of 1009 sectors, root at cluster 2
+QEMU HARDDISK  131072 blocks x 512 bytes  (64 MB)
+```
+
+`fs` gained `OP_STATFS`, which returns **text**. A struct would be an ABI to keep
+in step for no gain — `df` prints the string and nothing parses it. Written down
+as a decision rather than left as an accident, because the moment something wants
+the numbers, a struct is the right answer and this is the wrong one.
+
+The disk figures are cached at mount rather than re-asked. `df` should describe
+the disk this filesystem is mounted *on*; asking the driver again would describe
+whatever disk it has now — the same answer today, and a lie the first time a
+driver can be restarted under a service that stays up.
+
+### What the claim mechanism is for now
+
+`platform::devports` kept a claim per device so the kernel's ATA driver would
+stand aside while a ring-3 one held the channel. There is no kernel ATA driver to
+stand aside, so that check is gone and the self-test in `sys_request_device` that
+verified it went with it. The claim itself stays, with its remaining job: two
+*ring-3* drivers cannot take the same device.
+
+### The count
+
+The kernel is 2,071 lines smaller and does strictly less. Everything it stopped
+doing, something outside it now does — which is the only version of that sentence
+worth writing down.
+
 ## What is deliberately still missing
 - **The filesystem is read-only.** Allocating clusters and keeping both FAT
   copies consistent is a separate problem, and a read-only filesystem that is
@@ -2086,10 +2171,9 @@ be an IPC client too, which is the next piece of work rather than this one.
 - **The VFS is still unwired.** `userspace/fs-service/src/vfs.rs` has a mount
   table; it has never had a real filesystem underneath it, and connecting the
   two is separate work from making FAT32 correct.
-- **The kernel still contains a filesystem and a disk driver.** Nothing that
-  ships calls them — `ksh` reads through the `fs` service — but the console's
-  `df` and `lsblk` do, so they cannot be deleted until the console is a client
-  too.
+- **The in-kernel console has no file commands.** It runs only when userspace
+  has stopped, so it cannot ask the `fs` service, and it no longer has a
+  filesystem of its own. `ls` from the kernel prompt says so.
 - **IPC has no reply port.** A service waiting for its own downstream reply can
   be interrupted by a client request, and `fs` handles exactly one of those at a
   time. A third concurrent client hangs.

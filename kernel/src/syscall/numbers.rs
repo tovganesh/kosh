@@ -26,17 +26,16 @@ pub const SYS_MPROTECT: u64 = 12;
 pub const SYS_BRK: u64 = 13;
 pub const SYS_SBRK: u64 = 14;
 
-/// File system system calls
-pub const SYS_OPEN: u64 = 20;
-pub const SYS_CLOSE: u64 = 21;
+/// The two streams the kernel still owns.
+///
+/// `read(0, ...)` is the keyboard and `write(1, ...)` is the console. Numbers
+/// 20, 21, 24-29 and 70 used to be `open`, `close`, `lseek`, `stat`, `fstat`,
+/// `mkdir`, `rmdir`, `unlink` and `getdents`. They are not here — not refusing,
+/// not reserved, gone — because the filesystem is `userspace/fs-service` and a
+/// program that wants a file sends it a message. A syscall number that exists
+/// and always fails is a worse answer than one that does not exist.
 pub const SYS_READ: u64 = 22;
 pub const SYS_WRITE: u64 = 23;
-pub const SYS_LSEEK: u64 = 24;
-pub const SYS_STAT: u64 = 25;
-pub const SYS_FSTAT: u64 = 26;
-pub const SYS_MKDIR: u64 = 27;
-pub const SYS_RMDIR: u64 = 28;
-pub const SYS_UNLINK: u64 = 29;
 
 /// IPC system calls
 pub const SYS_SEND_MESSAGE: u64 = 30;
@@ -78,11 +77,6 @@ pub const SYS_UNAME: u64 = 50;
 pub const SYS_SYSINFO: u64 = 51;
 pub const SYS_TIME: u64 = 52;
 pub const SYS_CLOCK_GETTIME: u64 = 53;
-
-/// Directory listing. Fixed-size records, so userspace can walk the buffer
-/// without a parser. Not in the 20..29 file-system block because that range was
-/// already allocated when this was added.
-pub const SYS_GETDENTS: u64 = 70;
 
 /// Security and capability system calls
 pub const SYS_GRANT_CAPABILITY: u64 = 60;
@@ -138,16 +132,8 @@ pub fn syscall_name(syscall_number: u64) -> &'static str {
         SYS_BRK => "brk",
         SYS_SBRK => "sbrk",
         
-        SYS_OPEN => "open",
-        SYS_CLOSE => "close",
         SYS_READ => "read",
         SYS_WRITE => "write",
-        SYS_LSEEK => "lseek",
-        SYS_STAT => "stat",
-        SYS_FSTAT => "fstat",
-        SYS_MKDIR => "mkdir",
-        SYS_RMDIR => "rmdir",
-        SYS_UNLINK => "unlink",
         
         SYS_SEND_MESSAGE => "send_message",
         SYS_RECEIVE_MESSAGE => "receive_message",
@@ -164,7 +150,6 @@ pub fn syscall_name(syscall_number: u64) -> &'static str {
         SYS_REGISTER_SERVICE => "register_service",
         SYS_LOOKUP_SERVICE => "lookup_service",
         
-        SYS_GETDENTS => "getdents",
         SYS_UNAME => "uname",
         SYS_SYSINFO => "sysinfo",
         SYS_TIME => "time",

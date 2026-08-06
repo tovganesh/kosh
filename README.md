@@ -64,8 +64,8 @@ test disk, then boots the lot:
 
 ```bash
 ./scripts/run.sh              # boot it, serial on stdio (ctrl-a x to quit)
-./scripts/run.sh --check      # boot headless, assert 64 serial markers (CI)
-./scripts/run.sh --check-cli  # drive the shell through QEMU's monitor, assert 40
+./scripts/run.sh --check      # boot headless, assert 61 serial markers (CI)
+./scripts/run.sh --check-cli  # drive the shell through QEMU's monitor, assert 41
 ./scripts/run.sh --debug      # same as plain run, plus a gdb stub on :1234
 ```
 
@@ -135,11 +135,12 @@ interaction in `--check-cli`.
 
 **Devices and storage**
 - 8259 PIC remap, PIT timer, PS/2 keyboard on IRQ1
-- ATA PIO driver on the legacy IDE ports — IDENTIFY, LBA28 reads
 - **The disk driver and the filesystem both run in ring 3.** `ata-driver` reads
   the disk from an unprivileged process using `in` and `out` directly — no
   syscall per port — and `fs-service` mounts FAT32 on top of it and answers
-  `open`/`read`/`stat`/`getdents` for the shell. The kernel is not on that path
+  `open`/`read`/`stat`/`getdents` for the shell. **The kernel has no filesystem
+  and no disk driver at all**: `fs/`, `block/`, the descriptor table and nine
+  system calls were deleted, 2,071 lines against 164 added
   Its ports come from the TSS I/O permission bitmap, 9 bits granted to that
   thread and denied to every other; a process without the grant that touches
   0x1F7 is killed and the system carries on
@@ -149,7 +150,8 @@ interaction in `--check-cli`.
 - One driver per device at a time: while a ring-3 driver holds `ata0`, the
   kernel's own block layer refuses that channel, and the claim is released even
   if the driver crashes
-- Read-only FAT32: BPB validation, cluster-chain walking, long filenames
+- Read-only FAT32 — BPB validation, cluster-chain walking, long filenames — in
+  ring 3, reading sectors over IPC
 - CMOS RTC, so `date` prints the real date
 
 **Userspace**
@@ -188,21 +190,24 @@ interaction in `--check-cli`.
 
 ## The syscall surface
 
-48 numbers are defined; **27 do the work** and the other 21 return an error
+39 numbers are defined; **21 do the work** and the other 18 return an error
 saying so. Nothing returns success for work it did not do.
 
-**Working** (all 27 exercised from ring 3, not just by the kernel checking
+Nine went away this phase rather than staying and refusing: `open`, `close`,
+`lseek`, `stat`, `fstat`, `mkdir`, `rmdir`, `unlink`, `getdents`. A file is a
+message to the `fs` service now, and a syscall number that exists and always
+fails is a worse answer than one that does not exist.
+
+**Working** (all 21 exercised from ring 3, not just by the kernel checking
 itself):
 
 `exit` `fork` `exec` `wait` `getpid` `getppid` `yield` `spawn` · `mmap`
-`munmap` · `open` `close` `read` `write` `lseek` `stat` `getdents` · `time`
-`clock_gettime` · `send_message` `receive_message` · `request_device`
-`release_device` · `register_service` `lookup_service` · `debug_print`
-`debug_dump`
+`munmap` · `read` `write` · `time` `clock_gettime` · `send_message`
+`receive_message` · `request_device` `release_device` · `register_service`
+`lookup_service` · `debug_print` `debug_dump`
 
-The six file system calls still exist and still work, and nothing that ships
-calls them any more: `ksh` gets its files from the `fs` service. They are
-counted above because they are real, not because they are used.
+`read` is the keyboard and `write` is the console — the two devices still inside
+the kernel, along with the timer.
 
 **Refuses with `NotSupported`, honestly:**
 
@@ -231,10 +236,13 @@ of it.
   path — a process may message its parent and its children, and nothing else —
   but the four capability syscalls still return `NotSupported`, so a program
   cannot inspect or delegate what it holds.
-- **The kernel still contains a filesystem and a disk driver.** Nothing that
-  ships calls them — `ksh` reads through the `fs` service — but the in-kernel
-  console's `df` and `lsblk` do, so they cannot be deleted until the console is
-  an IPC client too. The keyboard driver is still in-kernel and has no plan yet.
+- **The fallback console has no file commands.** It runs only *because*
+  userspace has stopped, so it cannot ask the `fs` service either — a fallback
+  that needs the thing it is a fallback for is not one. `ls` from the kernel
+  prompt says so, and the disk commands live in `ksh`.
+- **The keyboard driver is still in the kernel**, and has no plan yet. It is
+  harder than the disk: it is interrupt-driven, and ring 3 cannot receive
+  interrupts.
 - **IPC has no reply port.** A service waiting for its own downstream reply can
   be interrupted by a client's request. `fs` stashes exactly one of those; a
   third concurrent client is dropped with a warning and hangs.
@@ -281,8 +289,6 @@ kernel/src/
   task/            preemptive kernel threads and the context switch
   syscall/         SYSCALL entry, dispatcher, user-pointer checks, files
   elf.rs           static ELF64 loader
-  block/ata.rs     ATA PIO driver (stands aside for the ring-3 one)
-  fs/fat32.rs      read-only FAT32 (the shell no longer reads through it)
   ipc/services.rs  name registry; a lookup is also a capability grant
   console/         the in-kernel fallback shell
   platform/rtc.rs      CMOS real-time clock
@@ -319,7 +325,8 @@ Roughly in order, each unblocking the next:
 - [x] One process-id namespace, so IPC and capabilities became reachable
 - [x] The disk driver out of the kernel, with port permissions to make it possible
 - [x] The filesystem out of the kernel, and an `init` that starts both
-- [ ] The in-kernel console as an IPC client, so `fs/` and `block/` can be deleted
+- [x] `fs/` and `block/` deleted — the kernel cannot read a disk at all
+- [ ] A reply port for IPC, so a service can be asked something while it waits
 - [ ] `argv` for `exec`, so a driver can be told what to serve
 - [ ] FAT32 writes
 - [ ] `userspace/init` doing its job

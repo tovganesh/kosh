@@ -193,6 +193,15 @@ const OP_LSEEK: u32 = 3;
 const OP_STAT: u32 = 4;
 const OP_GETDENTS: u32 = 5;
 const OP_SHUTDOWN: u32 = 6;
+/// `STATFS` -> a human-readable description of the mounted volume and the disk
+/// under it, as UTF-8 in the payload.
+///
+/// A string rather than a struct on purpose. `df` prints it and nothing parses
+/// it, so a struct would be an ABI to keep in step for no gain — and the moment
+/// something *does* want the numbers, a struct is the right answer and this is
+/// the wrong one. Written down so that trade is a decision rather than an
+/// accident.
+const OP_STATFS: u32 = 7;
 
 const REQ_HEADER: usize = 40;
 const REP_HEADER: usize = 24;
@@ -253,6 +262,15 @@ fn fs_error_to_status(e: FsError) -> i32 {
 // lock here would protect against nothing.
 
 static mut VOLUME: Option<Fat32> = None;
+
+/// What the block service said about the disk, kept for `STATFS`.
+///
+/// Cached rather than re-asked: `df` should describe the disk this filesystem
+/// is mounted on, and asking the driver again would describe whatever disk it
+/// has *now* — the same answer today and a lie the moment a driver can be
+/// restarted under a service that stays up.
+static mut DISK_BLOCKS: u64 = 0;
+static mut DISK_MODEL: [u8; 41] = [0; 41];
 
 static mut REQUEST: [u8; MAX_MESSAGE] = [0; MAX_MESSAGE];
 static mut REPLY: [u8; MAX_MESSAGE] = [0; MAX_MESSAGE];
@@ -537,6 +555,37 @@ fn handle(op: u32, sender: u32, len: usize) -> (i32, usize, u32, i64) {
     let want = read_u64(request, 24);
 
     match op {
+        OP_STATFS => {
+            let text = {
+                use core::fmt::Write;
+                let mut out = alloc::string::String::new();
+                let (blocks, model) = unsafe {
+                    (
+                        *core::ptr::addr_of!(DISK_BLOCKS),
+                        *core::ptr::addr_of!(DISK_MODEL),
+                    )
+                };
+                let end = model.iter().position(|&b| b == 0).unwrap_or(model.len());
+                let name = core::str::from_utf8(&model[..end]).unwrap_or("<unreadable>");
+                let _ = write!(
+                    out,
+                    "{}\n{}  {} blocks x 512 bytes  ({} MB)",
+                    volume().describe(),
+                    name,
+                    blocks,
+                    blocks * 512 / (1024 * 1024)
+                );
+                out
+            };
+
+            let bytes = text.as_bytes();
+            let n = core::cmp::min(bytes.len(), MAX_PAYLOAD);
+            unsafe {
+                let reply = &mut *core::ptr::addr_of_mut!(REPLY);
+                reply[REP_HEADER..REP_HEADER + n].copy_from_slice(&bytes[..n]);
+            }
+            (ST_OK, n, 0, 0)
+        }
         OP_OPEN => {
             let path = match request_path(len) {
                 Ok(p) => p,
@@ -816,6 +865,10 @@ pub extern "C" fn fs_service_main() -> ! {
     // disk which is not there, rather than as a filesystem that will not mount.
     match block::info() {
         Ok((sectors, model)) => {
+            unsafe {
+                DISK_BLOCKS = sectors;
+                DISK_MODEL = model;
+            }
             let end = model.iter().position(|&b| b == 0).unwrap_or(model.len());
             let name = core::str::from_utf8(&model[..end]).unwrap_or("<not utf-8>");
             say!(
