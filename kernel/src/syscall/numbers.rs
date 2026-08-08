@@ -39,6 +39,16 @@ pub const SYS_WRITE: u64 = 23;
 
 /// IPC system calls
 pub const SYS_SEND_MESSAGE: u64 = 30;
+/// `receive_message(buf, capacity, (from << 32) | blocking)` -> (sender << 32) | length
+///
+/// The third argument carries both: blocking in the low half, and the sender to
+/// wait for in the high half — 0 for "whoever sent one", a pid for "only that
+/// process". The second form is what stops a client blocking for a reply from
+/// being handed somebody else's request.
+///
+/// Packed into one register on purpose. An argument in R10 would be read from a
+/// register that three-argument callers never write; see the comment on
+/// `sys_receive_message`.
 pub const SYS_RECEIVE_MESSAGE: u64 = 31;
 pub const SYS_REPLY_MESSAGE: u64 = 32;
 pub const SYS_CREATE_CHANNEL: u64 = 33;

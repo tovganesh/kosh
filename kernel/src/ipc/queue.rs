@@ -101,6 +101,46 @@ impl MessageQueue {
         }
     }
     
+    /// Take the first message from `sender`, leaving everything else queued.
+    ///
+    /// This is the whole of "selective receive", and it exists because a service
+    /// that sends a request downstream and then waits for the answer will
+    /// otherwise be handed the *next client request* instead. `fs-service` hit
+    /// exactly that: it asks `ata-driver` for a sector, blocks, and a shell's
+    /// `open` arrives first. Its workaround was a one-slot stash, which works for
+    /// two concurrent clients and drops the third.
+    ///
+    /// A linear scan, because the queue is short by construction — a service that
+    /// has thousands of messages pending has a scheduling problem, not a data
+    /// structure problem — and because the alternative, a per-sender queue, makes
+    /// "the next message from anyone" the expensive operation instead. Servers
+    /// wait for anyone; clients wait for one specific sender. Both should be
+    /// cheap, and with a short queue both are.
+    pub fn dequeue_from(&mut self, sender: ProcessId) -> Result<Message, MessageError> {
+        let position = self
+            .messages
+            .iter()
+            .position(|m| m.header.sender == sender)
+            .ok_or(MessageError::NoMessage)?;
+
+        let message = self
+            .messages
+            .remove(position)
+            .ok_or(MessageError::NoMessage)?;
+
+        let message_size = message.total_size();
+        self.total_size = self.total_size.saturating_sub(message_size);
+
+        serial_println!(
+            "Dequeued message from {} for process {} (queue size: {})",
+            sender.0,
+            self.process_id.0,
+            self.messages.len()
+        );
+
+        Ok(message)
+    }
+
     /// Peek at the next message without removing it
     pub fn peek(&self) -> Option<&Message> {
         self.messages.front()
@@ -234,6 +274,19 @@ impl MessageQueueManager {
         self.total_messages = self.total_messages.saturating_sub(1);
         Ok(message)
     }
+
+    fn dequeue_message_from(
+        &mut self,
+        process_id: ProcessId,
+        sender: ProcessId,
+    ) -> Result<Message, MessageError> {
+        let queue = self.queues.get_mut(&process_id)
+            .ok_or(MessageError::ReceiverNotFound)?;
+
+        let message = queue.dequeue_from(sender)?;
+        self.total_messages = self.total_messages.saturating_sub(1);
+        Ok(message)
+    }
     
     /// Get queue statistics for a process
     fn get_queue_statistics(&self, process_id: ProcessId) -> Option<MessageQueueStatistics> {
@@ -312,6 +365,15 @@ pub fn enqueue_message(process_id: ProcessId, message: Message) -> Result<(), Me
 }
 
 /// Dequeue a message from a process's queue
+pub fn dequeue_message_from(
+    process_id: ProcessId,
+    sender: ProcessId,
+) -> Result<Message, MessageError> {
+    let mut manager = MESSAGE_QUEUE_MANAGER.lock();
+    let manager = manager.as_mut().ok_or(MessageError::ResourceExhausted)?;
+    manager.dequeue_message_from(process_id, sender)
+}
+
 pub fn dequeue_message(process_id: ProcessId) -> Result<Message, MessageError> {
     let mut manager = MESSAGE_QUEUE_MANAGER.lock();
     let manager = manager.as_mut().ok_or(MessageError::ResourceExhausted)?;

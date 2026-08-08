@@ -2162,6 +2162,88 @@ The kernel is 2,071 lines smaller and does strictly less. Everything it stopped
 doing, something outside it now does — which is the only version of that sentence
 worth writing down.
 
+## Selective receive (Phase 21)
+
+`fs-service` carried a workaround with its own limit written on it: a one-slot
+stash for messages that arrived while it was waiting for a sector, and a comment
+saying a third concurrent client would be dropped and hang. This removes the need
+for it.
+
+### Why a service that is also a client needs it
+
+`receive_message` handed over whatever arrived first. That is exactly right for a
+server, and wrong for a client — and `fs` is both. It asks `block` for a sector
+and blocks; a shell's `open` lands in its queue first; the receive returns the
+`open` request, and the block client parses a filesystem request as sector data.
+
+The stash caught that message and set it aside. One slot, because the client
+being served is itself blocked waiting, so only a *second* client can produce a
+message during a read. A third one's request was dropped with a warning, and that
+client waited forever.
+
+`MessageQueue::dequeue_from` takes the first message from a named sender and
+leaves the rest queued. There is no slot to run out of. The syscall grew a
+sender filter: 0 for "whoever sent one", which is what a server passes, and a pid
+for "only that process", which is what a client waiting for its own reply passes.
+
+A linear scan, because the queue is short by construction — a service with
+thousands of messages pending has a scheduling problem, not a data structure
+problem — and because the alternative, a queue per sender, makes "the next
+message from anyone" the expensive operation instead. Servers wait for anyone,
+clients wait for one process; both should be cheap, and with a short queue both
+are.
+
+### The third time an argument was read from a register nobody wrote
+
+The filter went in as argument four. Argument four is R10, and every server loop
+here uses a three-argument syscall wrapper — "receive from anyone, blocking"
+needs no more — so R10 held whatever was last in it. The kernel read the garbage
+as a pid and waited for a message from a process that does not exist. The disk
+driver hung on its first receive, before `fs` could mount, and the boot stopped
+with `init` spinning in `lookup_service`.
+
+This is the third instance in this repository. `sys_mmap` read `fd` out of R8 in
+Phase 13; `validate_mmap_args` did the same thing again in Phase 16, after the
+lesson had already been written down. The lesson that finally stuck is not
+"remember R10" — it is that **an argument nobody sets is not an argument**. So
+the filter is packed into argument three alongside the blocking flag, in a
+register every caller already writes:
+
+```
+receive_message(buf, capacity, (from << 32) | blocking)
+```
+
+The return value has packed `(sender << 32) | len` since Phase 17 for the same
+reason. The symmetry is not decoration.
+
+### A test that was green against the bug it was written for
+
+The first version had three processes hammering `block` and checking every reply
+was a boot sector. It passed with selective receive and passed without it, which
+should have been the end of the matter and nearly was.
+
+A driver that only ever answers is never waiting for anything, so nothing can
+cross in its clients' queues. The crossing needs a service that is *itself* a
+client. The test now points at `fs`: three processes, `STAT /README.TXT` fifteen
+times each, checking the size is the 199 bytes `ls` reports — so a crossed reply
+cannot pass by being a well-formed answer about something else. `STAT /` would
+not do, because the root is synthetic and answering it needs no disk at all; a
+path lookup walks the root directory, which is several sector reads, which is
+the window.
+
+Reverting `fs`'s block client to an any-sender receive turns that marker into a
+`FAIL` and takes four later markers with it, because the shell's session does not
+recover from a filesystem that has started answering the wrong questions.
+
+### Capabilities are not inherited by fork
+
+The forked children could not talk to the service their parent had looked up, and
+that is correct rather than a bug to work around. A child is a new pid; the grant
+`lookup_service` made names the parent. Inheriting it would let a process hand
+out access it holds by forking, which is the thing a capability system exists to
+prevent. So each child calls `lookup_service` itself and the registry decides —
+one line in the test, and the reason it is there is worth more than the line.
+
 ## What is deliberately still missing
 - **The filesystem is read-only.** Allocating clusters and keeping both FAT
   copies consistent is a separate problem, and a read-only filesystem that is
@@ -2174,9 +2256,6 @@ worth writing down.
 - **The in-kernel console has no file commands.** It runs only when userspace
   has stopped, so it cannot ask the `fs` service, and it no longer has a
   filesystem of its own. `ls` from the kernel prompt says so.
-- **IPC has no reply port.** A service waiting for its own downstream reply can
-  be interrupted by a client request, and `fs` handles exactly one of those at a
-  time. A third concurrent client hangs.
 - **`exec` takes no `argv`.** A driver cannot be told which device to serve, which
   is part of why `DRIVER_IMAGES` maps an image name to a device rather than the
   program deciding.

@@ -773,16 +773,47 @@ fn sys_send_message(_process_id: ProcessId, _args: [u64; 6]) -> SyscallResult {
 fn sys_receive_message(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
     let out = args[0];
     let capacity = args[1] as usize;
-    let blocking = args[2] != 0;
+    // Argument three carries two things: the blocking flag in the low half, and
+    // the sender to wait for in the high half — 0 for "anyone", which is what a
+    // server wants, and a pid for "only that process", which is what a client
+    // waiting for its own reply wants.
+    //
+    // Packed rather than given argument four, and that is not tidiness. Argument
+    // four lives in R10, and a caller using a three-argument syscall wrapper —
+    // which every server loop here does, because "receive from anyone, blocking"
+    // needs no more — never sets R10. The kernel would read whatever was in it,
+    // treat the garbage as a pid, and wait for a message from a process that does
+    // not exist. The driver hung on its first receive.
+    //
+    // This is the third time this repository has read an argument the caller did
+    // not set: `sys_mmap` read `fd` out of R8 in Phase 13, `validate_mmap_args`
+    // did it again in Phase 16, and now this. The lesson that finally stuck is
+    // not "remember R10" — it is that an argument nobody sets is not an argument,
+    // so put it where the callers already write. The return value packs
+    // `(sender << 32) | len` for the same reason.
+    let blocking = (args[2] & 0xFFFF_FFFF) != 0;
+    let from = args[2] >> 32;
 
     if capacity == 0 || capacity > MAX_MESSAGE_BYTES {
         return Err(SyscallError::InvalidArgument);
     }
 
     let message = loop {
-        match crate::ipc::message::receive_message(process_id) {
+        let attempt = if from == 0 {
+            crate::ipc::message::receive_message(process_id)
+        } else {
+            crate::ipc::message::receive_message_from(
+                process_id,
+                ProcessId::new(from as u32),
+            )
+        };
+
+        match attempt {
             Ok(m) => break m,
             Err(crate::ipc::MessageError::NoMessage) if blocking => {
+                // A wake-up is only a hint: `wake_for_message` fires on any
+                // send, so a selective receive can be woken by a message it does
+                // not want. Re-checking is what makes that harmless.
                 crate::task::block_for_message();
             }
             Err(e) => return Err(e.into()),

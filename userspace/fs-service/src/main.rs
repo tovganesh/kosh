@@ -124,6 +124,22 @@ pub(crate) fn receive_message(buf: &mut [u8]) -> i64 {
     }
 }
 
+/// Wait for a message from `from` specifically, leaving anything else queued.
+///
+/// This is what a service acting as a *client* needs. Without it, waiting for a
+/// sector meant being handed the next `open` request instead.
+pub(crate) fn receive_message_from(buf: &mut [u8], from: u32) -> i64 {
+    unsafe {
+        syscall3(
+            SYS_RECEIVE_MESSAGE,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            // Blocking in the low half, the sender to wait for in the high half.
+            ((from as u64) << 32) | 1,
+        )
+    }
+}
+
 /// Resolve a service name to a pid. This also grants the two processes mutual
 /// permission to message each other, which is why `block::connect` may only be
 /// given a pid that this returned.
@@ -277,9 +293,6 @@ static mut REPLY: [u8; MAX_MESSAGE] = [0; MAX_MESSAGE];
 
 /// One message set aside because it arrived while we were waiting for the block
 /// service. See [`stash_client_message`].
-static mut STASH: [u8; MAX_MESSAGE] = [0; MAX_MESSAGE];
-static mut STASH_LEN: usize = 0;
-static mut STASH_FROM: u32 = 0;
 
 fn volume() -> &'static Fat32 {
     match unsafe { (*core::ptr::addr_of!(VOLUME)).as_ref() } {
@@ -427,47 +440,11 @@ fn slot_index(handle: u32, owner: u32) -> Option<usize> {
 /// client checks the sender and hands anything else here, rather than parsing an
 /// fs request as sector data.
 ///
-/// One slot, because the server answers one request at a time and the client it
-/// is currently serving is waiting on a reply: in practice only a *second*
-/// client can produce a message during a read. A third one's request is dropped
-/// with a warning and that client will wait forever for a reply that is not
-/// coming. That is the honest limit of this design. Fixing it means either a
-/// per-request reply port in the kernel or a real request queue here, and
-/// neither is worth building before there is a second filesystem client.
-pub(crate) fn stash_client_message(sender: u32, bytes: &[u8]) {
-    unsafe {
-        if STASH_LEN != 0 {
-            print("  fs-service: message arrived during a disk read with the stash full; dropped\n");
-            return;
-        }
-        if bytes.is_empty() {
-            // A zero-length message cannot be a valid request, and storing one
-            // would be indistinguishable from an empty stash.
-            return;
-        }
-        let stash = &mut *core::ptr::addr_of_mut!(STASH);
-        let n = core::cmp::min(bytes.len(), stash.len());
-        stash[..n].copy_from_slice(&bytes[..n]);
-        STASH_LEN = n;
-        STASH_FROM = sender;
-    }
-}
-
-/// The next request, from the stash if one is waiting there. `None` means the
-/// receive failed and the server should stop.
+/// The next request. `None` means the receive failed and the server should stop.
+///
+/// "From anyone", which is what a server wants — the selective form is for the
+/// block client below, which is this program acting as somebody else's client.
 fn next_message() -> Option<(u32, usize)> {
-    unsafe {
-        if STASH_LEN != 0 {
-            let len = STASH_LEN;
-            let from = STASH_FROM;
-            let stash = &*core::ptr::addr_of!(STASH);
-            let request = &mut *core::ptr::addr_of_mut!(REQUEST);
-            request[..len].copy_from_slice(&stash[..len]);
-            STASH_LEN = 0;
-            return Some((from, len));
-        }
-    }
-
     let request = unsafe { &mut *core::ptr::addr_of_mut!(REQUEST) };
     let received = receive_message(request);
     if received < 0 {
@@ -485,8 +462,9 @@ fn next_message() -> Option<(u32, usize)> {
 /// The path bytes of the request currently in [`REQUEST`].
 ///
 /// The borrow outlives the disk reads that follow it, which is safe for a reason
-/// worth stating: a message that arrives during those reads goes to [`STASH`],
-/// never to `REQUEST`, so nothing overwrites the path while it is in use.
+/// worth stating: a message that arrives during those reads is left in the
+/// kernel's queue by the selective receive in `block.rs`, so nothing overwrites
+/// `REQUEST` while the path is in use.
 fn request_path(len: usize) -> Result<&'static str, i32> {
     let request = unsafe { &*core::ptr::addr_of!(REQUEST) };
     let path_len = read_u32(request, 32) as usize;
