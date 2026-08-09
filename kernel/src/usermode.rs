@@ -295,6 +295,68 @@ struct Program {
     stack_top: u64,
     /// Moved into the thread by [`enter_spawned`]. `None` afterwards.
     space: Option<AddressSpace>,
+    /// The command line, NUL-separated, including the program name.
+    args: ArgBuffer,
+}
+
+/// A command line on its way from one address space to another.
+///
+/// A flat buffer of NUL-separated strings rather than an array of pointers, and
+/// that is the whole design decision. An `argv` in the caller's memory is a list
+/// of addresses the kernel would have to validate one at a time, each of which
+/// could be changed between the check and the copy. A flat buffer is one span to
+/// bound-check and one copy to make, and the count falls out of the terminators.
+///
+/// Fixed size because it lives in a static table and because a command line that
+/// does not fit in half a page is a design problem somewhere else.
+#[derive(Clone, Copy)]
+pub struct ArgBuffer {
+    bytes: [u8; MAX_ARG_BYTES],
+    len: usize,
+}
+
+pub const MAX_ARG_BYTES: usize = 512;
+/// Enough for `program arg1 arg2 ...`; anything longer is truncated with a note
+/// in the log rather than silently.
+pub const MAX_ARGS: usize = 8;
+
+impl ArgBuffer {
+    pub const fn empty() -> Self {
+        Self {
+            bytes: [0; MAX_ARG_BYTES],
+            len: 0,
+        }
+    }
+
+    /// Build from a flat NUL-separated span, keeping at most [`MAX_ARG_BYTES`].
+    pub fn from_bytes(src: &[u8]) -> Self {
+        let mut out = Self::empty();
+        let n = core::cmp::min(src.len(), MAX_ARG_BYTES);
+        out.bytes[..n].copy_from_slice(&src[..n]);
+        out.len = n;
+        out
+    }
+
+    /// Just the program name, for a `spawn` with no arguments.
+    pub fn just(name: &str) -> Self {
+        let mut out = Self::empty();
+        let n = core::cmp::min(name.len(), MAX_ARG_BYTES - 1);
+        out.bytes[..n].copy_from_slice(&name.as_bytes()[..n]);
+        out.bytes[n] = 0;
+        out.len = n + 1;
+        out
+    }
+
+    fn args(&self) -> impl Iterator<Item = &[u8]> {
+        self.bytes[..self.len]
+            .split(|&b| b == 0)
+            .filter(|a| !a.is_empty())
+            .take(MAX_ARGS)
+    }
+
+    pub fn count(&self) -> usize {
+        self.args().count()
+    }
 }
 
 impl Program {
@@ -385,9 +447,70 @@ fn prepare_program(image: &[u8]) -> Result<(AddressSpace, u64), SpawnError> {
 /// recursive-descent parser and formats strings on the stack.
 const USER_STACK_PAGES_MAX: usize = 16;
 
+/// Copy a command line onto a user stack and build the `argv` array above it.
+///
+/// Returns `(argc, argv, rsp)`. The layout, from the top down:
+///
+/// ```text
+///   stack_top
+///     ...string bytes...
+///     (padding to 8)
+///     argv[argc] = 0        <- the NULL terminator execve promises
+///     argv[argc-1]
+///     ...
+///     argv[0]               <- argv points here
+///     (padding to 16)       <- rsp
+/// ```
+///
+/// The terminating NULL is not decoration: it is the only thing that lets a
+/// program walk `argv` without being told `argc`, and every C runtime relies on
+/// it. Costing eight bytes to keep a convention that every other system holds is
+/// a good trade.
+///
+/// # Safety
+/// The current address space must be the one owning `stack_top`.
+unsafe fn push_args(stack_top: u64, args: &ArgBuffer) -> (u64, u64, u64) {
+    let mut pointers = [0u64; MAX_ARGS];
+    let mut argc = 0usize;
+    let mut cursor = stack_top;
+
+    for arg in args.args() {
+        // NUL-terminated in the child too, so a program can hand `argv[i]`
+        // straight to anything that expects a C string.
+        cursor -= (arg.len() + 1) as u64;
+        core::ptr::copy_nonoverlapping(arg.as_ptr(), cursor as *mut u8, arg.len());
+        core::ptr::write((cursor + arg.len() as u64) as *mut u8, 0);
+        pointers[argc] = cursor;
+        argc += 1;
+    }
+
+    cursor &= !0x7;
+
+    // The array, highest index first, so `argv[0]` ends up lowest.
+    cursor -= 8;
+    core::ptr::write(cursor as *mut u64, 0); // argv[argc]
+    for i in (0..argc).rev() {
+        cursor -= 8;
+        core::ptr::write(cursor as *mut u64, pointers[i]);
+    }
+
+    let argv = cursor;
+    let rsp = cursor & !0xF;
+
+    (argc as u64, argv, rsp)
+}
+
 /// Load a boot module and run it in ring 3 on a new thread with its own address
 /// space. Returns the thread id, which is what `wait` takes.
 pub fn spawn_program(name: &str) -> Result<usize, SpawnError> {
+    spawn_program_with_args(name, &ArgBuffer::just(name))
+}
+
+/// As [`spawn_program`], with a command line.
+pub fn spawn_program_with_args(
+    name: &str,
+    args: &ArgBuffer,
+) -> Result<usize, SpawnError> {
     let module = boot_module_named(name).ok_or(SpawnError::NotFound)?;
     let image = unsafe { module.bytes() };
 
@@ -407,6 +530,7 @@ pub fn spawn_program(name: &str) -> Result<usize, SpawnError> {
             entry,
             stack_top: USER_STACK_TOP,
             space: Some(space),
+            args: *args,
         });
         slot
     };
@@ -574,6 +698,7 @@ pub fn register_forked(child: usize, parent: usize) {
         entry: 0,
         stack_top: 0,
         space: None,
+        args: ArgBuffer::empty(),
     });
 }
 
@@ -589,6 +714,7 @@ pub fn rename_program(thread: usize, name: &str) {
             entry: 0,
             stack_top: 0,
             space: None,
+            args: ArgBuffer::empty(),
         });
     }
 }
@@ -606,15 +732,22 @@ fn enter_spawned(slot: usize) {
                 // exit — between `task::spawn` returning and the parent writing
                 // the id, and then nothing would free its address space.
                 p.thread = crate::task::current_id();
-                p.space.take().map(|space| (space, p.entry, p.stack_top))
+                let args = p.args;
+                p.space.take().map(|space| (space, p.entry, p.stack_top, args))
             }
         }
     };
 
     match target {
-        Some((space, entry, stack_top)) => {
+        Some((space, entry, stack_top, args)) => {
             crate::task::adopt_address_space(space);
-            unsafe { enter_ring3(entry, stack_top) }
+            // Written *after* the switch, on purpose. The stack is reserved,
+            // not allocated, so touching it faults — and the fault handler can
+            // only service it in the address space the pages belong to. Doing
+            // this in the parent would mean poking at another PML4 through the
+            // physmap and materialising the pages by hand.
+            let (argc, argv, rsp) = unsafe { push_args(stack_top, &args) };
+            unsafe { enter_ring3_with_args(entry, rsp, argc, argv) }
         }
         None => serial_println!("spawned thread has no program in slot {}", slot),
     }
@@ -633,6 +766,7 @@ fn register_running(name: &str) {
         entry: 0,
         stack_top: 0,
         space: None,
+        args: ArgBuffer::empty(),
     });
 }
 
@@ -860,7 +994,15 @@ pub unsafe fn enter_ring3_at(entry: u64, stack_top: u64) -> ! {
 ///
 /// # Safety
 /// As [`enter_ring3`].
+pub unsafe fn enter_ring3_with_args(entry: u64, stack_top: u64, argc: u64, argv: u64) -> ! {
+    enter_ring3_full(entry, stack_top, argc, argv)
+}
+
 unsafe fn enter_ring3_with_arg(entry: u64, stack_top: u64, arg: u64) -> ! {
+    enter_ring3_full(entry, stack_top, arg, 0)
+}
+
+unsafe fn enter_ring3_full(entry: u64, stack_top: u64, arg: u64, arg2: u64) -> ! {
     let sel = crate::gdt::selectors();
     let user_cs = (sel.user_code.0 | 3) as u64;
     let user_ss = (sel.user_data.0 | 3) as u64;
@@ -883,6 +1025,7 @@ unsafe fn enter_ring3_with_arg(entry: u64, stack_top: u64, arg: u64) -> ! {
         cs = in(reg) user_cs,
         rip = in(reg) entry,
         in("rdi") arg,
+        in("rsi") arg2,
         options(noreturn)
     )
 }

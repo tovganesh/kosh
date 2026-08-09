@@ -240,9 +240,28 @@ fn sys_spawn(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
     let name = crate::syscall::files::path_from_user(args[0], args[1])?;
     let name = name.trim_start_matches('/');
 
-    serial_println!("Process {} spawning '{}'", process_id.0, name);
+    // `spawn(path, path_len, args_ptr, args_len)`. The command line is a flat
+    // NUL-separated buffer, not an array of pointers — one span to bound-check
+    // and one copy to make, instead of a list of addresses each of which could
+    // change between the check and the copy.
+    let argv = if args[2] != 0 && args[3] != 0 {
+        let len = core::cmp::min(args[3] as usize, crate::usermode::MAX_ARG_BYTES);
+        let mut buf = [0u8; crate::usermode::MAX_ARG_BYTES];
+        crate::syscall::uaccess::copy_from_user(args[2], &mut buf[..len])
+            .map_err(|_| SyscallError::InvalidArgument)?;
+        crate::usermode::ArgBuffer::from_bytes(&buf[..len])
+    } else {
+        crate::usermode::ArgBuffer::just(name)
+    };
 
-    match crate::usermode::spawn_program(name) {
+    serial_println!(
+        "Process {} spawning '{}' with {} argument(s)",
+        process_id.0,
+        name,
+        argv.count()
+    );
+
+    match crate::usermode::spawn_program_with_args(name, &argv) {
         Ok(thread) => Ok(thread as u64),
         // A shell turns this one into "command not found", so it must not be
         // lumped in with the others.

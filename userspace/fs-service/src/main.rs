@@ -787,6 +787,10 @@ core::arch::global_asm!(
 .global _start
 .type _start, @function
 _start:
+    /* rdi = argc, rsi = argv, put there by the kernel. `iretq` replaces only
+       SS, RSP, RFLAGS, CS and RIP, so every other register crosses the ring
+       boundary untouched — which is what makes this work with no stack
+       marshalling at all. Neither instruction below disturbs them. */
     xorq    %rbp, %rbp
     andq    $-16, %rsp
     call    fs_service_main

@@ -284,6 +284,7 @@ check)
         "I/O bitmap at TSS+" \
         "no block service here, disk test not exercised" \
         "init: kosh userspace starting" \
+        "ata-driver: asked to serve 'ata0'" \
         "ata-driver: got the ata0 ports" \
         "registered as the 'block' service" \
         "service 'block' registered by process" \
@@ -400,7 +401,7 @@ check-cli)
         # because running a program a second time is what exercises the teardown
         # of the first one's mappings.
         type_line "hello"
-        type_line "hello"
+        type_line "hello one two"
         # ksh inside ksh. This was *refused* until per-process address spaces:
         # both are linked at 8 MiB, so a second copy in one address space would
         # have overwritten the .text the first one was executing. Now each has
@@ -480,6 +481,7 @@ check-cli)
         "read LBA 0 in ring 3: a FAT32 boot sector" \
         "a second sector read back different bytes" \
         "the driver refused a read past the end of the disk" \
+        "argv: hello one two" \
         "three clients kept the filesystem straight, no crossed replies" \
         "killed for touching its ports" \
         "ksh: exiting" \

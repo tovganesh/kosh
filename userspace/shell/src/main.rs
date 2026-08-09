@@ -401,6 +401,27 @@ fn cmd_stat(cwd: &str, args: &[String]) {
 /// `lsblk` read `crate::block`. Neither module exists any more, and from here
 /// they are one question with one answer, because the only process that knows
 /// either is the one that mounted the volume.
+/// Flatten `name` and its arguments into the NUL-separated buffer `spawn` takes.
+///
+/// `argv[0]` is the program name, as it is everywhere else, so a program can say
+/// what it was invoked as. Truncated rather than rejected past the kernel's
+/// limit, with the count of what survived visible to the program in `argc`.
+fn command_line(name: &str, args: &[String]) -> Vec<u8> {
+    const MAX: usize = 512;
+    let mut out = Vec::new();
+
+    out.extend_from_slice(name.as_bytes());
+    out.push(0);
+    for arg in args {
+        if out.len() + arg.len() + 1 > MAX {
+            break;
+        }
+        out.extend_from_slice(arg.as_bytes());
+        out.push(0);
+    }
+    out
+}
+
 fn cmd_df() {
     let mut buf = [0u8; 256];
     let n = sys::statfs(&mut buf);
@@ -504,8 +525,9 @@ fn report_unsupported(parsed: &ParsedCommand) -> bool {
 /// No job control — no `jobs`, no `fg`, no notification when it finishes. The
 /// task id is printed so `wait` is at least possible by hand, and so a
 /// background job that dies is not silently gone.
-fn cmd_background(name: &str) {
-    let task = sys::spawn(name);
+fn cmd_background(name: &str, args: &[String]) {
+    let line = command_line(name, args);
+    let task = sys::spawn_with_args(name, &line);
 
     if task == sys::ENOENT {
         print("ksh: ");
@@ -606,8 +628,9 @@ fn civil_from_unix(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
 /// and gets said out loud, because "command not found" for what is actually
 /// "out of memory" or "that program's address range is already occupied" sends
 /// you looking in the wrong place.
-fn cmd_run(name: &str) {
-    let task = sys::spawn(name);
+fn cmd_run(name: &str, args: &[String]) {
+    let line = command_line(name, args);
+    let task = sys::spawn_with_args(name, &line);
 
     if task == sys::ENOENT {
         print("ksh: ");
@@ -740,9 +763,9 @@ pub extern "C" fn ksh_main() -> ! {
             // was the one thing this shell could not do.
             other => {
                 if parsed.background {
-                    cmd_background(other)
+                    cmd_background(other, &parsed.args)
                 } else {
-                    cmd_run(other)
+                    cmd_run(other, &parsed.args)
                 }
             }
         }

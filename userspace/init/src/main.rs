@@ -91,7 +91,38 @@ fn print_i64(mut value: i64) {
 }
 
 fn spawn(name: &str) -> i64 {
-    unsafe { syscall3(SYS_SPAWN, name.as_ptr() as u64, name.len() as u64, 0) }
+    unsafe { syscall4(SYS_SPAWN, name.as_ptr() as u64, name.len() as u64, 0, 0) }
+}
+
+/// Spawn with a command line: a flat NUL-separated buffer, program name first.
+fn spawn_with_args(name: &str, args: &[u8]) -> i64 {
+    unsafe {
+        syscall4(
+            SYS_SPAWN,
+            name.as_ptr() as u64,
+            name.len() as u64,
+            args.as_ptr() as u64,
+            args.len() as u64,
+        )
+    }
+}
+
+#[inline(always)]
+unsafe fn syscall4(number: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 {
+    let ret: i64;
+    core::arch::asm!(
+        "syscall",
+        inlateout("rax") number => ret,
+        in("rdi") a1,
+        in("rsi") a2,
+        in("rdx") a3,
+        // Argument four is in R10, not RCX: `syscall` destroys RCX.
+        in("r10") a4,
+        lateout("rcx") _,
+        lateout("r11") _,
+        options(nostack)
+    );
+    ret
 }
 
 fn wait(task: i64, status: &mut i32) -> i64 {
@@ -139,12 +170,16 @@ const SERVICE_WAIT_YIELDS: u32 = 20_000;
 /// separately on purpose. A service that started and then died would give a
 /// perfectly good id from `spawn` and nothing from the registry, and those two
 /// answers should not be confused with each other.
-fn start_service(module: &str, service: &str) -> i64 {
+fn start_service(module: &str, service: &str, args: &[u8]) -> i64 {
     print("init: starting ");
     print(module);
     print("\n");
 
-    let thread = spawn(module);
+    let thread = if args.is_empty() {
+        spawn(module)
+    } else {
+        spawn_with_args(module, args)
+    };
     if thread < 0 {
         print("init: could not spawn ");
         print(module);
@@ -198,6 +233,10 @@ core::arch::global_asm!(
 .global _start
 .type _start, @function
 _start:
+    /* rdi = argc, rsi = argv, put there by the kernel. `iretq` replaces only
+       SS, RSP, RFLAGS, CS and RIP, so every other register crosses the ring
+       boundary untouched — which is what makes this work with no stack
+       marshalling at all. Neither instruction below disturbs them. */
     xorq    %rbp, %rbp
     andq    $-16, %rsp
     call    init_main
@@ -211,13 +250,17 @@ _start:
 pub extern "C" fn init_main() -> ! {
     print("init: kosh userspace starting\n");
 
-    let block = start_service("ata-driver", "block");
+    // The driver is told *which* device to serve rather than knowing. Whether it
+    // may serve it is a separate question, answered by the capability the kernel
+    // granted at spawn — so init asking for a device the driver has no capability
+    // for is refused, rather than being impossible to express.
+    let block = start_service("ata-driver", "block", b"ata-driver\0ata0\0");
     if block < 0 {
         print("init: no block service; the filesystem cannot mount\n");
         exit(1);
     }
 
-    let fs = start_service("fs-service", "fs");
+    let fs = start_service("fs-service", "fs", b"");
     if fs < 0 {
         print("init: no fs service; the shell would have nothing to read\n");
         shutdown_block(block);

@@ -2244,6 +2244,80 @@ out access it holds by forking, which is the thing a capability system exists to
 prevent. So each child calls `lookup_service` itself and the registry decides —
 one line in the test, and the reason it is there is worth more than the line.
 
+## argv (Phase 22)
+
+`exec` and `spawn` took a program name and nothing else, which is why
+`DRIVER_IMAGES` in `usermode.rs` mapped an *image* name to a device: the driver
+could not be told what to serve, so the kernel had to decide for it.
+
+### A flat buffer, not an array of pointers
+
+`spawn(path, path_len, args_ptr, args_len)` takes the command line as one
+NUL-separated span:
+
+```
+"ata-driver\0ata0\0"
+```
+
+An `argv` in the caller's memory is a list of *addresses*, each of which the
+kernel would have to validate separately, and any of which the caller could
+change between the check and the copy. A flat buffer is one span to bound-check
+and one copy to make, and the count falls out of the terminators.
+
+### Where the strings are written
+
+The child's stack is *reserved*, not allocated — demand-paged since Phase 16 —
+so writing to it faults, and the fault can only be serviced in the address space
+the pages belong to. Doing it in the parent would mean reaching into another
+PML4 through the physmap and materialising the pages by hand.
+
+So `enter_spawned` writes the strings **after** `adopt_address_space`, in the
+child's own thread with the child's CR3 loaded. The demand-zero fault then
+resolves the ordinary way, through the same path a program's first stack write
+takes.
+
+The layout is the conventional one, from the top down: the string bytes, then a
+NULL, then the pointers, `argv[0]` lowest, with `rsp` aligned to 16 below them.
+The terminating NULL costs eight bytes and is the only thing that lets a program
+walk `argv` without being told `argc` — every C runtime relies on it, and keeping
+a convention every other system holds is worth eight bytes.
+
+`argc` and `argv` arrive in RDI and RSI. Nothing marshals them: `iretq` replaces
+only SS, RSP, RFLAGS, CS and RIP, so every other register crosses the ring
+boundary untouched. The `_start` shims gained a comment and no instructions.
+
+### The command line and the capability are different questions
+
+`init` now starts the driver as `ata-driver ata0`. What it is *allowed* to serve
+is still the capability the kernel granted at spawn, from `DRIVER_IMAGES` — and
+those two being independent is the point rather than a leftover.
+
+The control is to have `init` ask for `ata1`:
+
+```
+  ata-driver: asked to serve 'ata1'
+  process 3 asked for 'ata1' without a DeviceAccess capability — refused
+  ata-driver: request_device('ata1') was refused
+```
+
+Nine markers fail behind it, because a system without a disk driver has no
+filesystem and a shell with nothing to list. Before this phase that request could
+not be expressed at all: the device was a constant in the driver's source.
+
+### What ksh does with it
+
+`hello one two` reaches the program:
+
+```
+ksh:/$ hello one two
+  argv: hello one two
+hello from a loaded ELF binary
+```
+
+`argv[0]` is the program name, as everywhere else, so a program can say what it
+was invoked as. Past the kernel's 512-byte limit the line is truncated rather
+than rejected, and `argc` tells the program how much survived.
+
 ## What is deliberately still missing
 - **The filesystem is read-only.** Allocating clusters and keeping both FAT
   copies consistent is a separate problem, and a read-only filesystem that is
@@ -2256,9 +2330,9 @@ one line in the test, and the reason it is there is worth more than the line.
 - **The in-kernel console has no file commands.** It runs only when userspace
   has stopped, so it cannot ask the `fs` service, and it no longer has a
   filesystem of its own. `ls` from the kernel prompt says so.
-- **`exec` takes no `argv`.** A driver cannot be told which device to serve, which
-  is part of why `DRIVER_IMAGES` maps an image name to a device rather than the
-  program deciding.
+- **`exec` takes no `argv`.** `spawn` does; `exec` still replaces an image with
+  the command line it already had. Nothing needs it yet — `hello` execs `hello2`
+  with no arguments — but the asymmetry is real.
 - **Drivers are trusted by boot-module name.** See Phase 18: the delegation chain
   from `init` is what would make the capability grant mean something.
 - **Interrupts are not delivered to ring 3.** The ring-3 driver polls, exactly as

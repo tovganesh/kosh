@@ -193,6 +193,24 @@ fn print(s: &str) {
     write(1, s.as_bytes());
 }
 
+/// `argv[index]`, as a `&str`.
+fn arg(argc: u64, argv: *const *const u8, index: u64) -> Option<&'static str> {
+    if index >= argc || argv.is_null() {
+        return None;
+    }
+    unsafe {
+        let ptr = *argv.add(index as usize);
+        if ptr.is_null() {
+            return None;
+        }
+        let mut len = 0usize;
+        while *ptr.add(len) != 0 && len < 64 {
+            len += 1;
+        }
+        core::str::from_utf8(core::slice::from_raw_parts(ptr, len)).ok()
+    }
+}
+
 /// Print a signed integer without an allocator or `core::fmt`.
 fn print_i64(mut value: i64) {
     let mut buf = [0u8; 24];
@@ -236,6 +254,10 @@ core::arch::global_asm!(
 .global _start
 .type _start, @function
 _start:
+    /* rdi = argc, rsi = argv, put there by the kernel. `iretq` replaces only
+       SS, RSP, RFLAGS, CS and RIP, so every other register crosses the ring
+       boundary untouched — which is what makes this work with no stack
+       marshalling at all. Neither instruction below disturbs them. */
     xorq    %rbp, %rbp          /* end of the frame-pointer chain */
     andq    $-16, %rsp          /* System V: 16-byte aligned at process entry */
     call    kosh_main           /* ...and `call` makes it 8 past, as ABI wants */
@@ -246,7 +268,20 @@ _start:
 );
 
 #[no_mangle]
-pub extern "C" fn kosh_main() -> ! {
+pub extern "C" fn kosh_main(argc: u64, argv: *const *const u8) -> ! {
+    // What the shell was asked to run, as the shell typed it. Printed first so a
+    // command line that did not survive the trip is visible before anything else
+    // happens.
+    print("  argv:");
+    for i in 0..argc {
+        print(" ");
+        match arg(argc, argv, i) {
+            Some(a) => print(a),
+            None => print("<bad>"),
+        }
+    }
+    print("\n");
+
     print("hello from a loaded ELF binary\n");
 
     print("  my pid is ");
