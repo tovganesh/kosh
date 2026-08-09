@@ -207,11 +207,15 @@ fn fs_call(
         }
 
         let reply = &mut *core::ptr::addr_of_mut!(FS_REPLY);
+        // Selective: only from `fs`. The shell is not a server, so nothing else
+        // should be messaging it — but "should" is not a guarantee, and asking
+        // for the reply by sender costs nothing.
         let got = syscall(
             SYS_RECEIVE_MESSAGE,
             reply.as_mut_ptr() as u64,
             reply.len() as u64,
-            1,
+            // Blocking in the low half, the sender to wait for in the high half.
+            ((FS_PID as u64) << 32) | 1,
             0,
         );
         if got < 0 {

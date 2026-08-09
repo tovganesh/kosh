@@ -148,6 +148,19 @@ fn send_message(to: i64, bytes: &[u8]) -> i64 {
     }
 }
 
+/// As [`receive_message`], but only from `from`. Anything else stays queued.
+fn receive_message_from(buf: &mut [u8], from: i64, blocking: bool) -> i64 {
+    unsafe {
+        syscall3(
+            SYS_RECEIVE_MESSAGE,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            // Blocking in the low half, the sender to wait for in the high half.
+            ((from as u64) << 32) | if blocking { 1 } else { 0 },
+        )
+    }
+}
+
 /// Returns `(sender << 32) | length`, or negative on failure.
 fn receive_message(buf: &mut [u8], blocking: bool) -> i64 {
     unsafe {
@@ -585,7 +598,10 @@ fn block_request(driver: i64, op: u32, lba: u64, count: u32) -> (i32, usize) {
         }
 
         let reply = &mut *core::ptr::addr_of_mut!(BLOCK_REPLY);
-        let got = receive_message(reply, true);
+        // From the driver specifically. This program forks children that talk to
+        // the same driver, and a reply meant for one of them landing here would
+        // be a sector's worth of plausible-looking bytes.
+        let got = receive_message_from(reply, driver, true);
         if got < 0 {
             return (-101, 0);
         }
@@ -690,10 +706,142 @@ fn drive_a_disk() {
         print("  WARNING: the driver accepted an impossible LBA\n");
     }
 
+
+    concurrent_fs_clients();
+
     // Deliberately no shutdown. The driver is shared: `fs` is reading through it
     // and `ksh` is waiting on `fs`. Stopping a service because a client happens
     // to be finished with it is what the reference count in a real system is for.
     print("  leaving the shared driver running\n");
+}
+
+/// Three processes hammering the *filesystem* at once.
+///
+/// The service under test has to be one that is itself a client — `fs` reads
+/// sectors from `block` — because that is where messages cross. While `fs` is
+/// blocked waiting for a sector, a second client's request arrives; a receive
+/// that takes whatever came first hands it that request instead of the sector.
+///
+/// `block` alone does not exercise it. A driver that only ever answers is never
+/// waiting for anything, and three clients doing strict request/reply against it
+/// pass with or without selective receive — which is how the first version of
+/// this test came out green against the bug it was written for.
+///
+/// `STAT /README.TXT` rather than `STAT /`, because the root is synthetic and
+/// answering it needs no disk at all. A path lookup walks the root directory,
+/// which is several sector reads, which is the window.
+fn concurrent_fs_clients() {
+    const ROUNDS: usize = 15;
+    const PATH: &str = "/README.TXT";
+    /// What `ls` reports for it, so a crossed reply cannot pass by being a
+    /// well-formed answer about something else.
+    const EXPECTED_SIZE: u32 = 199;
+
+    let mut children = [0i64; 2];
+    for slot in children.iter_mut() {
+        let pid = fork();
+        if pid < 0 {
+            print("  WARNING: could not fork a concurrent client\n");
+            *slot = -1;
+            continue;
+        }
+        if pid == 0 {
+            // The child has to look the service up itself. Capabilities are not
+            // inherited across `fork`: the child is a new pid, and the grant its
+            // parent got from `lookup_service` names the parent. Inheriting them
+            // would let a process hand out access it holds by forking, which is
+            // the thing a capability system exists to prevent.
+            let fs = lookup_service("fs");
+            if fs < 0 {
+                exit(2);
+            }
+            let mut good = 0;
+            for _ in 0..ROUNDS {
+                if stat_size(fs, PATH) == Some(EXPECTED_SIZE) {
+                    good += 1;
+                }
+            }
+            exit(if good == ROUNDS { 0 } else { 1 });
+        }
+        *slot = pid;
+    }
+
+    let fs = lookup_service("fs");
+    let mut good = 0;
+    if fs >= 0 {
+        for _ in 0..ROUNDS {
+            if stat_size(fs, PATH) == Some(EXPECTED_SIZE) {
+                good += 1;
+            }
+        }
+    }
+
+    let mut all_good = fs >= 0 && good == ROUNDS;
+    for &child in children.iter() {
+        if child < 0 {
+            all_good = false;
+            continue;
+        }
+        let mut status: i32 = 0;
+        wait(child, &mut status);
+        if status != 0 {
+            all_good = false;
+        }
+    }
+
+    if all_good {
+        print("  three clients kept the filesystem straight, no crossed replies\n");
+    } else {
+        print("  WARNING: concurrent filesystem clients got crossed or missing replies\n");
+    }
+}
+
+// The filesystem protocol, client side. Only `STAT` — this program is testing
+// the transport, not the filesystem.
+const FS_REQ_MAGIC: u32 = 0x4B46_5330; // "KFS0"
+const FS_REP_MAGIC: u32 = 0x4B46_5231; // "KFR1"
+const FS_OP_STAT: u32 = 4;
+const FS_REQ_HEADER: usize = 40;
+const FS_REP_HEADER: usize = 24;
+
+static mut FS_REQUEST: [u8; FS_REQ_HEADER + 64] = [0; FS_REQ_HEADER + 64];
+static mut FS_REPLY: [u8; 256] = [0; 256];
+
+/// `stat(path).size`, or `None` if anything about the exchange was wrong.
+fn stat_size(fs: i64, path: &str) -> Option<u32> {
+    unsafe {
+        let request = &mut *core::ptr::addr_of_mut!(FS_REQUEST);
+        for byte in request.iter_mut() {
+            *byte = 0;
+        }
+        put_u32(request, 0, FS_REQ_MAGIC);
+        put_u32(request, 4, FS_OP_STAT);
+        put_u32(request, 32, path.len() as u32);
+        request[FS_REQ_HEADER..FS_REQ_HEADER + path.len()].copy_from_slice(path.as_bytes());
+
+        if send_message(fs, &request[..FS_REQ_HEADER + path.len()]) < 0 {
+            return None;
+        }
+
+        let reply = &mut *core::ptr::addr_of_mut!(FS_REPLY);
+        let got = receive_message_from(reply, fs, true);
+        if got < 0 {
+            return None;
+        }
+
+        let len = (got & 0xFFFF_FFFF) as usize;
+        if len < FS_REP_HEADER || get_u32(reply, 0) != FS_REP_MAGIC {
+            return None;
+        }
+        if get_u32(reply, 4) as i32 != 0 {
+            return None;
+        }
+        // The RawDirEntry the service returns: 64 bytes of name, then the size.
+        if len < FS_REP_HEADER + 68 {
+            return None;
+        }
+        Some(get_u32(reply, FS_REP_HEADER + 64))
+    }
 }
 
 /// Exit code the kernel gives a process it terminates for a fault.

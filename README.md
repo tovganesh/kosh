@@ -65,7 +65,7 @@ test disk, then boots the lot:
 ```bash
 ./scripts/run.sh              # boot it, serial on stdio (ctrl-a x to quit)
 ./scripts/run.sh --check      # boot headless, assert 61 serial markers (CI)
-./scripts/run.sh --check-cli  # drive the shell through QEMU's monitor, assert 41
+./scripts/run.sh --check-cli  # drive the shell through QEMU's monitor, assert 42
 ./scripts/run.sh --debug      # same as plain run, plus a gdb stub on :1234
 ```
 
@@ -243,9 +243,10 @@ of it.
 - **The keyboard driver is still in the kernel**, and has no plan yet. It is
   harder than the disk: it is interrupt-driven, and ring 3 cannot receive
   interrupts.
-- **IPC has no reply port.** A service waiting for its own downstream reply can
-  be interrupted by a client's request. `fs` stashes exactly one of those; a
-  third concurrent client is dropped with a warning and hangs.
+- **IPC has no reply *port*, only a sender filter.** `receive_message` can wait
+  for a named process, which is enough for request/reply and is what the services
+  use. It is not enough to tell two outstanding requests to the same server
+  apart — that needs a per-request token, and nothing here has two in flight yet.
 - **Drivers are trusted by boot-module name.** `DRIVER_IMAGES` in `usermode.rs`
   maps `ata-driver` to `ata0`, so the trust root is "GRUB loaded it from the
   ISO". A real capability system delegates from `init`; this is a two-entry table
@@ -326,7 +327,7 @@ Roughly in order, each unblocking the next:
 - [x] The disk driver out of the kernel, with port permissions to make it possible
 - [x] The filesystem out of the kernel, and an `init` that starts both
 - [x] `fs/` and `block/` deleted — the kernel cannot read a disk at all
-- [ ] A reply port for IPC, so a service can be asked something while it waits
+- [x] Selective receive, so a service can be asked something while it waits
 - [ ] `argv` for `exec`, so a driver can be told what to serve
 - [ ] FAT32 writes
 - [ ] `userspace/init` doing its job

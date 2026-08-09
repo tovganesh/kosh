@@ -106,12 +106,16 @@ pub fn cache_stats() -> (u64, u64) {
 
 /// Send one request and wait for its reply. Returns the payload length.
 ///
-/// The awkward part is the wait. `receive_message` hands over whatever arrived
-/// first from anyone, and a filesystem client can perfectly well send a request
-/// while we are halfway through reading a directory for the previous one. Such a
-/// message is set aside via [`crate::stash_client_message`] and the wait
-/// continues; treating it as the driver's reply would mean parsing an fs request
+/// The wait is *selective*: it asks the kernel for a message from the block
+/// service specifically. A filesystem client can perfectly well send a request
+/// while this service is halfway through reading a directory for the previous
+/// one, and treating that as the driver's reply would mean parsing an fs request
 /// as sector data.
+///
+/// This used to be a loop that received from anyone and set aside anything that
+/// was not the driver — one slot's worth, which handled a second concurrent
+/// client and dropped a third. Leaving the message in the kernel's queue instead
+/// has no slot to run out of.
 fn transact(op: u32, lba: u64, count: u32) -> Result<usize, BlockError> {
     let pid = unsafe { SERVICE_PID };
     if pid == 0 {
@@ -131,20 +135,14 @@ fn transact(op: u32, lba: u64, count: u32) -> Result<usize, BlockError> {
         }
     }
 
-    loop {
+    {
         let reply = unsafe { &mut *core::ptr::addr_of_mut!(REPLY) };
-        let received = crate::receive_message(reply);
+        let received = crate::receive_message_from(reply, pid);
         if received < 0 {
             return Err(BlockError::Ipc);
         }
 
-        let sender = (received as u64 >> 32) as u32;
         let len = (received as u64 & 0xFFFF_FFFF) as usize;
-
-        if sender != pid {
-            crate::stash_client_message(sender, &reply[..core::cmp::min(len, reply.len())]);
-            continue;
-        }
 
         if len < REP_HEADER || read_u32(reply, 0) != REP_MAGIC {
             return Err(BlockError::Protocol);

@@ -480,6 +480,7 @@ check-cli)
         "read LBA 0 in ring 3: a FAT32 boot sector" \
         "a second sector read back different bytes" \
         "the driver refused a read past the end of the disk" \
+        "three clients kept the filesystem straight, no crossed replies" \
         "killed for touching its ports" \
         "ksh: exiting" \
         "init: ksh exited with 0, shutting the services down" \

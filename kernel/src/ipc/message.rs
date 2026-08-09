@@ -337,6 +337,21 @@ pub fn send_message(message: Message) -> Result<(), MessageError> {
 }
 
 /// Receive a message for the current process
+/// Take the next message from `sender` specifically, leaving the rest queued.
+///
+/// A client waiting for the answer to a request it just sent wants this, not
+/// [`receive_message`]. See `queue::MessageQueue::dequeue_from`.
+pub fn receive_message_from(
+    receiver: ProcessId,
+    sender: ProcessId,
+) -> Result<Message, MessageError> {
+    if !crate::process::process_exists(receiver) {
+        return Err(MessageError::ReceiverNotFound);
+    }
+
+    crate::ipc::queue::dequeue_message_from(receiver, sender)
+}
+
 pub fn receive_message(receiver: ProcessId) -> Result<Message, MessageError> {
     serial_println!("Process {} attempting to receive message", receiver.0);
     
