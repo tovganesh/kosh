@@ -286,12 +286,14 @@ check)
         "init: kosh userspace starting" \
         "ata-driver: asked to serve 'ata0'" \
         "ata-driver: got the ata0 ports" \
+        "IRQ0 (timer), IRQ1 (keyboard) and IRQ14 (IDE) unmasked" \
         "registered as the 'block' service" \
         "service 'block' registered by process" \
         "fs-service: mounted" \
         "service 'fs' registered by process" \
         "init: userspace is up, handing the console to ksh" \
         "IDENTIFY succeeded from ring 3" \
+        "waiting on IRQ 14 without the device that raises it was refused" \
         "killed for touching its ports" \
         "child: I inherited the value my parent set before forking" \
         "child: my copy of the witness is mine" \
@@ -483,9 +485,12 @@ check-cli)
         "the driver refused a read past the end of the disk" \
         "argv: hello one two" \
         "three clients kept the filesystem straight, no crossed replies" \
+        "waiting on IRQ 14 without the device that raises it was refused" \
         "killed for touching its ports" \
         "ksh: exiting" \
         "init: ksh exited with 0, shutting the services down" \
+        "sector waits were woken by IRQ 14" \
+        "ata-driver: the disk woke this process from ring 3" \
         "init: services stopped, exiting" \
         "init exited with code 0, falling back to the kernel console" \
         "Kosh console" \

@@ -81,6 +81,16 @@ pub const SYS_REGISTER_SERVICE: u64 = 46;
 /// Find a service *and* get a capability for it. The grant is the point: a pid
 /// without one is a phone number with no line attached.
 pub const SYS_LOOKUP_SERVICE: u64 = 47;
+/// `wait_irq(irq, seen, timeout_ms)` -> the line's current fire count
+///
+/// Blocks until the count differs from `seen`, or until the timeout expires —
+/// whichever comes first, and the caller can tell which by comparing. A count
+/// rather than a flag so that an interrupt arriving *before* the wait is a
+/// non-event rather than a hang; see `interrupts::irq_wait`.
+///
+/// Permitted only for a line belonging to a device the caller holds. There is no
+/// separate IRQ capability: an interrupt is part of a device.
+pub const SYS_WAIT_IRQ: u64 = 48;
 
 /// System information system calls
 pub const SYS_UNAME: u64 = 50;
@@ -159,6 +169,7 @@ pub fn syscall_name(syscall_number: u64) -> &'static str {
         SYS_RELEASE_DEVICE => "release_device",
         SYS_REGISTER_SERVICE => "register_service",
         SYS_LOOKUP_SERVICE => "lookup_service",
+        SYS_WAIT_IRQ => "wait_irq",
         
         SYS_UNAME => "uname",
         SYS_SYSINFO => "sysinfo",

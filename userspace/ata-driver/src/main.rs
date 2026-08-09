@@ -25,6 +25,7 @@ const SYS_SEND_MESSAGE: u64 = 30;
 const SYS_RECEIVE_MESSAGE: u64 = 31;
 const SYS_REQUEST_DEVICE: u64 = 44;
 const SYS_REGISTER_SERVICE: u64 = 46;
+const SYS_WAIT_IRQ: u64 = 48;
 
 // --- the block protocol ----------------------------------------------------
 //
@@ -202,6 +203,65 @@ fn wait_ready_for_data() -> Result<(), i32> {
     Err(STATUS_TIMEOUT)
 }
 
+/// The IRQ line the primary IDE channel raises.
+const ATA_IRQ: u64 = 14;
+
+/// How the driver waited for the disk before this phase, and what it falls back
+/// to: `POLL_LIMIT` reads of the status register, burning a whole time slice per
+/// sector on a CPU that has other work.
+static mut IRQ_WAITS: u64 = 0;
+static mut IRQ_TIMEOUTS: u64 = 0;
+static mut IRQ_SEEN: u64 = 0;
+
+/// The line's current fire count, without waiting.
+///
+/// There is no separate syscall for this: `wait_irq` blocks only while the count
+/// *equals* what the caller says it saw, so a value the count can never hold
+/// means "tell me now". One call that answers both questions is one fewer
+/// number in the table and one fewer thing that can disagree with the other.
+fn irq_count() -> u64 {
+    wait_irq(u64::MAX, 0)
+}
+
+fn wait_irq(seen: u64, timeout_ms: u64) -> u64 {
+    let got = unsafe { syscall3(SYS_WAIT_IRQ, ATA_IRQ, seen, timeout_ms) };
+    if got < 0 {
+        // Refused, which means this process does not hold the device that
+        // raises the line. Report the count unchanged so the caller polls.
+        seen
+    } else {
+        got as u64
+    }
+}
+
+/// Sleep until the disk says it is ready, then confirm with the status register.
+///
+/// The interrupt is a *hint*, not the answer: ATA requires the status register
+/// to be read to clear the device's interrupt condition, and the register is the
+/// only thing that distinguishes "data ready" from "error". So the wait replaces
+/// the spinning, not the checking.
+///
+/// The count is captured *before* the command is issued — by the caller, into
+/// `IRQ_SEEN` — because a disk can answer faster than this process can be
+/// scheduled. A flag would be cleared by nobody and the wait would hang on an
+/// interrupt that had already happened; a counter that has already moved simply
+/// returns.
+fn await_data() -> Result<(), i32> {
+    let seen = unsafe { IRQ_SEEN };
+    let now = wait_irq(seen, 200);
+
+    unsafe {
+        IRQ_WAITS += 1;
+        if now == seen {
+            IRQ_TIMEOUTS += 1;
+        }
+    }
+
+    // Either way, the status register decides. A timeout here is slow, not
+    // wrong: `wait_ready_for_data` polls exactly as it always did.
+    wait_ready_for_data()
+}
+
 /// IDENTIFY the primary master, filling in [`BLOCKS`] and [`MODEL`].
 fn identify() -> Result<(), i32> {
     unsafe {
@@ -277,10 +337,13 @@ fn read_sectors(lba: u64, count: usize, out: &mut [u8]) -> Result<(), i32> {
             outb(IO_BASE + 4, ((this >> 8) & 0xFF) as u8);
             outb(IO_BASE + 5, ((this >> 16) & 0xFF) as u8);
             delay_400ns();
+            // Remember where the interrupt count stood *before* the command, so
+            // an interrupt that beats us to the wait is not lost.
+            IRQ_SEEN = irq_count();
             outb(IO_BASE + 7, CMD_READ_SECTORS);
         }
 
-        wait_ready_for_data()?;
+        await_data()?;
 
         let base = sector * SECTOR;
         let mut i = 0;
@@ -490,6 +553,23 @@ pub extern "C" fn ata_driver_main(argc: u64, argv: *const *const u8) -> ! {
     // which releases `ata0` and lets the kernel's own block layer have the disk
     // back — see `platform::devports`.
     while serve_one() {}
+
+    unsafe {
+        print("  ata-driver: ");
+        print_u64(IRQ_WAITS - IRQ_TIMEOUTS);
+        print(" of ");
+        print_u64(IRQ_WAITS);
+        print(" sector waits were woken by IRQ 14\n");
+
+        // The count alone is not a test: a driver whose interrupts never arrive
+        // still reads every sector, just slowly, and prints a perfectly
+        // well-formed line saying zero. So say which of the two happened.
+        if IRQ_WAITS > 0 && IRQ_TIMEOUTS == IRQ_WAITS {
+            print("  WARNING: every wait timed out — the driver polled for all of them\n");
+        } else if IRQ_WAITS > 0 {
+            print("  ata-driver: the disk woke this process from ring 3\n");
+        }
+    }
 
     print("  ata-driver: shutting down, releasing ata0\n");
     exit(0)

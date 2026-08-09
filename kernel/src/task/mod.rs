@@ -81,6 +81,14 @@ pub enum BlockedOn {
     /// A message arriving in this process's queue. The id is the thread's own,
     /// because a process and its thread share one id.
     Message(usize),
+    /// A hardware interrupt on this line, or the deadline passing — whichever
+    /// comes first. The deadline is in timer ticks and is checked by the timer
+    /// handler, which is the only clock the kernel has.
+    ///
+    /// A wait with no deadline would mean a driver waiting on a line that is
+    /// masked, or on a device that needs its status register read before it will
+    /// lower the line, hangs the system. Slow beats stuck.
+    Irq { line: u8, deadline: u64 },
 }
 
 /// A 512-byte `FXSAVE` area.
@@ -824,6 +832,48 @@ pub fn block_for_message() {
     });
 
     schedule();
+}
+
+/// Park the running thread until `line` fires or `deadline` (in ticks) passes.
+pub fn block_for_irq(line: u8, deadline: u64) {
+    without_interrupts(|| {
+        let mut sched = SCHEDULER.lock();
+        let current = sched.current;
+        if let Some(t) = sched.threads[current].as_mut() {
+            t.state = State::Blocked(BlockedOn::Irq { line, deadline });
+        }
+    });
+
+    schedule();
+}
+
+/// Make every thread waiting on `line` runnable.
+///
+/// Called from an interrupt handler, so it must do nothing but take the
+/// scheduler lock and set some states — no allocation, no IPC, no second lock.
+pub fn wake_for_irq(line: u8) {
+    without_interrupts(|| {
+        let mut sched = SCHEDULER.lock();
+        for t in sched.threads.iter_mut().flatten() {
+            if matches!(t.state, State::Blocked(BlockedOn::Irq { line: l, .. }) if l == line) {
+                t.state = State::Ready;
+            }
+        }
+    });
+}
+
+/// Wake IRQ waiters whose deadline has passed. Called from the timer handler,
+/// which already holds no locks.
+pub fn expire_irq_waits(now: u64) {
+    without_interrupts(|| {
+        let mut sched = SCHEDULER.lock();
+        for t in sched.threads.iter_mut().flatten() {
+            if matches!(t.state, State::Blocked(BlockedOn::Irq { deadline, .. }) if now >= deadline)
+            {
+                t.state = State::Ready;
+            }
+        }
+    });
 }
 
 /// Make a thread waiting for a message runnable again.

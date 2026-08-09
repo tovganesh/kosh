@@ -2318,6 +2318,99 @@ hello from a loaded ELF binary
 was invoked as. Past the kernel's 512-byte limit the line is truncated rather
 than rejected, and `argc` tells the program how much survived.
 
+## Interrupts, for processes that are not the kernel (Phase 23)
+
+The disk driver ran in ring 3 from Phase 18 and spun on a status register for
+every sector, because ring 3 could not be told an interrupt had happened. It can
+now: `wait_irq(irq, seen, timeout_ms)` blocks until the line fires.
+
+```
+  ata-driver: 104 of 104 sector waits were woken by IRQ 14
+  ata-driver: the disk woke this process from ring 3
+```
+
+### Why a counter and not a message
+
+The obvious design is "the kernel turns an IRQ into an IPC message". It is also
+the one that deadlocks. Sending a message takes the message-queue lock and the
+capability manager's lock, and an interrupt can arrive while the interrupted
+thread holds either — the driver whose request is being serviced is *exactly*
+the thread most likely to be inside the IPC path when its own device raises
+IRQ 14.
+
+So an interrupt does the smallest thing that cannot deadlock: increment an
+atomic and mark any thread waiting on that line runnable. No allocation, no IPC
+locks, one `fetch_add` and a scan of a fixed thread table.
+
+### Why a counter and not a flag
+
+`wait_irq(irq, seen)` blocks only while the count still equals `seen`. The
+driver reads the count *before* issuing its command, and passes it back.
+
+A flag would lose the common race. A disk can answer faster than a process can
+be scheduled: the driver issues the read, the IRQ fires before the driver reaches
+`wait_irq`, and with a flag there is nobody to have set it — the driver then
+waits for an interrupt that already happened. That bug is a hang, and hangs are
+the expensive kind. A count that has already moved simply returns.
+
+Reading the count without waiting needs no second system call: `wait_irq` blocks
+only while the count *equals* what the caller claims to have seen, so passing a
+value it can never hold means "tell me now". One call answering both questions is
+one fewer number in the table and one fewer thing that can disagree with the
+other.
+
+### Why it has a deadline
+
+A driver that waits forever for an interrupt that never comes takes the system
+with it — and "never comes" is the ordinary outcome of a wrong PIC mask, a device
+that will not lower its line until its status register is read, or an emulator
+quirk. So the wait is bounded in timer ticks, and expiry is *reported* rather
+than hidden: the count comes back unchanged, and the caller falls back to
+polling, which it can do because it owns the ports.
+
+The deadline is computed once, before the loop. Recomputing it each pass would
+let a line that fires steadily — a shared PIC pin, say — extend the wait
+indefinitely, which is the failure the deadline exists to prevent.
+
+The interrupt is a *hint*, not the answer. ATA requires the status register to be
+read to clear the device's interrupt condition, and the register is the only
+thing that distinguishes "data ready" from "error". The wait replaces the
+spinning, not the checking.
+
+### The permission is the device
+
+There is no IRQ capability. A thread may wait on a line only if it holds the
+device that raises it, and `Device` gained an `irq` field so the two cannot
+disagree:
+
+```rust
+Device { name: "ata0", ranges: [...], irq: Some(14), .. }
+```
+
+A driver that could name an arbitrary IRQ could wait on the timer line and watch
+the scheduler.
+
+`hello` checks the refusal, and needs no forked child to do it — unlike the port
+test beside it, which expects death. That difference is worth noticing: the CPU
+enforces the ports and answers with a #GP, the kernel enforces the line and
+answers with an error return. Both answer to the same grant.
+
+```
+  waiting on IRQ 14 without the device that raises it was refused
+```
+
+### The control, and what it actually shows
+
+Masking IRQ 14 at the PIC — one bit in `write_masks` — does not break the system,
+and that is the claim being tested. Every wait times out, the driver polls for
+every sector exactly as it did before this phase, and the disk is still read
+correctly. What it does is make the scripted console session so much slower that
+it runs past its QEMU time budget, and fourteen markers fail behind it, including
+the driver's own summary because `init` never gets to shut it down.
+
+Slow beats stuck, demonstrated in both directions: the line masked, the system
+still works; the line live, 104 of 104 waits woken by the disk.
+
 ## What is deliberately still missing
 - **The filesystem is read-only.** Allocating clusters and keeping both FAT
   copies consistent is a separate problem, and a read-only filesystem that is
@@ -2335,9 +2428,9 @@ than rejected, and `argc` tells the program how much survived.
   with no arguments — but the asymmetry is real.
 - **Drivers are trusted by boot-module name.** See Phase 18: the delegation chain
   from `init` is what would make the capability grant mean something.
-- **Interrupts are not delivered to ring 3.** The ring-3 driver polls, exactly as
-  the in-kernel one does. A driver that wants IRQ14 needs the kernel to turn an
-  interrupt into a message, which nothing does yet.
+- **Interrupt delivery is a wake, not a message.** A driver can sleep on a line
+  it owns; it cannot be *sent* anything by an interrupt, and there is no way to
+  hand a line to a process that does not own the whole device.
 - **The descriptor table is still global.** One table for the system, because
   `Program` has nowhere to hang a per-process one yet. `sys_exit` works around
   it by only closing everything when it is the last program running.
