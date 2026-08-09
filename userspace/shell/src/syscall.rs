@@ -379,6 +379,24 @@ pub fn spawn(name: &str) -> i64 {
     unsafe { syscall(SYS_SPAWN, name.as_ptr() as u64, name.len() as u64, 0, 0) }
 }
 
+/// Spawn with a command line: a flat NUL-separated buffer, program name first.
+///
+/// Flat rather than an array of pointers because that is what the kernel takes —
+/// one span it can bound-check once, instead of a list of addresses each of
+/// which it would have to validate separately and which could change underneath
+/// it between the check and the copy.
+pub fn spawn_with_args(name: &str, args: &[u8]) -> i64 {
+    unsafe {
+        syscall(
+            SYS_SPAWN,
+            name.as_ptr() as u64,
+            name.len() as u64,
+            args.as_ptr() as u64,
+            args.len() as u64,
+        )
+    }
+}
+
 /// Block until `task` finishes; returns its exit code through `status`.
 pub fn wait(task: i64, status: &mut i32) -> i64 {
     unsafe {

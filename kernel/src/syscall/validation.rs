@@ -147,7 +147,13 @@ fn validate_wait_args(_args: &[u64; 6]) -> Result<(), SyscallError> {
     Ok(())
 }
 
-/// `spawn(path_ptr, path_len)`.
+/// `spawn(path_ptr, path_len, args_ptr, args_len)`.
+///
+/// The command line is optional: a zero pointer or a zero length means "just the
+/// program name", which is what the kernel then synthesises. Arguments three and
+/// four live in RDX and R10, and R10 is a register a three-argument caller does
+/// not write — so a caller that wants no arguments must pass a zero *length*
+/// too, and `args_ptr == 0` is checked first for exactly that reason.
 fn validate_spawn_args(process_id: ProcessId, args: &[u64; 6]) -> Result<(), SyscallError> {
     let path_ptr = args[0];
     let path_len = args[1];
@@ -155,7 +161,14 @@ fn validate_spawn_args(process_id: ProcessId, args: &[u64; 6]) -> Result<(), Sys
     if path_len == 0 || path_len > 255 {
         return Err(SyscallError::InvalidArgument);
     }
-    validate_user_pointer(process_id, path_ptr, path_len as usize, false)
+    validate_user_pointer(process_id, path_ptr, path_len as usize, false)?;
+
+    if args[2] != 0 && args[3] != 0 {
+        let len = core::cmp::min(args[3] as usize, crate::usermode::MAX_ARG_BYTES);
+        validate_user_pointer(process_id, args[2], len, false)?;
+    }
+
+    Ok(())
 }
 
 fn validate_no_args(args: &[u64; 6]) -> Result<(), SyscallError> {

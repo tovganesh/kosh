@@ -92,6 +92,29 @@ fn print_u64(mut value: u64) {
     unsafe { syscall3(SYS_WRITE, 1, buf[i..].as_ptr() as u64, (buf.len() - i) as u64) };
 }
 
+/// `argv[index]`, as a `&str`.
+///
+/// The kernel NUL-terminates each string and terminates the array with a null
+/// pointer, so this needs no length and no trust in `argc` beyond the bound
+/// check — but it checks `argc` anyway, because two independent ways of knowing
+/// where the array ends is exactly the situation where one of them is wrong.
+fn arg(argc: u64, argv: *const *const u8, index: u64) -> Option<&'static str> {
+    if index >= argc || argv.is_null() {
+        return None;
+    }
+    unsafe {
+        let ptr = *argv.add(index as usize);
+        if ptr.is_null() {
+            return None;
+        }
+        let mut len = 0usize;
+        while *ptr.add(len) != 0 && len < 64 {
+            len += 1;
+        }
+        core::str::from_utf8(core::slice::from_raw_parts(ptr, len)).ok()
+    }
+}
+
 fn exit(code: u64) -> ! {
     unsafe { syscall3(SYS_EXIT, code, 0, 0) };
     loop {
@@ -389,6 +412,10 @@ core::arch::global_asm!(
 .global _start
 .type _start, @function
 _start:
+    /* rdi = argc, rsi = argv, put there by the kernel. `iretq` replaces only
+       SS, RSP, RFLAGS, CS and RIP, so every other register crosses the ring
+       boundary untouched — which is what makes this work with no stack
+       marshalling at all. Neither instruction below disturbs them. */
     xorq    %rbp, %rbp
     andq    $-16, %rsp
     call    ata_driver_main
@@ -399,13 +426,21 @@ _start:
 );
 
 #[no_mangle]
-pub extern "C" fn ata_driver_main() -> ! {
+pub extern "C" fn ata_driver_main(argc: u64, argv: *const *const u8) -> ! {
     print("  ata-driver: starting in ring 3\n");
+
+    // Which device to serve comes from the command line, not from a constant.
+    // Whether this process *may* serve it is a separate question, answered by
+    // the capability the kernel granted at spawn — so `init` asking for a device
+    // this driver has no capability for is refused rather than unrepresentable.
+    let device = arg(argc, argv, 1).unwrap_or("ata0");
+    print("  ata-driver: asked to serve '");
+    print(device);
+    print("'\n");
 
     // The two system calls that make the rest of this program legal. Everything
     // after them is `in` and `out` on a disk, executed by an unprivileged
     // process with its own page tables and no way to reach the kernel's.
-    let device = "ata0";
     let granted = unsafe {
         syscall3(
             SYS_REQUEST_DEVICE,
@@ -416,7 +451,9 @@ pub extern "C" fn ata_driver_main() -> ! {
     };
 
     if granted < 0 {
-        print("  ata-driver: request_device('ata0') was refused\n");
+        print("  ata-driver: request_device('");
+        print(device);
+        print("') was refused\n");
         exit(1);
     }
     print("  ata-driver: got the ata0 ports\n");

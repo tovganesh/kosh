@@ -64,8 +64,8 @@ test disk, then boots the lot:
 
 ```bash
 ./scripts/run.sh              # boot it, serial on stdio (ctrl-a x to quit)
-./scripts/run.sh --check      # boot headless, assert 61 serial markers (CI)
-./scripts/run.sh --check-cli  # drive the shell through QEMU's monitor, assert 42
+./scripts/run.sh --check      # boot headless, assert 62 serial markers (CI)
+./scripts/run.sh --check-cli  # drive the shell through QEMU's monitor, assert 43
 ./scripts/run.sh --debug      # same as plain run, plus a gdb stub on :1234
 ```
 
@@ -225,8 +225,9 @@ of it.
   VFS, so `mmap` still refuses anything but `MAP_ANONYMOUS`. There is also no
   reclaim: nothing ever takes a page *back*, so the only pressure valve is a
   process exiting.
-- **No `argv`.** `exec` takes a program name and nothing else; passing arguments
-  needs somewhere to put the strings in the new address space.
+- **`exec` takes no `argv`.** `spawn` does — `ksh` passes command-line arguments
+  and `init` starts the driver as `ata-driver ata0` — but `exec` still replaces
+  an image with the command line it already had.
 - **The filesystem is read-only.** `ksh` refuses redirection rather than
   pretending; there is no `mkdir`, `unlink` or write path.
 - **IPC is send/receive only.** `reply_message`, `create_channel` and
@@ -328,7 +329,9 @@ Roughly in order, each unblocking the next:
 - [x] The filesystem out of the kernel, and an `init` that starts both
 - [x] `fs/` and `block/` deleted — the kernel cannot read a disk at all
 - [x] Selective receive, so a service can be asked something while it waits
-- [ ] `argv` for `exec`, so a driver can be told what to serve
+- [x] `argv` for `spawn`, so a driver is told what to serve rather than knowing
+- [ ] Interrupts delivered to ring 3, so a driver can stop polling — and so the
+      keyboard, the last driver inside the kernel, could move out
 - [ ] FAT32 writes
 - [ ] `userspace/init` doing its job
 
