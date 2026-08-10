@@ -92,6 +92,7 @@ pub fn dispatch_syscall(
         SYS_RELEASE_DEVICE => sys_release_device(process_id, args),
         SYS_REGISTER_SERVICE => sys_register_service(process_id, args),
         SYS_LOOKUP_SERVICE => sys_lookup_service(process_id, args),
+        SYS_WAIT_IRQ => sys_wait_irq(process_id, args),
         
         // System information
         SYS_UNAME => sys_uname(process_id, args),
@@ -942,6 +943,54 @@ fn sys_driver_response(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
                    process_id.0, request_id, response_ptr, response_len);
     
     // TODO: Implement driver response
+    Err(SyscallError::NotSupported)
+}
+
+/// `wait_irq(irq, seen, timeout_ms)` -> the line's current fire count
+///
+/// The permission check is the device grant this thread already holds: a driver
+/// may wait on the line its device raises and no other. A separate IRQ
+/// capability would be a second thing to keep in step with the first.
+#[cfg(target_arch = "x86_64")]
+fn sys_wait_irq(process_id: ProcessId, args: [u64; 6]) -> SyscallResult {
+    use crate::interrupts::irq_wait;
+
+    let irq = args[0] as u8;
+    let seen = args[1];
+    let timeout_ms = if args[2] == 0 { 50 } else { args[2] };
+
+    if !crate::platform::devports::grant_covers_irq(crate::task::current_io_grant(), irq) {
+        serial_println!(
+            "  process {} asked to wait on IRQ {} without holding the device that raises it",
+            process_id.0,
+            irq
+        );
+        return Err(SyscallError::PermissionDenied);
+    }
+
+    // The deadline is computed once, before the loop. Recomputing it on each
+    // pass would make a line that fires steadily — a spurious interrupt on a
+    // shared PIC pin, say — extend the wait indefinitely, which is the failure
+    // the deadline exists to prevent.
+    let ticks = (timeout_ms * crate::interrupts::timer::TIMER_HZ as u64).div_ceil(1000).max(1);
+    let deadline = crate::interrupts::timer::ticks() + ticks;
+
+    loop {
+        let now = irq_wait::count(irq);
+        if now != seen {
+            return Ok(now);
+        }
+        if crate::interrupts::timer::ticks() >= deadline {
+            // Not an error: the caller asked to be told, and "the line did not
+            // fire" is an answer. Returning `seen` unchanged is how it knows.
+            return Ok(seen);
+        }
+        crate::task::block_for_irq(irq, deadline);
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn sys_wait_irq(_process_id: ProcessId, _args: [u64; 6]) -> SyscallResult {
     Err(SyscallError::NotSupported)
 }
 

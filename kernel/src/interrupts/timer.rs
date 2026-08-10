@@ -101,6 +101,12 @@ pub extern "x86-interrupt" fn timer_interrupt_handler(_frame: InterruptStackFram
         pic::notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
     }
 
+    // Deadlines first, and before `on_tick` — a thread whose IRQ wait has
+    // expired should be runnable *when* the scheduler looks, not one tick
+    // later. This is the only clock the kernel has, so it is the only place a
+    // timeout can be noticed.
+    crate::task::expire_irq_waits(tick);
+
     // The wiring that never existed: a periodic interrupt that actually reaches
     // a scheduler. This call may switch stacks and return on a different
     // thread.

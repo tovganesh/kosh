@@ -24,6 +24,13 @@ pub struct Device {
     /// At most two runs — a command block and a control block, which is the
     /// shape of every legacy device that is split at all.
     pub ranges: [Option<PortRange>; 2],
+    /// The PIC line this device raises, if it has one.
+    ///
+    /// Part of the device rather than a separate grant, for the same reason the
+    /// ports are: a driver names a device, and the kernel decides what that
+    /// means. A driver that could name an arbitrary IRQ could wait on the timer
+    /// line and watch the scheduler.
+    pub irq: Option<u8>,
     pub description: &'static str,
 }
 
@@ -41,11 +48,16 @@ pub static DEVICES: &[Device] = &[
         // alternate status register, which is a *separate* range on the ISA bus
         // and is why this table has room for two.
         ranges: [Some((0x1F0, 8)), Some((0x3F6, 1))],
+        irq: Some(14),
         description: "primary IDE channel",
     },
     Device {
         name: "ata1",
         ranges: [Some((0x170, 8)), Some((0x376, 1))],
+        // Masked at the PIC, so waiting on it would block until the deadline
+        // every time. Named anyway, because the table is the description of the
+        // device and not of what the kernel currently bothers to deliver.
+        irq: Some(15),
         description: "secondary IDE channel",
     },
 ];
@@ -70,6 +82,19 @@ pub fn ports_for_grant(grant: u32) -> impl Iterator<Item = PortRange> {
         .enumerate()
         .filter(move |(i, _)| grant & grant_bit(*i) != 0)
         .flat_map(|(_, d)| d.ranges.iter().flatten().copied())
+}
+
+/// Whether `grant` includes a device that raises `irq`.
+///
+/// This is the whole of the IRQ permission check: a thread may wait on a line
+/// only if it holds the device that raises it. There is no separate "IRQ
+/// capability", because an interrupt is part of a device and granting them
+/// separately would mean the two could disagree.
+pub fn grant_covers_irq(grant: u32, irq: u8) -> bool {
+    DEVICES
+        .iter()
+        .enumerate()
+        .any(|(i, d)| grant & grant_bit(i) != 0 && d.irq == Some(irq))
 }
 
 /// Human-readable form of a grant, for the log.

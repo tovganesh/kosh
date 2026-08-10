@@ -19,6 +19,7 @@
 //! should not fire until the kernel is ready for them.
 
 pub mod exceptions;
+pub mod irq_wait;
 pub mod keyboard;
 pub mod pic;
 pub mod timer;
@@ -102,7 +103,9 @@ lazy_static! {
         idt[pic::PIC_2_OFFSET as usize + 3].set_handler_fn(pic::spurious_handler);
         idt[pic::PIC_2_OFFSET as usize + 4].set_handler_fn(pic::spurious_handler);
         idt[pic::PIC_2_OFFSET as usize + 5].set_handler_fn(pic::spurious_handler);
-        idt[pic::PIC_2_OFFSET as usize + 6].set_handler_fn(pic::spurious_handler);
+        // IRQ14 is the primary IDE channel. It gets a real handler rather than
+        // the spurious one, because a ring-3 driver is waiting on it.
+        idt[pic::PIC_2_OFFSET as usize + 6].set_handler_fn(pic::ata_primary_handler);
         idt[pic::PIC_2_OFFSET as usize + 7].set_handler_fn(pic::spurious_handler);
 
         idt

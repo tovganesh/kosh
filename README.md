@@ -64,8 +64,8 @@ test disk, then boots the lot:
 
 ```bash
 ./scripts/run.sh              # boot it, serial on stdio (ctrl-a x to quit)
-./scripts/run.sh --check      # boot headless, assert 62 serial markers (CI)
-./scripts/run.sh --check-cli  # drive the shell through QEMU's monitor, assert 43
+./scripts/run.sh --check      # boot headless, assert 64 serial markers (CI)
+./scripts/run.sh --check-cli  # drive the shell through QEMU's monitor, assert 46
 ./scripts/run.sh --debug      # same as plain run, plus a gdb stub on :1234
 ```
 
@@ -252,8 +252,10 @@ of it.
   maps `ata-driver` to `ata0`, so the trust root is "GRUB loaded it from the
   ISO". A real capability system delegates from `init`; this is a two-entry table
   standing in for one.
-- **Ring 3 cannot receive interrupts.** The userspace driver polls, exactly as
-  the in-kernel one does. Turning IRQ14 into a message is not implemented.
+- **Interrupt delivery is a wake, not a message.** A driver can sleep on a line
+  it owns — `ata-driver` does, and 104 of 104 sector waits are woken by IRQ 14 —
+  but an interrupt cannot *carry* anything, and a line cannot be handed to a
+  process that does not own the whole device.
 - **`userspace/driver-manager` does not run.** Not built, not on the ISO, no
   linker script. `init` and `fs-service` were in the same state until this phase;
   both are real now.
@@ -330,8 +332,8 @@ Roughly in order, each unblocking the next:
 - [x] `fs/` and `block/` deleted — the kernel cannot read a disk at all
 - [x] Selective receive, so a service can be asked something while it waits
 - [x] `argv` for `spawn`, so a driver is told what to serve rather than knowing
-- [ ] Interrupts delivered to ring 3, so a driver can stop polling — and so the
-      keyboard, the last driver inside the kernel, could move out
+- [x] Interrupts delivered to ring 3, so a driver sleeps instead of polling
+- [ ] The keyboard out of the kernel — the last driver inside it
 - [ ] FAT32 writes
 - [ ] `userspace/init` doing its job
 

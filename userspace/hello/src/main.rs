@@ -32,6 +32,7 @@ const SYS_WRITE: u64 = 23;
 const SYS_CLOCK_GETTIME: u64 = 53;
 const SYS_DEBUG_PRINT: u64 = 100;
 const SYS_LOOKUP_SERVICE: u64 = 47;
+const SYS_WAIT_IRQ: u64 = 48;
 
 /// mmap protection bits, as the kernel reads them.
 const PROT_READ: u64 = 0x1;
@@ -446,6 +447,7 @@ pub extern "C" fn kosh_main(argc: u64, argv: *const *const u8) -> ! {
     drive_a_disk();
 
     // ...and a process that has no business touching that disk.
+    irq_permission_check();
     port_permission_negative_control();
 
     // fork, and the copy-on-write behaviour underneath it.
@@ -881,6 +883,21 @@ fn stat_size(fs: i64, path: &str) -> Option<u32> {
 
 /// Exit code the kernel gives a process it terminates for a fault.
 const EXIT_KILLED: i32 = -9;
+
+/// An interrupt is part of a device, so waiting on one needs the device.
+///
+/// Unlike the port test below this needs no forked child: `wait_irq` refuses
+/// with an error return rather than a #GP, because it is a system call and the
+/// kernel can say no. That difference is the point — the CPU enforces the ports,
+/// the kernel enforces the line, and both answer to the same grant.
+fn irq_permission_check() {
+    let got = unsafe { syscall3(SYS_WAIT_IRQ, 14, 0, 10) };
+    if got < 0 {
+        print("  waiting on IRQ 14 without the device that raises it was refused\n");
+    } else {
+        print("  WARNING: waited on an IRQ for a device I do not hold\n");
+    }
+}
 
 /// Prove that the ports the driver used are not simply open to everyone.
 ///

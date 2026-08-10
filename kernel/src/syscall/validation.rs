@@ -45,6 +45,13 @@ pub fn validate_syscall_args(
         SYS_DRIVER_RESPONSE => validate_driver_response_args(process_id, args),
         SYS_REQUEST_DEVICE | SYS_RELEASE_DEVICE => validate_device_args(process_id, args),
         SYS_REGISTER_SERVICE | SYS_LOOKUP_SERVICE => validate_service_args(process_id, args),
+        SYS_WAIT_IRQ => {
+            if args[0] >= crate::interrupts::irq_wait::MAX_IRQ as u64 {
+                Err(SyscallError::InvalidArgument)
+            } else {
+                Ok(())
+            }
+        }
         
         SYS_UNAME | SYS_SYSINFO | SYS_TIME => validate_info_args(args),
         SYS_CLOCK_GETTIME => validate_clock_gettime_args(args),

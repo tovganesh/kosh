@@ -127,6 +127,13 @@ fn threads() {
             crate::task::State::Ready => "ready",
             crate::task::State::Finished => "finished",
             crate::task::State::Blocked(crate::task::BlockedOn::Message(_)) => "msg-wait",
+            crate::task::State::Blocked(crate::task::BlockedOn::Irq { line, .. }) => {
+                let text = alloc::format!("irq({})", line);
+                let bytes = text.as_bytes();
+                let take = core::cmp::min(bytes.len(), blocked.len());
+                blocked[..take].copy_from_slice(&bytes[..take]);
+                core::str::from_utf8(&blocked[..take]).unwrap_or("blocked")
+            }
             crate::task::State::Blocked(crate::task::BlockedOn::Thread(on)) => {
                 let text = alloc::format!("wait({})", on);
                 let bytes = text.as_bytes();

@@ -33,7 +33,11 @@ pub fn init() {
         // to work at all — but we mask the secondary entirely for now.
         //
         // primary mask: bit set = masked. 0b1111_1000 leaves IRQ0,1,2 enabled.
-        pics.write_masks(0b1111_1000, 0b1111_1111);
+        // secondary: 0b1011_1111 leaves IRQ14 — the primary IDE channel —
+        // enabled, because `userspace/ata-driver` waits on it. Everything else
+        // on the secondary PIC stays masked: an unmasked line with no handler
+        // and no waiter is a source of spurious interrupts and nothing else.
+        pics.write_masks(0b1111_1000, 0b1011_1111);
     }
 
     serial_println!(
@@ -43,7 +47,7 @@ pub fn init() {
         PIC_2_OFFSET,
         PIC_2_OFFSET + 7
     );
-    serial_println!("  IRQ0 (timer) and IRQ1 (keyboard) unmasked, rest masked");
+    serial_println!("  IRQ0 (timer), IRQ1 (keyboard) and IRQ14 (IDE) unmasked, rest masked");
 }
 
 /// Acknowledge an interrupt so the PIC will deliver the next one.
@@ -54,6 +58,22 @@ pub fn init() {
 /// Must be called with the vector of the interrupt currently being serviced.
 pub unsafe fn notify_end_of_interrupt(vector: u8) {
     PICS.lock().notify_end_of_interrupt(vector);
+}
+
+/// The primary IDE channel.
+///
+/// It does two things and neither of them touches the disk. The kernel has no
+/// ATA driver any more — reading the status register to clear the interrupt is
+/// the *driver's* job, in ring 3, and doing it here would mean the kernel
+/// consuming the very status the driver is about to look at.
+///
+/// So: acknowledge the PIC, and tell whoever is waiting. `fired` takes the
+/// scheduler lock and nothing else, which is what makes it safe from here.
+pub extern "x86-interrupt" fn ata_primary_handler(_frame: InterruptStackFrame) {
+    unsafe {
+        notify_end_of_interrupt(PIC_2_OFFSET + 6);
+    }
+    crate::interrupts::irq_wait::fired(14);
 }
 
 /// Catch-all for IRQs we do not handle yet.
