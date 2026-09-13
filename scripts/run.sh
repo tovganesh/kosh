@@ -436,7 +436,7 @@ check-cli)
         # Leaving ksh must hand the console back to the kernel, which is both a
         # feature and the only way to test both shells in one session.
         type_line "exit"
-        sleep 2
+        sleep 6
 
         # --- the in-kernel debug console ---
         # No file commands here any more: the kernel has no filesystem, and this
@@ -446,7 +446,7 @@ check-cli)
         type_line "mem"
         type_line "ps"
         type_line "ls"
-        sleep 1
+        sleep 2
         echo quit
     # 240s, not 180: the session now also spawns a disk driver twice and waits
     # for it to identify a drive and serve four requests each time.
