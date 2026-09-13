@@ -475,6 +475,14 @@ pub extern "C" fn kbd_driver_main(_argc: u64, _argv: *const *const u8) -> ! {
         }
     }
 
+    // Drain any remaining scancodes before exiting so the controller's output buffer
+    // is empty when returning to the kernel console
+    unsafe {
+        while inb(0x64) & 1 != 0 {
+            let _ = inb(KBD_DATA_PORT);
+        }
+    }
+
     print("  kbd-driver: shutting down, releasing kbd0\n");
     exit(0)
 }

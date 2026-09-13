@@ -163,11 +163,16 @@ pub fn release_all(thread: usize) {
     for (i, slot) in claims.iter_mut().enumerate() {
         if *slot == Some(thread) {
             *slot = None;
+            let name = DEVICES.get(i).map(|d| d.name).unwrap_or("?");
             serial_println!(
                 "  released device '{}' held by thread {}",
-                DEVICES.get(i).map(|d| d.name).unwrap_or("?"),
+                name,
                 thread
             );
+            #[cfg(target_arch = "x86_64")]
+            if name == "kbd0" {
+                crate::interrupts::keyboard::drain_controller();
+            }
         }
     }
 }
