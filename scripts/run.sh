@@ -409,12 +409,15 @@ check-cli)
         # because running a program a second time is what exercises the teardown
         # of the first one's mappings.
         type_line "hello"
+        sleep 4
         type_line "hello one two"
+        sleep 4
         # ksh inside ksh. This was *refused* until per-process address spaces:
         # both are linked at 8 MiB, so a second copy in one address space would
         # have overwritten the .text the first one was executing. Now each has
         # its own PML4 and the same address means different memory.
         type_line "ksh"
+        sleep 1
         type_line "getpid"
         type_line "exit"
         type_line "getpid"
