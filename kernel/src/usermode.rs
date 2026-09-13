@@ -633,7 +633,7 @@ pub fn register_process(thread: usize, parent: Option<usize>, name: &str) {
 /// That is defensible for a boot-time driver and useless for anything loaded
 /// later, which is exactly why it is a table with two entries rather than a rule.
 /// `userspace/init` taking this over is what makes it a real chain.
-const DRIVER_IMAGES: &[(&str, &str)] = &[("ata-driver", "ata0")];
+const DRIVER_IMAGES: &[(&str, &str)] = &[("ata-driver", "ata0"), ("kbd-driver", "kbd0")];
 
 fn grant_driver_capabilities(pid: crate::process::ProcessId, name: &str) {
     use crate::ipc::capability::{create_capability, CapabilityType, ResourceId};

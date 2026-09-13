@@ -36,11 +36,11 @@ pub struct Device {
 
 /// The devices a ring-3 driver may be given.
 ///
-/// Notably absent: the PIC (0x20/0xA0), the PIT (0x40), the keyboard controller
-/// (0x60/0x64), the CMOS/NMI gate (0x70) and COM1 (0x3F8). The first three can
-/// stop the scheduler, the fourth can mask NMIs, and the last is where every
-/// diagnostic in this system goes. None of them are things a disk driver needs,
-/// so none of them are in the table, so no capability can name them.
+/// Notably absent: the PIC (0x20/0xA0), the PIT (0x40), the keyboard command
+/// register (0x64), the CMOS/NMI gate (0x70) and COM1 (0x3F8). Port 0x64 can
+/// pulse the CPU reset line, the first two can stop the scheduler, the fourth
+/// can mask NMIs, and the last is where every diagnostic in this system goes.
+/// A keyboard driver needs only port 0x60 (data), so 0x64 is not granted.
 pub static DEVICES: &[Device] = &[
     Device {
         name: "ata0",
@@ -59,6 +59,15 @@ pub static DEVICES: &[Device] = &[
         // device and not of what the kernel currently bothers to deliver.
         irq: Some(15),
         description: "secondary IDE channel",
+    },
+    Device {
+        name: "kbd0",
+        // 0x60 is the PS/2 data port. Reading it yields the scancode.
+        // 0x64 (command/status) is deliberately omitted so a ring-3 driver
+        // cannot pulse CPU reset or reprogram controller lines.
+        ranges: [Some((0x60, 1)), None],
+        irq: Some(1),
+        description: "PS/2 keyboard data",
     },
 ];
 

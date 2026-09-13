@@ -81,7 +81,7 @@ echo "==> building userspace programs"
 # libc, and anything that moves a String around needs them.
 USER_STD=(-Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem)
 
-for pkg in kosh-hello kosh-hello2 kosh-ata-driver kosh-fs-service kosh-init kosh-shell; do
+for pkg in kosh-hello kosh-hello2 kosh-ata-driver kosh-kbd-driver kosh-fs-service kosh-init kosh-shell; do
     USER_FLAGS=(--package "$pkg" --target "$TARGET_JSON" "${USER_STD[@]}")
     [ "$PROFILE" = "release" ] && USER_FLAGS+=(--release)
     cargo build "${USER_FLAGS[@]}" -Z json-target-spec 2>/dev/null \
@@ -91,10 +91,11 @@ done
 HELLO="$ROOT/target/$TARGET_NAME/$PROFILE/kosh-hello"
 HELLO2="$ROOT/target/$TARGET_NAME/$PROFILE/kosh-hello2"
 ATADRV="$ROOT/target/$TARGET_NAME/$PROFILE/kosh-ata-driver"
+KBDDRV="$ROOT/target/$TARGET_NAME/$PROFILE/kosh-kbd-driver"
 FSSVC="$ROOT/target/$TARGET_NAME/$PROFILE/kosh-fs-service"
 INIT="$ROOT/target/$TARGET_NAME/$PROFILE/kosh-init"
 KSH="$ROOT/target/$TARGET_NAME/$PROFILE/ksh"
-for bin in "$HELLO" "$HELLO2" "$ATADRV" "$FSSVC" "$INIT" "$KSH"; do
+for bin in "$HELLO" "$HELLO2" "$ATADRV" "$KBDDRV" "$FSSVC" "$INIT" "$KSH"; do
     [ -f "$bin" ] || { echo "error: userspace binary not found at $bin" >&2; exit 1; }
     echo "==> $(basename "$bin"): entry $(readelf -h "$bin" | awk '/Entry point/ {print $4}')"
 done
@@ -120,6 +121,7 @@ cp "$KERNEL" "$ISO_DIR/boot/kosh-kernel"
 cp "$HELLO" "$ISO_DIR/boot/hello"
 cp "$HELLO2" "$ISO_DIR/boot/hello2"
 cp "$ATADRV" "$ISO_DIR/boot/ata-driver"
+cp "$KBDDRV" "$ISO_DIR/boot/kbd-driver"
 cp "$FSSVC" "$ISO_DIR/boot/fs-service"
 cp "$INIT"  "$ISO_DIR/boot/init"
 cp "$KSH"   "$ISO_DIR/boot/ksh"
@@ -142,6 +144,7 @@ menuentry "Kosh" {
     module2 /boot/hello hello
     module2 /boot/hello2 hello2
     module2 /boot/ata-driver ata-driver
+    module2 /boot/kbd-driver kbd-driver
     module2 /boot/fs-service fs-service
     module2 /boot/init init
     module2 /boot/ksh ksh
@@ -286,9 +289,12 @@ check)
         "init: kosh userspace starting" \
         "ata-driver: asked to serve 'ata0'" \
         "ata-driver: got the ata0 ports" \
+        "kbd-driver: got the kbd0 ports" \
         "IRQ0 (timer), IRQ1 (keyboard) and IRQ14 (IDE) unmasked" \
         "registered as the 'block' service" \
         "service 'block' registered by process" \
+        "registered as the 'input' service" \
+        "service 'input' registered by process" \
         "fs-service: mounted" \
         "service 'fs' registered by process" \
         "init: userspace is up, handing the console to ksh" \
@@ -491,6 +497,8 @@ check-cli)
         "init: ksh exited with 0, shutting the services down" \
         "sector waits were woken by IRQ 14" \
         "ata-driver: the disk woke this process from ring 3" \
+        "waits were woken by IRQ 1" \
+        "kbd-driver: the keyboard woke this process from ring 3" \
         "init: services stopped, exiting" \
         "init exited with code 0, falling back to the kernel console" \
         "Kosh console" \

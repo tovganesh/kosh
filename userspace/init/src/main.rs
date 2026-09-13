@@ -227,6 +227,13 @@ fn shutdown_fs(pid: i64) {
     send_message(pid, &request);
 }
 
+fn shutdown_input(pid: i64) {
+    let mut request = [0u8; 16];
+    request[0..4].copy_from_slice(&0x4B49_4E50u32.to_le_bytes()); // "KINP"
+    request[4..8].copy_from_slice(&1u32.to_le_bytes()); // OP_SHUTDOWN
+    send_message(pid, &request);
+}
+
 core::arch::global_asm!(
     r#"
 .section .text._start, "ax"
@@ -267,11 +274,19 @@ pub extern "C" fn init_main() -> ! {
         exit(1);
     }
 
+    let input = start_service("kbd-driver", "input", b"");
+    if input < 0 {
+        print("init: no input service; continuing with kernel keyboard\n");
+    }
+
     print("init: userspace is up, handing the console to ksh\n");
 
     let shell = spawn("ksh");
     if shell < 0 {
         print("init: could not start ksh\n");
+        if input >= 0 {
+            shutdown_input(input);
+        }
         shutdown_fs(fs);
         shutdown_block(block);
         exit(1);
@@ -283,6 +298,12 @@ pub extern "C" fn init_main() -> ! {
     print("init: ksh exited with ");
     print_i64(status as i64);
     print(", shutting the services down\n");
+
+    if input >= 0 {
+        shutdown_input(input);
+        let mut input_status: i32 = 0;
+        wait(input, &mut input_status);
+    }
 
     // Filesystem first. It is the block driver's only client, and stopping the
     // driver with a read in flight would leave `fs` blocked in a receive that

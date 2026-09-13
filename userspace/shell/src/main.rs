@@ -705,6 +705,10 @@ pub extern "C" fn ksh_main() -> ! {
         println("ksh: no 'fs' service — file commands will not work");
     }
 
+    if sys::connect_input() < 0 {
+        println("ksh: no 'input' service — using kernel keyboard fallback");
+    }
+
     println("");
     println("ksh: the Kosh shell, in ring 3. Type 'help'.");
 

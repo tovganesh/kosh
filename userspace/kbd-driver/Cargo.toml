@@ -1,0 +1,17 @@
+[package]
+name = "kosh-kbd-driver"
+version = "0.1.0"
+edition = "2021"
+
+# The PS/2 keyboard driver, in ring 3.
+#
+# It talks to port 0x60 directly with `inb`, which the TSS I/O permission
+# bitmap permits for this thread, and waits for key events on IRQ 1 via
+# `SYS_WAIT_IRQ`. It decodes scancodes into ASCII characters and ANSI escape
+# sequences, and serves read requests over IPC as the "input" service.
+
+[dependencies]
+
+[[bin]]
+name = "kosh-kbd-driver"
+path = "src/main.rs"

@@ -59,7 +59,7 @@ function, including the bugs found along the way and how each was caught.
 
 ## Running it
 
-One command builds the kernel, the six userspace programs, a GRUB ISO and a FAT32
+One command builds the kernel, the seven userspace programs, a GRUB ISO and a FAT32
 test disk, then boots the lot:
 
 ```bash
@@ -134,7 +134,7 @@ interaction in `--check-cli`.
   per-segment permissions and a zeroed `.bss` tail
 
 **Devices and storage**
-- 8259 PIC remap, PIT timer, PS/2 keyboard on IRQ1
+- 8259 PIC remap, PIT timer, CMOS RTC
 - **The disk driver and the filesystem both run in ring 3.** `ata-driver` reads
   the disk from an unprivileged process using `in` and `out` directly — no
   syscall per port — and `fs-service` mounts FAT32 on top of it and answers
@@ -144,12 +144,16 @@ interaction in `--check-cli`.
   Its ports come from the TSS I/O permission bitmap, 9 bits granted to that
   thread and denied to every other; a process without the grant that touches
   0x1F7 is killed and the system carries on
-- Devices are named, not addressed: `request_device("ata0")` is checked against a
-  `DeviceAccess` capability, and the kernel decides which ports the name means —
-  so a disk driver cannot ask for the interrupt controller
-- One driver per device at a time: while a ring-3 driver holds `ata0`, the
-  kernel's own block layer refuses that channel, and the claim is released even
-  if the driver crashes
+- **The keyboard driver runs in ring 3.** `kbd-driver` claims `kbd0` (port `0x60`),
+  sleeps on IRQ 1 via `wait_irq`, translates Set 1 scancodes into ASCII/ANSI sequences,
+  and answers read requests over IPC as the `"input"` service. The kernel does not
+  read port `0x60` while `kbd0` is claimed, preserving the byte for userspace, and
+  reclaims it for the fallback console only after userspace exits
+- Devices are named, not addressed: `request_device("ata0")` and `request_device("kbd0")`
+  are checked against a `DeviceAccess` capability, and the kernel decides which ports the
+  name means — so a keyboard driver cannot touch the disk or pulse CPU reset via 0x64
+- One driver per device at a time: while a ring-3 driver holds `ata0` or `kbd0`, the
+  kernel refuses other claims, and the claim is released even if the driver crashes
 - Read-only FAT32 — BPB validation, cluster-chain walking, long filenames — in
   ring 3, reading sectors over IPC
 - CMOS RTC, so `date` prints the real date
@@ -171,6 +175,8 @@ interaction in `--check-cli`.
   `cmd &` starts one in the background
 - `ata-driver` — the ATA driver as an ordinary ring-3 process, driving a real
   disk with `in` and `out` and answering block reads over IPC
+- `kbd-driver` — the PS/2 keyboard driver, in ring 3, waking on IRQ 1 and delivering
+  scancodes and decoded characters to `ksh` over IPC as `"input"`
 - The SSE register file survives both a system call and a context switch, which
   is what a userspace driver and a userspace filesystem running concurrently
   needs and what neither used to get
@@ -206,8 +212,9 @@ itself):
 `receive_message` · `request_device` `release_device` · `register_service`
 `lookup_service` · `debug_print` `debug_dump`
 
-`read` is the keyboard and `write` is the console — the two devices still inside
-the kernel, along with the timer.
+`read` is stdin (with `ksh` reading from the `"input"` service over IPC and falling
+back to the syscall) and `write` is the console — the display and timer remain
+inside the kernel.
 
 **Refuses with `NotSupported`, honestly:**
 
@@ -241,9 +248,6 @@ of it.
   userspace has stopped, so it cannot ask the `fs` service either — a fallback
   that needs the thing it is a fallback for is not one. `ls` from the kernel
   prompt says so, and the disk commands live in `ksh`.
-- **The keyboard driver is still in the kernel**, and has no plan yet. It is
-  harder than the disk: it is interrupt-driven, and ring 3 cannot receive
-  interrupts.
 - **IPC has no reply *port*, only a sender filter.** `receive_message` can wait
   for a named process, which is enough for request/reply and is what the services
   use. It is not enough to tell two outstanding requests to the same server
@@ -301,6 +305,7 @@ userspace/
   hello/           static ELF that proves the loader and the newer syscalls
   hello2/          what hello execs into — a different image at the same address
   ata-driver/      the ATA driver, in ring 3, talking to the disk over IPC
+  kbd-driver/      the PS/2 keyboard driver, in ring 3, delivering keys over IPC
   fs-service/      read-only FAT32, in ring 3, over IPC in both directions
   init/            process 1: starts the services, then the shell
   shell/           ksh
@@ -333,7 +338,7 @@ Roughly in order, each unblocking the next:
 - [x] Selective receive, so a service can be asked something while it waits
 - [x] `argv` for `spawn`, so a driver is told what to serve rather than knowing
 - [x] Interrupts delivered to ring 3, so a driver sleeps instead of polling
-- [ ] The keyboard out of the kernel — the last driver inside it
+- [x] The keyboard out of the kernel — the last driver inside it
 - [ ] FAT32 writes
 - [ ] `userspace/init` doing its job
 

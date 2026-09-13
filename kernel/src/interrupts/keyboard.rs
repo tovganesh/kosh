@@ -169,6 +169,18 @@ fn translate(key: DecodedKey) -> Option<Key> {
 }
 
 pub extern "x86-interrupt" fn keyboard_interrupt_handler(_frame: InterruptStackFrame) {
+    // If a ring-3 driver is driving the keyboard, do not touch port 0x60 —
+    // reading it clears the controller's output buffer and consumes the
+    // scancode before the driver can see it. Just acknowledge the PIC and wake
+    // the driver.
+    if crate::platform::devports::is_claimed("kbd0") {
+        unsafe {
+            pic::notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
+        }
+        crate::interrupts::irq_wait::fired(1);
+        return;
+    }
+
     let scancode: u8 = unsafe {
         let mut port: Port<u8> = Port::new(PS2_DATA_PORT);
         port.read()
