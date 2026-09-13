@@ -73,14 +73,80 @@ unsafe fn syscall(number: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 {
     ret
 }
 
-/// Read from the console.
+const INP_REQ_MAGIC: u32 = 0x4B49_4E50; // "KINP"
+const INP_REP_MAGIC: u32 = 0x4B49_5250; // "KIRP"
+const INP_OP_READ: u32 = 0;
+
+static mut INPUT_PID: i64 = 0;
+static mut INPUT_CONNECTED: bool = false;
+
+pub fn connect_input() -> i64 {
+    let pid = lookup_service("input");
+    if pid >= 0 {
+        unsafe {
+            INPUT_PID = pid;
+            INPUT_CONNECTED = true;
+        }
+    }
+    pid
+}
+
+pub fn input_connected() -> bool {
+    unsafe { INPUT_CONNECTED }
+}
+
+/// Read from standard input.
 ///
-/// Still a system call, and deliberately a separate function from [`read`]:
-/// standard input is the kernel's keyboard ring, not a file, and routing fd 0
-/// through the filesystem service would ask it about a descriptor it never
-/// handed out. The two used to share a number because the kernel owned both.
+/// If the ring-3 "input" service is available, requests keys over IPC.
+/// Otherwise falls back to the kernel's `sys_read(0, ...)` so ksh continues
+/// to work when running without the userspace driver.
 pub fn read_stdin(buf: &mut [u8]) -> i64 {
-    unsafe { syscall(SYS_READ, STDIN, buf.as_mut_ptr() as u64, buf.len() as u64, 0) }
+    unsafe {
+        if !INPUT_CONNECTED {
+            connect_input();
+        }
+        if INPUT_CONNECTED && INPUT_PID > 0 {
+            let mut req = [0u8; 16];
+            req[0..4].copy_from_slice(&INP_REQ_MAGIC.to_le_bytes());
+            req[4..8].copy_from_slice(&INP_OP_READ.to_le_bytes());
+            req[8..12].copy_from_slice(&(buf.len() as u32).to_le_bytes());
+            req[12..16].copy_from_slice(&0u32.to_le_bytes());
+
+            let sent = syscall(
+                SYS_SEND_MESSAGE,
+                INPUT_PID as u64,
+                req.as_ptr() as u64,
+                req.len() as u64,
+                0,
+            );
+            if sent >= 0 {
+                let mut rep = [0u8; 16 + 128];
+                // Selective receive from INPUT_PID with blocking
+                let got = syscall(
+                    SYS_RECEIVE_MESSAGE,
+                    rep.as_mut_ptr() as u64,
+                    rep.len() as u64,
+                    ((INPUT_PID as u64) << 32) | 1,
+                    0,
+                );
+                if got >= 0 {
+                    let received = (got & 0xFFFF_FFFF) as usize;
+                    if received >= 16 {
+                        let magic = u32::from_le_bytes([rep[0], rep[1], rep[2], rep[3]]);
+                        let status = i32::from_le_bytes([rep[4], rep[5], rep[6], rep[7]]);
+                        let len = u32::from_le_bytes([rep[8], rep[9], rep[10], rep[11]]) as usize;
+                        if magic == INP_REP_MAGIC && status == 0 && len > 0 {
+                            let n = len.min(buf.len()).min(received - 16);
+                            buf[..n].copy_from_slice(&rep[16..16 + n]);
+                            return n as i64;
+                        }
+                    }
+                }
+            }
+        }
+
+        syscall(SYS_READ, STDIN, buf.as_mut_ptr() as u64, buf.len() as u64, 0)
+    }
 }
 
 pub fn write(fd: u64, bytes: &[u8]) -> i64 {

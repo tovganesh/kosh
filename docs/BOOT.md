@@ -2411,6 +2411,93 @@ the driver's own summary because `init` never gets to shut it down.
 Slow beats stuck, demonstrated in both directions: the line masked, the system
 still works; the line live, 104 of 104 waits woken by the disk.
 
+## The keyboard driver in ring 3 (Phase 24)
+
+The keyboard was the last device driver inside the kernel. Moving it to ring 3
+completes the microkernel split: the kernel owns no hardware device drivers.
+
+```
+  kbd-driver: got the kbd0 ports
+  kbd-driver: registered as the 'input' service
+  ...
+  kbd-driver: 46 of 46 waits were woken by IRQ 1
+  kbd-driver: the keyboard woke this process from ring 3
+```
+
+### Port 0x60, and why 0x64 is absent
+
+The driver needs port 0x60 to read the scancode byte from the 8042 controller.
+`devports.rs` declares `kbd0`:
+
+```rust
+Device {
+    name: "kbd0",
+    ranges: &[PortRange { start: 0x60, length: 1 }],
+    irq: Some(1),
+    max_holders: 1,
+}
+```
+
+Port 0x64 (the 8042 command/status register) is deliberately excluded from the
+grant. On standard PC hardware, writing `0xFE` to port 0x64 pulses the CPU reset
+line. Giving an unprivileged driver port 0x64 gives it the power to reboot the
+machine with a single `outb`. Denying 0x64 keeps that power away; the TSS I/O
+permission bitmap will raise `#GP` if ring 3 touches 0x64.
+
+### The hand-off: not reading port 0x60 in ring 0
+
+With `ata-driver`, the kernel's IRQ 14 handler did nothing but acknowledge the
+PIC and wake waiters. With the keyboard, the kernel already had an interrupt
+handler that read port 0x60 and fed its own scancode decoder.
+
+Reading port 0x60 has a destructive side-effect on the 8042: reading the data
+register clears the output buffer. If the kernel's interrupt handler reads port
+0x60, the driver in ring 3 sees an empty buffer or garbage.
+
+So the kernel's `keyboard_interrupt_handler` checks `devports::is_claimed("kbd0")`:
+
+```rust
+if devports::is_claimed("kbd0") {
+    PIC.lock().notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
+    irq_wait::fired(1);
+    return;
+}
+```
+
+If claimed by userspace, the kernel acknowledges the PIC and calls `irq_wait::fired(1)`
+without touching port 0x60. The byte remains in the 8042 data latch until
+`kbd-driver` wakes up and executes `inb(0x60)` directly in ring 3.
+
+### The fallback console
+
+When userspace terminates (for example, when `exit` is typed in `ksh`, causing
+`init` to shut down its services), `init` sends `OP_SHUTDOWN` to `kbd-driver`.
+`kbd-driver` exits with code 0.
+
+On thread exit, `kernel/src/usermode.rs::deregister_process` calls
+`devports::release_all`, revoking the `kbd0` claim.
+
+From that moment on, `devports::is_claimed("kbd0")` returns `false`. Subsequent
+keypresses are read and decoded by the kernel's in-tree keyboard handler, feeding
+the kernel fallback console prompt:
+
+```
+init exited with code 0, falling back to the kernel console
+Kosh console
+Kosh 0.1.0 x86_64
+```
+
+### The input service protocol
+
+`kbd-driver` registers as the `"input"` service. The protocol defines two operations:
+- `OP_READ` (0): read up to N decoded bytes (blocking if none are queued).
+- `OP_SHUTDOWN` (1): flush and cleanly terminate the driver.
+
+The shell (`ksh`) connects to `"input"` via `lookup_service("input")`. Its `read_stdin`
+routine queries `"input"` for key sequences (including multi-byte ANSI sequences
+for arrow keys and line editing). If `"input"` is not registered (e.g. if booted
+without userspace services), `ksh` cleanly falls back to `SYS_READ(0)`.
+
 ## What is deliberately still missing
 - **The filesystem is read-only.** Allocating clusters and keeping both FAT
   copies consistent is a separate problem, and a read-only filesystem that is
@@ -2439,5 +2526,5 @@ still works; the line live, 104 of 104 waits woken by the disk.
   currently global — see the note in `sys_exit`.
 - **Swap and power management are disabled** in `init_kernel`. Both were
   simulated, and swap tried to allocate 8 MiB from a 1 MiB heap.
-- **Only IRQ0 and IRQ1 are unmasked.** Everything else on the PIC has a
+- **Only IRQ0, IRQ1, and IRQ14 are unmasked.** Everything else on the PIC has a
   handler that acknowledges and returns.

@@ -43,6 +43,9 @@ pub fn run(_arg: usize) {
 
     banner();
 
+    #[cfg(target_arch = "x86_64")]
+    crate::interrupts::keyboard::drain_controller();
+
     loop {
         // The prompt carries the working directory, so `pwd` is rarely needed.
         let prompt = build_prompt(&cwd);

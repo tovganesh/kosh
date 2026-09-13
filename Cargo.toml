@@ -9,6 +9,7 @@ members = [
     "userspace/hello",
     "userspace/hello2",
     "userspace/ata-driver",
+    "userspace/kbd-driver",
     "userspace/fs-service",
     "userspace/driver-manager",
     "userspace/shell",

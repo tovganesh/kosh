@@ -26,6 +26,7 @@ use crate::interrupts::{pic, InterruptIndex};
 use crate::serial_println;
 
 const PS2_DATA_PORT: u16 = 0x60;
+const PS2_STATUS_PORT: u16 = 0x64;
 
 /// Capacity of the key ring. A power of two so the modulo is a mask. 128 keys
 /// is far more than a human can type between polls.
@@ -103,13 +104,22 @@ impl KeyBuffer {
 
 static BUFFER: Mutex<KeyBuffer> = Mutex::new(KeyBuffer::new());
 
+/// Drain anything lingering in the keyboard controller so the next keypress
+/// raises an interrupt cleanly.
+pub fn drain_controller() {
+    unsafe {
+        let mut status: Port<u8> = Port::new(PS2_STATUS_PORT);
+        let mut data: Port<u8> = Port::new(PS2_DATA_PORT);
+        while status.read() & 1 != 0 {
+            let _ = data.read();
+        }
+    }
+}
+
 pub fn init() {
     // Drain anything the BIOS left in the controller's output buffer,
     // otherwise the first real keystroke never generates an IRQ.
-    unsafe {
-        let mut port: Port<u8> = Port::new(PS2_DATA_PORT);
-        let _ = port.read();
-    }
+    drain_controller();
     serial_println!("  PS/2 keyboard: IRQ1 handler installed (US layout, set 1)");
 }
 
@@ -169,6 +179,18 @@ fn translate(key: DecodedKey) -> Option<Key> {
 }
 
 pub extern "x86-interrupt" fn keyboard_interrupt_handler(_frame: InterruptStackFrame) {
+    // If a ring-3 driver is driving the keyboard, do not touch port 0x60 —
+    // reading it clears the controller's output buffer and consumes the
+    // scancode before the driver can see it. Just acknowledge the PIC and wake
+    // the driver.
+    if crate::platform::devports::is_claimed("kbd0") {
+        unsafe {
+            pic::notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
+        }
+        crate::interrupts::irq_wait::fired(1);
+        return;
+    }
+
     let scancode: u8 = unsafe {
         let mut port: Port<u8> = Port::new(PS2_DATA_PORT);
         port.read()
